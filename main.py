@@ -100,7 +100,13 @@ class ModelPanelPlugin(Star):
         cfg = cfg if isinstance(cfg, dict) else {}
         pid = str(cfg.get("id") or "")
         ptype = str(cfg.get("type") or cfg.get("provider_type") or "")
-        name = str(cfg.get("name") or pid or "")
+        name = str(
+            cfg.get("name")
+            or cfg.get("provider")
+            or cfg.get("provider_source_name")
+            or pid
+            or ""
+        )
         model = ""
         try:
             m = provider.meta()
