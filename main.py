@@ -10,9 +10,11 @@ from quart import request
 
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 
-# 插件页面 API 路由前缀（与 AstrBot 插件页面桥接约定一致）
+# 插件页面 API 路由前缀：/<plugin_name>/<endpoint>。
+# 对齐 AstrBot 官方《插件 Pages》约定：后端注册带插件名前缀、不带 /page；
+# 前端 bridge 写相对路径，由 Dashboard 自动转发。
 PLUGIN_NAME = "astrbot_plugin_model_panel"
-PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+PAGE_API_PREFIX = f"/{PLUGIN_NAME}"
 
 # 伴侣插件精准模型配置的 provider 字段（与伴侣插件 _allowed_provider_keys 一致）
 COMPANION_PROVIDER_KEYS = [

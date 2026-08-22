@@ -40,11 +40,13 @@ async function getPageBridge(timeoutMs = 2500): Promise<Bridge> {
 function endpointForStyle(style: string, routePath: string): string {
   const clean = routePath.replace(/^\/+/, "");
   switch (style) {
+    // AstrBot 插件页面 API：前端写相对路径（不带插件名、不带 /page），
+    // 由 Dashboard 自动转发到 /api/v1/plugins/extensions/<plugin_name>/<endpoint>。
+    // 兜底再尝试带插件名前缀的完整路径。
     case "bare": return clean;
     case "slash": return "/" + clean;
-    // AstrBot 插件页面 API 路由约定：/{plugin_name}/page/{route}
-    case "full": return PAGE_PLUGIN_NAME + "/page/" + clean;
-    case "fullSlash": return "/" + PAGE_PLUGIN_NAME + "/page/" + clean;
+    case "full": return PAGE_PLUGIN_NAME + "/" + clean;
+    case "fullSlash": return "/" + PAGE_PLUGIN_NAME + "/" + clean;
     default: return "";
   }
 }
@@ -52,10 +54,10 @@ function endpointForStyle(style: string, routePath: string): string {
 function bridgeEndpointCandidates(routePath: string): string[] {
   const clean = routePath.replace(/^\/+/, "");
   const candidates = [
-    endpointForStyle("full", clean),
-    endpointForStyle("fullSlash", clean),
     endpointForStyle("bare", clean),
     endpointForStyle("slash", clean),
+    endpointForStyle("full", clean),
+    endpointForStyle("fullSlash", clean),
   ].map((s) => String(s || "").replace(/\/+/g, "/"));
   return [...new Set(candidates.filter(Boolean))];
 }
