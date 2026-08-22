@@ -16,7 +16,7 @@
     </div>
 
     <div class="card">
-      <div class="card-title">模型列表（{{ items.length }}）</div>
+      <div class="card-title">全部模型（{{ items.length }}）</div>
       <div v-if="!items.length" class="muted">暂无 LLM 模型。</div>
       <div class="table">
         <div class="row head">

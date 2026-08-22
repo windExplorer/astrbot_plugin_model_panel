@@ -1,9 +1,9 @@
 <template>
   <div>
     <div class="card">
-      <div class="card-title">伴侣插件精准模型配置</div>
+      <div class="card-title">陪伴插件精准模型配置</div>
       <div v-if="!loaded" class="muted">
-        {{ loaded === null ? "加载中…" : "未找到伴侣插件（astrbot_plugin_private_companion），请确认已安装并启用。" }}
+        {{ loaded === null ? "加载中…" : "未找到陪伴插件（astrbot_plugin_private_companion），请确认已安装并启用。" }}
       </div>
       <template v-else>
         <div class="toolbar">
@@ -13,7 +13,7 @@
           <span class="muted">已使用模型 {{ usedModels.length }} 个（未选择替换的保持原样）</span>
         </div>
 
-        <div v-if="!usedModels.length" class="muted empty">伴侣插件精准配置中没有已配置的模型。</div>
+        <div v-if="!usedModels.length" class="muted empty">陪伴插件精准配置中没有已配置的模型。</div>
 
         <div v-else class="list">
           <div v-for="item in usedModels" :key="item.value" class="row">
@@ -97,7 +97,7 @@ async function reload() {
     items.value = data.items || [];
   } catch (e) {
     loaded.value = false;
-    console.error("加载伴侣插件配置失败", e);
+    console.error("加载陪伴插件配置失败", e);
   }
 }
 

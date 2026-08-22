@@ -114,16 +114,24 @@ class ModelPanelPlugin(Star):
             return []
 
     def _provider_display(self, provider: Any) -> dict:
-        cfg = getattr(provider, "provider_config", {}) or {}
-        meta = None
+        cfg = getattr(provider, "provider_config", None)
+        cfg = cfg if isinstance(cfg, dict) else {}
+        pid = str(cfg.get("id") or "")
+        ptype = str(cfg.get("type") or cfg.get("provider_type") or "")
+        name = str(cfg.get("name") or pid or "")
+        model = ""
         try:
-            meta = provider.meta()
+            m = provider.meta()
+            pid = str(getattr(m, "id", None) or pid)
+            ptype = str(getattr(m, "type", None) or ptype)
+            model = str(getattr(m, "model", None) or "")
         except Exception:
             pass
-        pid = str(getattr(meta, "id", None) or cfg.get("id") or "")
-        ptype = str(getattr(meta, "type", None) or cfg.get("type") or "")
-        model = str(getattr(provider, "get_model", lambda: "")() or "")
-        name = str(cfg.get("name") or pid or "")
+        if not model:
+            try:
+                model = str(getattr(provider, "get_model", lambda: "")() or "")
+            except Exception:
+                model = ""
         return {
             "id": pid,
             "name": name,
@@ -132,10 +140,16 @@ class ModelPanelPlugin(Star):
         }
 
     def _companion_star(self) -> Any:
+        # 用 get_all_stars 遍历，按插件目录名/name 匹配，比 get_registered_star 更稳
         try:
-            return self.context.get_registered_star(COMPANION_PLUGIN_NAME)
+            for star in self.context.get_all_stars():
+                name = getattr(star, "name", "") or ""
+                root = getattr(star, "root_dir_name", "") or ""
+                if name == COMPANION_PLUGIN_NAME or root == COMPANION_PLUGIN_NAME:
+                    return star
         except Exception:
-            return None
+            pass
+        return None
 
     def _companion_config(self) -> Any:
         star = self._companion_star()
