@@ -88,7 +88,8 @@ const sortKey = ref<"latency" | "name">("latency");
 const groupedItems = computed(() => {
   const byGroup = new Map<string, ProviderItem[]>();
   for (const item of items.value) {
-    const g = item.name || item.type || "";
+    // 分组用供应商名（item.name），不用 type（type 是 openai_chat_completion 这类，非供应商名）
+    const g = item.name || "未分组";
     if (!byGroup.has(g)) byGroup.set(g, []);
     byGroup.get(g)!.push(item);
   }

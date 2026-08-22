@@ -100,10 +100,12 @@ class ModelPanelPlugin(Star):
         cfg = cfg if isinstance(cfg, dict) else {}
         pid = str(cfg.get("id") or "")
         ptype = str(cfg.get("type") or cfg.get("provider_type") or "")
+        # 供应商名 = 提供商源唯一 ID（provider_source_id），其次 name/provider。
+        # 绝不能退回用 type（openai_chat_completion 这类）当供应商名。
         name = str(
-            cfg.get("name")
+            cfg.get("provider_source_id")
+            or cfg.get("name")
             or cfg.get("provider")
-            or cfg.get("provider_source_name")
             or pid
             or ""
         )
