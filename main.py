@@ -108,7 +108,9 @@ class ModelPanelPlugin(Star):
     # ---------------- 工具 ----------------
     def _chat_providers(self) -> list[Any]:
         try:
-            return self.context.get_all_providers()
+            providers = self.context.get_all_providers()
+            logger.debug(f"[ModelPanel] get_all_providers 数量: {len(providers)}")
+            return providers
         except Exception as e:
             logger.warning(f"[ModelPanel] get_all_providers 失败: {e}")
             return []
@@ -142,13 +144,24 @@ class ModelPanelPlugin(Star):
     def _companion_star(self) -> Any:
         # 用 get_all_stars 遍历，按插件目录名/name 匹配，比 get_registered_star 更稳
         try:
-            for star in self.context.get_all_stars():
+            stars = self.context.get_all_stars()
+            logger.debug(f"[ModelPanel] get_all_stars 数量: {len(stars)}")
+            for star in stars:
                 name = getattr(star, "name", "") or ""
                 root = getattr(star, "root_dir_name", "") or ""
                 if name == COMPANION_PLUGIN_NAME or root == COMPANION_PLUGIN_NAME:
+                    logger.debug(f"[ModelPanel] 已找到陪伴插件: name={name} root={root}")
                     return star
-        except Exception:
-            pass
+            # 找不到时记录全部插件名，便于排查
+            all_names = [
+                f"{getattr(s, 'root_dir_name', '?')}({getattr(s, 'name', '?')})"
+                for s in stars
+            ]
+            logger.warning(
+                f"[ModelPanel] 未找到陪伴插件 {COMPANION_PLUGIN_NAME}，当前插件: {all_names}"
+            )
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 遍历插件失败: {e}")
         return None
 
     def _companion_config(self) -> Any:
@@ -200,6 +213,10 @@ class ModelPanelPlugin(Star):
             d = self._provider_display(p)
             d["is_default"] = bool(d["id"] and d["id"] == default_id)
             items.append(d)
+        logger.info(
+            f"[ModelPanel] /panel/providers 返回 {len(items)} 个模型, "
+            f"默认={default_id or '无'}"
+        )
         return {"items": items, "default_provider_id": default_id}
 
     async def api_test_provider(self) -> dict:
@@ -236,11 +253,17 @@ class ModelPanelPlugin(Star):
     async def api_companion_providers(self) -> dict:
         cfg = self._companion_config()
         if cfg is None:
+            logger.warning("[ModelPanel] /panel/companion/providers: 未找到陪伴插件配置")
             return {"loaded": False, "items": []}
         values = self._companion_provider_values()
         items = []
         for key, value in values.items():
             items.append({"key": key, "value": value})
+        configured = sum(1 for v in values.values() if v)
+        logger.info(
+            f"[ModelPanel] /panel/companion/providers: 共 {len(items)} 项, "
+            f"已配置 {configured} 项, 模式={cfg.get('provider_config_mode') or '无'}"
+        )
         return {"loaded": True, "items": items, "config_mode": str(cfg.get("provider_config_mode") or "")}
 
     async def api_companion_replace(self) -> dict:
@@ -267,8 +290,9 @@ class ModelPanelPlugin(Star):
             if callable(save):
                 save()
         except Exception as e:
-            logger.warning(f"[ModelPanel] 保存伴侣插件配置失败: {e}")
+            logger.warning(f"[ModelPanel] 保存陪伴插件配置失败: {e}")
             return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
+        logger.info(f"[ModelPanel] /panel/companion/replace: 替换 {len(changed)} 处")
         return {"ok": True, "changed_count": len(changed), "changed": changed}
 
     # ---------------- 内部 ----------------
