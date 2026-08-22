@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "模型控制台",
+  "description": "模型管理与检测面板插件配置。",
+  "properties": {
+    "test_timeout": {
+      "type": "number",
+      "title": "检测超时（秒）",
+      "description": "模型延迟/存活检测的超时时间，默认 45 秒。",
+      "default": 45,
+      "minimum": 5,
+      "maximum": 180
+    }
+  }
+}
