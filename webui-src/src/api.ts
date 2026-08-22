@@ -42,8 +42,9 @@ function endpointForStyle(style: string, routePath: string): string {
   switch (style) {
     case "bare": return clean;
     case "slash": return "/" + clean;
-    case "full": return PAGE_PLUGIN_NAME + "/" + clean;
-    case "fullSlash": return "/" + PAGE_PLUGIN_NAME + "/" + clean;
+    // AstrBot 插件页面 API 路由约定：/{plugin_name}/page/{route}
+    case "full": return PAGE_PLUGIN_NAME + "/page/" + clean;
+    case "fullSlash": return "/" + PAGE_PLUGIN_NAME + "/page/" + clean;
     default: return "";
   }
 }

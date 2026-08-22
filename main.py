@@ -10,6 +10,10 @@ from quart import request
 
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 
+# 插件页面 API 路由前缀（与 AstrBot 插件页面桥接约定一致）
+PLUGIN_NAME = "astrbot_plugin_model_panel"
+PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+
 # 伴侣插件精准模型配置的 provider 字段（与伴侣插件 _allowed_provider_keys 一致）
 COMPANION_PROVIDER_KEYS = [
     "FAST_RESPONSE_PROVIDER_ID",
@@ -62,48 +66,22 @@ class ModelPanelPlugin(Star):
 
     # ---------------- 路由注册 ----------------
     def _register_routes(self) -> None:
-        self.context.register_web_api(
-            "/panel/overview",
-            self.api_overview,
-            ["GET"],
-            "ModelPanel overview",
-        )
-        self.context.register_web_api(
-            "/panel/providers",
-            self.api_list_providers,
-            ["GET"],
-            "ModelPanel providers",
-        )
-        self.context.register_web_api(
-            "/panel/providers/test",
-            self.api_test_provider,
-            ["POST"],
-            "ModelPanel test provider",
-        )
-        self.context.register_web_api(
-            "/panel/providers/test_all",
-            self.api_test_all_providers,
-            ["POST"],
-            "ModelPanel test all providers",
-        )
-        self.context.register_web_api(
-            "/panel/default_model",
-            self.api_default_model,
-            ["GET"],
-            "ModelPanel default model",
-        )
-        self.context.register_web_api(
-            "/panel/companion/providers",
-            self.api_companion_providers,
-            ["GET"],
-            "ModelPanel companion providers",
-        )
-        self.context.register_web_api(
-            "/panel/companion/replace",
-            self.api_companion_replace,
-            ["POST"],
-            "ModelPanel companion replace",
-        )
+        routes = [
+            ("/panel/overview", self.api_overview, ["GET"]),
+            ("/panel/providers", self.api_list_providers, ["GET"]),
+            ("/panel/providers/test", self.api_test_provider, ["POST"]),
+            ("/panel/providers/test_all", self.api_test_all_providers, ["POST"]),
+            ("/panel/default_model", self.api_default_model, ["GET"]),
+            ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
+            ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
+        ]
+        for path, handler, methods in routes:
+            self.context.register_web_api(
+                f"{PAGE_API_PREFIX}{path}",
+                handler,
+                methods,
+                "ModelPanel " + path,
+            )
 
     # ---------------- 工具 ----------------
     def _chat_providers(self) -> list[Any]:
