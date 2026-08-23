@@ -803,6 +803,23 @@ class ModelPanelPlugin(Star):
         except Exception as e:
             logger.warning(f"[ModelPanel] 保存陪伴插件配置失败: {e}")
             return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
+        # 陪伴插件在 bootstrap 时把 config 值一次性读到实例属性
+        # （如 self.fast_response_provider_id），只 save_config() 写了文件但
+        # 实例属性不会自动更新。需要调陪伴插件的 _apply_quick_provider_defaults()
+        # 把新 config 值同步到运行时实例属性，否则陪伴插件的 WebUI / 运行逻辑
+        # 仍然用旧值。
+        star = self._companion_star()
+        if star is not None:
+            plugin_obj = getattr(star, "star_cls", None) or getattr(star, "instance", None) or star
+            apply = getattr(plugin_obj, "_apply_quick_provider_defaults", None)
+            if callable(apply):
+                try:
+                    apply()
+                    logger.info("[ModelPanel] 已调 _apply_quick_provider_defaults 同步实例属性")
+                except Exception as e:
+                    logger.warning(f"[ModelPanel] _apply_quick_provider_defaults 调用失败: {e}")
+            else:
+                logger.warning("[ModelPanel] 陪伴插件未找到 _apply_quick_provider_defaults 方法，可能需要重启插件才能生效")
         logger.info(f"[ModelPanel] /panel/companion/replace: 替换 {len(changed)} 处")
         return {"ok": True, "changed_count": len(changed), "changed": changed}
 
