@@ -585,21 +585,28 @@ onMounted(async () => {
   font-size: 14px;
   color: var(--accent-2);
 }
-/* 弹窗尺寸控制：同上，n-modal 默认 min-height: 100% 会撑满 viewport */
+/* 弹窗尺寸控制：详见 CompanionReplaceView 中的说明。
+   三层级覆盖（scroll-content / n-modal / n-card）+ n-card__content 加
+   min-height:0 + overflow-y:auto，让 modal 自适应内容高度且上限为 viewport-64px。 */
 .detect-view :deep(.n-modal-scroll-content) {
   min-height: auto !important;
 }
 .detect-view :deep(.n-modal) {
   max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
-.detect-view :deep(.n-modal .n-card) {
+.detect-view :deep(.n-card) {
   max-height: calc(100vh - 64px);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
-.detect-view :deep(.n-modal .n-card__content) {
-  overflow-y: auto;
-  flex: 1;
+.detect-view :deep(.n-card__content) {
+  flex: 1 1 auto;
   min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 </style>
