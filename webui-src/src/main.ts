@@ -9,6 +9,21 @@ import CompanionReplaceView from "./views/CompanionReplaceView.vue";
 import SettingsView from "./views/SettingsView.vue";
 
 import { i18n } from "./i18n";
+import { FAVICON_BASE64 } from "./assets/faviconBase64";
+
+// AstrBot 页面只加载 JS bundle，静态图片资源无法用相对路径引用，
+// 故 favicon 也改用 base64 内嵌。
+(function setFavicon() {
+  try {
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.href = FAVICON_BASE64;
+  } catch { /* ignore */ }
+})();
 
 const router = createRouter({
   history: createWebHashHistory(),

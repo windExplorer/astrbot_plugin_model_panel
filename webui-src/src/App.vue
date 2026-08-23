@@ -85,7 +85,7 @@ import { useI18n } from "vue-i18n";
 import { PLUGIN_VERSION } from "./version";
 import { useTheme } from "./stores/theme";
 import { useLocale, type AppLocale } from "./stores/locale";
-import logoUrl from "./assets/logo.png";
+import { LOGO_BASE64 as logoUrl } from "./assets/logoBase64";
 
 const route = useRoute();
 const { t, locale } = useI18n();
