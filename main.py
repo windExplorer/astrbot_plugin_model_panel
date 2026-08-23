@@ -230,6 +230,8 @@ class ModelPanelPlugin(Star):
         cfg = cfg if isinstance(cfg, dict) else {}
         pid = str(cfg.get("id") or "")
         ptype = str(cfg.get("type") or cfg.get("provider_type") or "")
+        # 供应商名 = 提供商源唯一 ID（provider_source_id），其次 name/provider。
+        # 绝不能退回用 type（openai_chat_completion 这类）当供应商名。
         name = str(
             cfg.get("provider_source_id")
             or cfg.get("name")
@@ -250,6 +252,30 @@ class ModelPanelPlugin(Star):
                 model = str(getattr(provider, "get_model", lambda: "")() or "")
             except Exception:
                 model = ""
+        # 最后兜底：从 cfg 里找 model 字段
+        if not model:
+            for k in ("model", "default_model", "selected_model"):
+                v = cfg.get(k)
+                if isinstance(v, str) and v.strip():
+                    model = v.strip()
+                    break
+        # 如果 model 还是空，给一个基于 name 或 id 的可读 fallback（避免下拉显示空白）
+        if not model:
+            base = name or pid or "unknown"
+            # 大部分 provider 把 model 写在 cfg.model，但有些隐藏在 list 形式
+            for k in ("models", "model_list"):
+                lst = cfg.get(k)
+                if isinstance(lst, list) and lst:
+                    if isinstance(lst[0], str):
+                        model = lst[0]
+                        break
+                    if isinstance(lst[0], dict):
+                        model = str(lst[0].get("model") or lst[0].get("name") or "")
+                        if model:
+                            break
+            if not model:
+                # 标识成"未指定"而不是空字符串，避免前端下拉空白
+                model = f"{base} (model unknown)"
         return {
             "id": pid,
             "name": name,

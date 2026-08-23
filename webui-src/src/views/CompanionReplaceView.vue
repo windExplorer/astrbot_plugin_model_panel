@@ -376,14 +376,18 @@ onMounted(async () => {
   try {
     const data = await apiGet<{
       items: { id: string; name: string; model: string }[];
-      models: string[];
+      models?: string[];
     }>("/panel/providers");
     // 优先用后端返回的去重 models 列表，避免 NSelect 里出现多个相同名字的选项
+    // 后端未返回 models（旧版 zip 兼容）时，从 items 去重 fallback
     const set = new Set<string>();
     if (Array.isArray(data.models) && data.models.length) {
       data.models.forEach((m) => m && set.add(m));
     } else if (data.items) {
-      data.items.forEach((p) => (p.model || p.id) && set.add(p.model || p.id));
+      data.items.forEach((p) => {
+        const m = (p.model || p.id || "").trim();
+        if (m) set.add(m);
+      });
     }
     providers.value = [...set];
   } catch (e) {
