@@ -75,17 +75,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-async function bridgeRequest(br: Bridge, path: string, method: string, body?: unknown): Promise<any> {
+async function bridgeRequest(br: Bridge, path: string, method: string, body?: unknown, timeoutMs?: number): Promise<any> {
   const url = new URL(path, "https://astrbot-plugin-page.local/");
   const routePath = url.pathname.replace(/^\/+/, "");
   const candidates = bridgeEndpointCandidates(routePath);
   const errors: string[] = [];
+  const ms = timeoutMs ?? 6000;
 
   if (method === "GET") {
     const params = Object.fromEntries(url.searchParams.entries());
     for (const c of candidates) {
       try {
-        const p = await withTimeout(br.apiGet(c, Object.keys(params).length ? params : undefined), 6000, "GET " + c);
+        const p = await withTimeout(br.apiGet(c, Object.keys(params).length ? params : undefined), ms, "GET " + c);
         if (isRouteMissingPayload(p)) {
           errors.push(p.message || p.error || "未找到该路由");
           continue;
@@ -106,7 +107,7 @@ async function bridgeRequest(br: Bridge, path: string, method: string, body?: un
   }
   for (const c of candidates) {
     try {
-      const r = await withTimeout(br.apiPost(c, payload), 6000, "POST " + c);
+      const r = await withTimeout(br.apiPost(c, payload), ms, "POST " + c);
       if (isRouteMissingPayload(r)) {
         errors.push(r.message || r.error || "未找到该路由");
         continue;
@@ -131,14 +132,14 @@ function normalize(payload: any): any {
   return payload;
 }
 
-async function apiRaw(path: string, method: string, body?: unknown): Promise<any> {
+async function apiRaw(path: string, method: string, body?: unknown, timeoutMs?: number): Promise<any> {
   const br = await getPageBridge();
-  const payload = await bridgeRequest(br, path, method, body);
+  const payload = await bridgeRequest(br, path, method, body, timeoutMs);
   return normalize(payload);
 }
 
 /** GET 请求，endpoint 形如 "overview"、"providers"（不带插件名、不带 /api/plug）。 */
-export async function apiGet<T = any>(endpoint: string, params?: Record<string, any>): Promise<T> {
+export async function apiGet<T = any>(endpoint: string, params?: Record<string, any>, timeoutMs?: number): Promise<T> {
   let path = endpoint;
   if (params && Object.keys(params).length) {
     const qs = new URLSearchParams();
@@ -150,12 +151,12 @@ export async function apiGet<T = any>(endpoint: string, params?: Record<string, 
     const q = qs.toString();
     if (q) path = endpoint + "?" + q;
   }
-  return apiRaw(path, "GET") as Promise<T>;
+  return apiRaw(path, "GET", undefined, timeoutMs) as Promise<T>;
 }
 
 /** POST 请求，body 作为 JSON 负载发送。 */
-export async function apiPost<T = any>(endpoint: string, body?: unknown): Promise<T> {
-  return apiRaw(endpoint, "POST", body || {}) as Promise<T>;
+export async function apiPost<T = any>(endpoint: string, body?: unknown, timeoutMs?: number): Promise<T> {
+  return apiRaw(endpoint, "POST", body || {}, timeoutMs) as Promise<T>;
 }
 
 // ---------- 类型 ----------
@@ -304,7 +305,7 @@ export async function startTestAllStream(
         fail_count: number;
         skip_count: number;
         error?: string | null;
-      }>(`/panel/providers/session/${r.session_id}`);
+      }>(`/panel/providers/session/${r.session_id}`, undefined, 30000);
       if (snap && Array.isArray(snap.items)) {
         for (let i = 0; i < snap.items.length; i++) {
           const it = snap.items[i];

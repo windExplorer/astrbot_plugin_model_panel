@@ -395,7 +395,9 @@ async function loadProviders() {
 async function testOne(id: string) {
   pending[id] = true;
   try {
-    const r = await apiPost<TestResult>("/panel/providers/test", { id });
+    // 单独检测：后端会阻塞到 provider.test() 返回（最长 test_timeout + 5s），
+    // 前端 bridge 默认 6s 会误杀，这里用 180s 兜底
+    const r = await apiPost<TestResult>("/panel/providers/test", { id }, 180000);
     results[id] = r;
   } catch (e) {
     results[id] = {
