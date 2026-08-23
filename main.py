@@ -11,8 +11,8 @@ from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 from quart import Response, request
 
-from storage import Storage
-from session_manager import SessionManager
+from .storage import Storage
+from .session_manager import SessionManager
 
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 
