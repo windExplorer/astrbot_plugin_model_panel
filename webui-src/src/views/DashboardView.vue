@@ -1,5 +1,10 @@
 <template>
   <div class="dashboard">
+    <div class="dash-toolbar">
+      <n-button quaternary :loading="refreshing" @click="manualRefresh">
+        {{ t("detect.btnRefresh") }}
+      </n-button>
+    </div>
     <n-grid :x-gap="14" :y-gap="14" cols="1 s:2 m:4" responsive="screen">
       <n-gi>
         <n-card size="small">
@@ -99,20 +104,48 @@ import { apiGet, type Overview } from "../api";
 
 const { t } = useI18n();
 const overview = ref<Overview | null>(null);
+const refreshing = ref(false);
 
-onMounted(async () => {
+async function loadOverview() {
   try {
     overview.value = await apiGet<Overview>("/panel/overview");
   } catch (e) {
     console.error("加载总览失败", e);
   }
+}
+
+async function manualRefresh() {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await loadOverview();
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+onMounted(() => {
+  loadOverview();
+  // 切回本页 / 从其它标签页切回时自动刷新，保证展示最新的默认模型与统计
+  document.addEventListener("visibilitychange", onVisibility);
 });
+
+function onVisibility() {
+  if (document.visibilityState === "visible") {
+    loadOverview();
+  }
+}
 </script>
 
 <style scoped>
 .dashboard {
   display: flex;
   flex-direction: column;
+}
+.dash-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 .mt-3 {
   margin-top: 12px;

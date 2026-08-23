@@ -3,10 +3,10 @@
     <!-- 顶部操作栏：sticky 不随主区滚动 -->
     <n-card :title="t('detect.title')" size="small" class="toolbar-card">
       <n-space align="center" wrap>
-        <n-button type="primary" :loading="testing" @click="testAll">
+        <n-button type="primary" :loading="testing" :disabled="testing" @click="testAll">
           {{ testing ? t("detect.btnAllLoading") : t("detect.btnAll") }}
         </n-button>
-        <n-button quaternary :loading="refreshing" @click="manualRefresh">
+        <n-button quaternary :loading="refreshing" :disabled="testing" @click="manualRefresh">
           {{ t("detect.btnRefresh") }}
         </n-button>
         <n-divider vertical />
@@ -34,6 +34,27 @@
         </n-checkbox>
         <n-text depth="3" class="hint">{{ t("detect.selectHint") }}</n-text>
       </n-space>
+
+      <!-- 检测中进度提示：明确告诉用户当前在检测第几个 -->
+      <n-alert v-if="testing" type="info" :show-icon="false" class="testing-banner">
+        <n-space align="center" justify="space-between" wrap>
+          <n-text strong>
+            {{ t("detect.testingProgress", { current: testProgress.current, total: testProgress.total }) }}
+          </n-text>
+          <n-text depth="3">
+            {{ t("detect.testingRunning", { ok: lastSessionStats?.ok_count ?? 0, fail: lastSessionStats?.fail_count ?? 0 }) }}
+          </n-text>
+        </n-space>
+        <n-progress
+          class="testing-progress"
+          type="line"
+          :percentage="testProgress.percent"
+          :show-indicator="false"
+          :height="4"
+          :border-radius="2"
+          status="info"
+        />
+      </n-alert>
     </n-card>
 
     <!-- 主内容区：每个供应商一张独立表格，标题显示供应商名 + 模型数 -->
@@ -158,6 +179,7 @@
 import { computed, h, onMounted, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import {
+  NAlert,
   NButton,
   NCard,
   NCheckbox,
@@ -168,6 +190,7 @@ import {
   NDivider,
   NEmpty,
   NModal,
+  NProgress,
   NSelect,
   NSpace,
   NTag,
@@ -201,6 +224,8 @@ const lastSessionStats = ref<{
   skip_count: number;
   total: number;
 } | null>(null);
+// 检测进度（用于顶部"正在检测第 X/n 个"提示）
+const testProgress = reactive({ current: 0, total: 0, percent: 0 });
 const loadingFailed = ref(false);
 const loadingErrorMsg = ref("");
 
@@ -418,6 +443,11 @@ async function testOne(id: string) {
 async function testAll() {
   if (testing.value) return;
   testing.value = true;
+  // 重置检测进度与统计
+  testProgress.current = 0;
+  testProgress.total = 0;
+  testProgress.percent = 0;
+  lastSessionStats.value = null;
   const skip = Object.keys(enabled).filter((k) => !enabled[k]);
   for (const k of Object.keys(pending)) pending[k] = false;
   try {
@@ -425,7 +455,8 @@ async function testAll() {
       startTestAllStream(
         { skip },
         {
-          onStart: () => {
+          onStart: (e) => {
+            testProgress.total = e.total || 0;
             for (const k of Object.keys(enabled)) {
               if (enabled[k]) pending[k] = true;
             }
@@ -434,6 +465,10 @@ async function testAll() {
             const it = e.item;
             results[it.id] = it;
             pending[it.id] = false;
+            testProgress.current = Math.min(e.index || testProgress.current, e.total || testProgress.total);
+            testProgress.percent = e.total
+              ? Math.round((testProgress.current / e.total) * 100)
+              : 0;
           },
           onDone: (e) => {
             lastSessionStats.value = {
@@ -442,6 +477,8 @@ async function testAll() {
               skip_count: e.skip_count,
               total: e.total,
             };
+            testProgress.current = testProgress.total || e.total || 0;
+            testProgress.percent = 100;
             for (const k of Object.keys(pending)) pending[k] = false;
             resolve();
           },
@@ -453,9 +490,18 @@ async function testAll() {
       );
     });
   } catch (e) {
+    const msg = String((e as Error)?.message || e);
     console.error("一键检测失败", e);
+    if (msg.includes("已有检测任务")) {
+      message.warning(t("detect.testingBusyHint"));
+    } else {
+      message.error(t("detect.testingFail", { msg }));
+    }
   } finally {
     testing.value = false;
+    testProgress.current = 0;
+    testProgress.total = 0;
+    testProgress.percent = 0;
     for (const k of Object.keys(pending)) pending[k] = false;
   }
 }
@@ -476,7 +522,7 @@ async function manualRefresh() {
 // ---------- 表格列（固定宽度，所有列对齐）----------
 const COL = {
   check: 56,
-  provider: 220,
+  provider: 300,
   vendor: 160,
   status: 110,
   latency: 100,
@@ -505,18 +551,15 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     key: "model",
     width: COL.provider,
     render(row) {
-      return h("div", null, [
-        h("div", { style: "font-weight: 600" }, [
-          row.name || row.id,
-          row.is_default
-            ? h(NTag, { size: "tiny", type: "warning", style: "margin-left: 6px", round: true },
-                () => t("common.default"))
-            : null,
-        ]),
-        h("div", { style: "color: var(--muted); font-size: 12px; word-break: break-all" }, [
-          // 完整 model 字符串，包括 xx/xx/xx 路径形式，绝不截断
-          row.model || row.type || row.id || "",
-        ]),
+      // 模型列显示"供应商/模型"完整路径（如 NVIDIA/deepseek-ai/deepseek-v4-flash-0731），
+      // 优先用后端拼好的 display_model，其次回退到 model / name。
+      const model = row.display_model || row.model || row.name || row.id || "";
+      return h("div", { style: "font-weight: 700; font-size: 14px; word-break: break-all; line-height: 1.4" }, [
+        model,
+        row.is_default
+          ? h(NTag, { size: "tiny", type: "warning", style: "margin-left: 6px", round: true },
+              () => t("common.default"))
+          : null,
       ]);
     },
   },
@@ -560,28 +603,20 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
       const r = results[row.id];
       if (!r) return h(NText, { depth: 3 }, () => "—");
       const tag = resultTagFor(r);
-      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start; width: 100%" }, [
+      // 单行展示：状态 tag + 查看详情（error_code/状态码）。error 详情在弹窗里看。
+      return h("div", { style: "display: flex; align-items: center; gap: 8px; width: 100%; flex-wrap: wrap" }, [
         h(NTag, { type: tag.type, size: "small", round: true }, () => tag.label),
         h(NTooltip, { delay: 200 }, {
           trigger: () =>
             h(NButton, {
               text: true,
               type: "primary",
-              size: "tiny",
+              size: "small",
               onClick: () => openDetail(row),
-              style: "font-family: ui-monospace, Menlo, monospace; font-size: 11px; padding: 0; height: auto",
-            }, () => r.error_code || (r.ok ? "ok" : "—")),
+              style: "font-family: ui-monospace, Menlo, monospace; font-size: 12px; font-weight: 600; padding: 0; height: auto",
+            }, () => t("detect.detailViewBtn")),
           default: () => r.error || t("detect.detail.openRaw"),
         }),
-        r.error
-          ? h(NText, {
-              depth: 3,
-              style:
-                "font-size: 12px; width: 100%; word-break: break-all; " +
-                "white-space: normal; overflow: hidden; text-overflow: ellipsis; " +
-                "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;",
-            }, () => r.error)
-          : null,
       ]);
     },
   },
@@ -633,7 +668,15 @@ onMounted(async () => {
     console.error("初始化失败", e);
   }
   await loadResults();
+  // 从其它标签页/后台切回时自动刷新结果与列表（检测进行中不打扰）
+  document.addEventListener("visibilitychange", onVisibility);
 });
+
+function onVisibility() {
+  if (document.visibilityState === "visible" && !testing.value) {
+    loadResults();
+  }
+}
 </script>
 
 <style scoped>
@@ -652,6 +695,12 @@ onMounted(async () => {
 }
 .hint {
   font-size: 12px;
+}
+.testing-banner {
+  margin-top: 12px;
+}
+.testing-progress {
+  margin-top: 8px;
 }
 .groups {
   display: flex;

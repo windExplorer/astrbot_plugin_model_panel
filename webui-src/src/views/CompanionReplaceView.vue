@@ -7,6 +7,9 @@
           <n-button type="primary" :loading="saving" @click="save">
             {{ saving ? t("companion.btnSaving") : t("companion.btnSave") }}
           </n-button>
+          <n-button quaternary :loading="refreshing" @click="manualRefresh">
+            {{ t("companion.btnRefresh") }}
+          </n-button>
           <n-text v-if="configMode" depth="3">
             {{ t("companion.configMode", { mode: configMode || t("companion.configModeNone") }) }}
           </n-text>
@@ -18,23 +21,53 @@
           </n-text>
         </n-space>
 
-        <n-empty
-          v-if="!usedModels.length"
-          :description="t('companion.usedModelsEmpty')"
-          class="empty"
-        />
+        <n-tabs type="line" class="mt-2">
+          <!-- Tab1：精简配置（初心）—— 按模型名替换，不管主备位置 -->
+          <n-tab-pane name="simple" :tab="t('companion.tabSimple')">
+            <n-text depth="3" class="block">
+              {{ t("companion.simpleExplain") }}
+            </n-text>
+            <n-empty
+              v-if="!simpleRows.length"
+              :description="t('companion.usedModelsEmpty')"
+              class="empty"
+            />
+            <n-data-table
+              v-else
+              :columns="simpleColumns"
+              :data="simpleRows"
+              :pagination="false"
+              size="small"
+              :bordered="true"
+              :single-line="false"
+              :row-key="(row) => row.value"
+              :scroll-x="900"
+            />
+          </n-tab-pane>
 
-        <n-data-table
-          v-else
-          :columns="columns"
-          :data="usedModels"
-          :pagination="false"
-          size="small"
-          :bordered="true"
-          :single-line="false"
-          :row-key="(row) => row.value"
-          :scroll-x="900"
-        />
+          <!-- Tab2：主次区分配置 —— 主模型 / 备用模型分开替换 -->
+          <n-tab-pane name="advanced" :tab="t('companion.tabAdvanced')">
+            <n-text depth="3" class="block">
+              {{ t("companion.advancedExplain") }}
+            </n-text>
+            <n-empty
+              v-if="!advRows.length"
+              :description="t('companion.usedModelsEmpty')"
+              class="empty"
+            />
+            <n-data-table
+              v-else
+              :columns="advColumns"
+              :data="advRows"
+              :pagination="false"
+              size="small"
+              :bordered="true"
+              :single-line="false"
+              :row-key="(row) => row.aggKey"
+              :scroll-x="900"
+            />
+          </n-tab-pane>
+        </n-tabs>
 
         <n-collapse class="mt-3" :default-expanded-names="[]">
           <n-collapse-item :title="unconfiguredTitle" name="unconfigured">
@@ -128,6 +161,8 @@ import {
   NModal,
   NSelect,
   NSpace,
+  NTabPane,
+  NTabs,
   NTag,
   NText,
   NTooltip,
@@ -147,9 +182,13 @@ const message = useMessage();
 
 const loaded = ref<boolean | null>(null);
 const items = ref<CompanionProviderItem[]>([]);
-const providers = ref<{ model: string; vendor: string }[]>([]);
-const replacements = reactive<Record<string, string>>({});
+const providers = ref<{ id: string; model: string; vendor: string }[]>([]);
+// Tab1 精简配置：key = 纯 model 名
+const simpleReplacements = reactive<Record<string, string>>({});
+// Tab2 主次区分配置：key = "kind:model名"
+const advReplacements = reactive<Record<string, string>>({});
 const saving = ref(false);
+const refreshing = ref(false);
 const configMode = ref("");
 const configuredCount = ref(0);
 const totalKeys = ref(0);
@@ -157,29 +196,29 @@ const totalKeys = ref(0);
 const detailVisible = ref(false);
 const detailModel = ref<{
   value: string;
-  labels: string[];
   keys: { key: string; label: string }[];
 } | null>(null);
 
-function openDetail(model: {
-  value: string;
-  labels: string[];
-  keys: { key: string; label: string }[];
-}) {
+function openDetail(model: { value: string; keys: { key: string; label: string }[] }) {
   detailModel.value = model;
   detailVisible.value = true;
 }
 
 function formatAllModels(): string {
   try {
-    return JSON.stringify(usedModels.value, null, 2);
+    return JSON.stringify(advRows.value, null, 2);
   } catch {
-    return String(usedModels.value);
+    return String(advRows.value);
   }
 }
 
-// value(模型名) -> [{ key, label }, ...]
-const usedModels = computed(() => {
+// ---------- Tab1 精简配置：按纯 model 名聚合，不区分主/备 ----------
+type SimpleRow = {
+  value: string;
+  keys: { key: string; label: string }[];
+  labels: string[];
+};
+const simpleRows = computed<SimpleRow[]>(() => {
   const map = new Map<string, { key: string; label: string }[]>();
   for (const it of items.value) {
     if (!it.value) continue;
@@ -191,6 +230,33 @@ const usedModels = computed(() => {
     keys,
     labels: keys.map((k) => k.key),
   }));
+});
+
+// ---------- Tab2 主次区分配置：按 kind + model 聚合 ----------
+type AdvRow = {
+  aggKey: string;
+  value: string;
+  kind: string;
+  keys: { key: string; label: string }[];
+  labels: string[];
+};
+const advRows = computed<AdvRow[]>(() => {
+  const map = new Map<string, { key: string; label: string }[]>();
+  const kindOf = new Map<string, string>();
+  for (const it of items.value) {
+    if (!it.value) continue;
+    const aggKey = `${it.kind || "main"}:${it.value}`;
+    if (!map.has(aggKey)) {
+      map.set(aggKey, []);
+      kindOf.set(aggKey, it.kind || "main");
+    }
+    map.get(aggKey)!.push({ key: it.key, label: it.label || it.key });
+  }
+  return [...map.entries()].map(([aggKey, keys]) => {
+    const value = aggKey.slice(aggKey.indexOf(":") + 1);
+    const kind = kindOf.get(aggKey) || "main";
+    return { aggKey, value, kind, keys, labels: keys.map((k) => k.key) };
+  });
 });
 
 const unconfiguredItems = computed(() =>
@@ -205,7 +271,7 @@ const unconfiguredTitle = computed(() =>
   t("companion.sectionUnconfigured", { n: unconfiguredItems.value.length }),
 );
 
-// value(模型名) 完整 model 字符串（含 xx/xx/xx 路径形式）作为 NSelect 的 value
+// label 展示用 "vendor · model"（含 xx/xx/xx 路径形式）
 function modelLabel(p: { model: string; vendor: string }): string {
   if (p.vendor && p.vendor !== p.model) {
     return `${p.vendor} · ${p.model}`;
@@ -213,12 +279,14 @@ function modelLabel(p: { model: string; vendor: string }): string {
   return p.model;
 }
 
+// NSelect 的 value 必须是 provider id：陪伴插件 config 里存的是 provider id，
+// 写回 provider id 才能被陪伴插件下拉框正确匹配/显示。label 用 vendor · model。
 function availableOptions(value: string): { label: string; value: string }[] {
   const opts: { label: string; value: string }[] = providers.value.map((p) => ({
     label: modelLabel(p),
-    value: p.model,
+    value: p.id,
   }));
-  // 去重
+  // 去重（按 provider id）
   const seen = new Set<string>();
   const dedup = opts.filter((o) => {
     if (seen.has(o.value)) return false;
@@ -232,12 +300,31 @@ function availableOptions(value: string): { label: string; value: string }[] {
   return [{ label: t("companion.selectNone"), value: "" }, ...dedup];
 }
 
+function persistReplacements() {
+  try {
+    localStorage.setItem(
+      "model_panel.companion.replacements",
+      JSON.stringify({ simple: simpleReplacements, advanced: advReplacements }),
+    );
+  } catch { /* ignore */ }
+}
+
+// ---------- 保存 ----------
 async function save() {
-  const replacementsList: { old: string; replacement: string }[] = [];
-  for (const [oldValue, newValue] of Object.entries(replacements)) {
-    if (newValue && newValue !== oldValue) {
-      replacementsList.push({ old: oldValue, replacement: newValue });
-    }
+  const replacementsList: { old: string; replacement: string; kind: string }[] = [];
+  // Tab1 精简配置：old = model 名，kind = "any"（主备都替换）
+  for (const [model, newValue] of Object.entries(simpleReplacements)) {
+    if (!newValue || newValue === model) continue;
+    replacementsList.push({ old: model, replacement: newValue, kind: "any" });
+  }
+  // Tab2 主次区分配置：old = model 名，kind 从 aggKey 拆出
+  for (const [aggKey, newValue] of Object.entries(advReplacements)) {
+    if (!newValue) continue;
+    const idx = aggKey.indexOf(":");
+    const kind = idx >= 0 ? aggKey.slice(0, idx) : "main";
+    const old = idx >= 0 ? aggKey.slice(idx + 1) : aggKey;
+    if (newValue === old) continue;
+    replacementsList.push({ old, replacement: newValue, kind });
   }
   if (!replacementsList.length) {
     message.warning(t("companion.saveEmpty"));
@@ -251,6 +338,9 @@ async function save() {
     );
     if (res.ok) {
       message.success(t("companion.saveSuccess", { n: res.changed_count }));
+      simpleReplacements.length = 0;
+      advReplacements.length = 0;
+      persistReplacements();
       await reload();
     } else {
       message.error(t("companion.saveFail", { msg: res.error || "" }));
@@ -276,92 +366,139 @@ async function reload() {
   }
 }
 
-const columns = computed<
-  DataTableColumn<{
-    value: string;
-    labels: string[];
-    keys: { key: string; label: string }[];
-  }>[]
->(() => [
+async function manualRefresh() {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await Promise.all([reload(), loadAvailableModels()]);
+    message.success(t("companion.refreshed"));
+  } catch (e) {
+    console.error(e);
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+// ---------- 表格列 ----------
+function renderModelTag(row: { value: string; kind?: string }) {
+  return row.kind === "fallback"
+    ? h(
+        NTag,
+        {
+          size: "small",
+          type: "warning",
+          round: true,
+          bordered: false,
+          style: "margin-left: 8px; vertical-align: middle",
+        },
+        () => t("companion.kindFallback"),
+      )
+    : h(
+        NTag,
+        {
+          size: "small",
+          type: "default",
+          round: true,
+          bordered: false,
+          style: "margin-left: 8px; vertical-align: middle",
+        },
+        () => t("companion.kindMain"),
+      );
+}
+
+function renderModelCell(row: { value: string; kind?: string; keys: { key: string; label: string }[]; labels: string[] }) {
+  const PREVIEW = 7;
+  const total = row.keys.length;
+  const previewLabels = row.keys
+    .slice(0, PREVIEW)
+    .map((k) => k.label)
+    .join("\n");
+  const rest = total - PREVIEW;
+  const tooltipBody =
+    rest > 0
+      ? previewLabels + "\n" + t("companion.tooltipMore", { n: rest })
+      : previewLabels || t("companion.noLabels");
+  return h("div", null, [
+    h("div", { style: "font-weight: 600" }, [
+      row.value,
+      row.kind ? renderModelTag(row) : null,
+    ]),
+    h(
+      NTooltip,
+      {
+        delay: 200,
+        placement: "top-start",
+        style: "max-width: 360px; white-space: pre-line; word-break: break-all",
+      },
+      {
+        trigger: () =>
+          h(
+            NTag,
+            {
+              size: "small",
+              type: "info",
+              round: true,
+              bordered: false,
+              style: "margin-top: 4px; cursor: pointer",
+              onClick: () =>
+                openDetail({ value: row.value, keys: row.keys }),
+            },
+            () => `${t("companion.labelsTitle")}: ${row.labels.length}`,
+          ),
+        default: () => tooltipBody,
+      },
+    ),
+  ]);
+}
+
+function renderReplaceCell(
+  aggKey: string,
+  currentValue: string,
+  target: Record<string, string>,
+) {
+  return h(NSelect, {
+    value: target[aggKey] ?? "",
+    options: availableOptions(currentValue),
+    size: "medium",
+    filterable: true,
+    clearable: true,
+    "menu-size": "large",
+    onUpdateValue: (v: string) => {
+      target[aggKey] = v;
+      persistReplacements();
+    },
+  });
+}
+
+const simpleColumns = computed<DataTableColumn<SimpleRow>[]>(() => [
   {
     title: t("companion.colModel"),
     key: "value",
     minWidth: 260,
-    render(row) {
-      // 悬浮 tooltip：最多展示前 TOOLTIP_PREVIEW 个 key 的中文标签，
-      // 其余折叠为"+N 个 · 点击查看"，避免超长溢出屏幕被截断。
-      const PREVIEW = 7;
-      const total = row.keys.length;
-      const previewLabels = row.keys
-        .slice(0, PREVIEW)
-        .map((k) => k.label)
-        .join("\n");
-      const rest = total - PREVIEW;
-      const tooltipBody =
-        rest > 0
-          ? previewLabels +
-            "\n" +
-            t("companion.tooltipMore", { n: rest })
-          : previewLabels || t("companion.noLabels");
-      return h("div", null, [
-        // 模型名：普通 NText，不再是按钮
-        h("div", { style: "font-weight: 600" }, row.value),
-        // 适用于：NTag 包裹 + NTooltip 预览 + 点击弹窗
-        h(
-          NTooltip,
-          {
-            delay: 200,
-            placement: "top-start",
-            // 控制 tooltip 内容换行与最大宽度，避免屏幕边缘被截断
-            style: "max-width: 360px; white-space: pre-line; word-break: break-all",
-          },
-          {
-            trigger: () =>
-              h(
-                NTag,
-                {
-                  size: "small",
-                  type: "info",
-                  round: true,
-                  bordered: false,
-                  style: "margin-top: 4px; cursor: pointer",
-                  onClick: () => openDetail(row),
-                },
-                () => `${t("companion.labelsTitle")}: ${row.labels.length}`,
-              ),
-            default: () => tooltipBody,
-          },
-        ),
-      ]);
-    },
+    render: (row) => renderModelCell(row),
   },
   {
     title: t("common.save"),
     key: "new",
     minWidth: 280,
-    render(row) {
-      // 用 NSelect 配合 filterable=true 实现搜索下拉：
-      // 模型多时易找，且 Naive UI 自带菜单高度自适应。
-      return h(NSelect, {
-        value: replacements[row.value] ?? "",
-        options: availableOptions(row.value),
-        size: "medium",
-        filterable: true,
-        clearable: true,
-        // 让下拉菜单更大，选项更高（避免紧凑看不清）
-        "menu-size": "large",
-        onUpdateValue: (v: string) => {
-          replacements[row.value] = v;
-          // 持久化用户的替换选择（localStorage，避免误刷新丢失）
-          try {
-            localStorage.setItem(
-              "model_panel.companion.replacements",
-              JSON.stringify(replacements),
-            );
-          } catch { /* ignore */ }
-        },
-      });
-    },
+    render: (row) =>
+      renderReplaceCell(row.value, row.value, simpleReplacements),
+  },
+]);
+
+const advColumns = computed<DataTableColumn<AdvRow>[]>(() => [
+  {
+    title: t("companion.colModel"),
+    key: "value",
+    minWidth: 260,
+    render: (row) => renderModelCell(row),
+  },
+  {
+    title: t("common.save"),
+    key: "new",
+    minWidth: 280,
+    render: (row) =>
+      renderReplaceCell(row.aggKey, row.value, advReplacements),
   },
 ]);
 
@@ -393,24 +530,31 @@ const detailKeyColumns = computed<DataTableColumn<{ key: string; label: string }
   },
 ]);
 
-onMounted(async () => {
-  await reload();
+async function loadAvailableModels() {
   try {
     const data = await apiGet<{
       items: { id: string; name: string; model: string }[];
       models?: string[];
-      provider_models?: { model: string; vendor: string }[];
+      provider_models?: { model: string; vendor: string; id?: string }[];
     }>("/panel/providers");
-    // 优先用后端返回的 provider_models（{model, vendor}），下拉 label 可拼 "vendor · model"；
-    // 旧版 zip 没这字段时，从 items/models 去重 fallback
-    const list: { model: string; vendor: string }[] = [];
+    // 优先用后端返回的 provider_models（{model, vendor, id}）：
+    // label 拼 "vendor · model"，value 用 provider id（陪伴插件 config 存的是 id）。
+    // 旧版 zip 没 id 字段时，从 items 的 id 补齐，仍以 provider id 作为 value。
+    const list: { id: string; model: string; vendor: string }[] = [];
     if (Array.isArray(data.provider_models) && data.provider_models.length) {
       for (const m of data.provider_models) {
-        if (m && m.model) list.push({ model: m.model, vendor: m.vendor || "" });
+        if (m && m.model) list.push({ id: m.id || m.model, model: m.model, vendor: m.vendor || "" });
       }
     } else if (Array.isArray(data.models) && data.models.length) {
+      const byModel = new Map<string, { id: string; vendor: string }>();
+      for (const p of data.items) {
+        const m = (p.model || "").trim();
+        if (m && !byModel.has(m)) byModel.set(m, { id: p.id || p.name || m, vendor: p.name || "" });
+      }
       for (const m of data.models) {
-        if (m) list.push({ model: m, vendor: "" });
+        if (!m) continue;
+        const info = byModel.get(m) || { id: m, vendor: "" };
+        list.push({ id: info.id, model: m, vendor: info.vendor });
       }
     } else if (data.items) {
       const seen = new Set<string>();
@@ -418,7 +562,7 @@ onMounted(async () => {
         const m = (p.model || p.id || "").trim();
         if (m && !seen.has(m)) {
           seen.add(m);
-          list.push({ model: m, vendor: p.name || "" });
+          list.push({ id: p.id || p.name || m, model: m, vendor: p.name || "" });
         }
       }
     }
@@ -426,17 +570,35 @@ onMounted(async () => {
   } catch (e) {
     console.error("加载可用模型失败", e);
   }
+}
+
+onMounted(async () => {
+  await reload();
+  await loadAvailableModels();
   // 恢复用户上次的替换选择（localStorage，避免误操作刷新丢失）
   try {
     const saved = localStorage.getItem("model_panel.companion.replacements");
     if (saved) {
       const obj = JSON.parse(saved);
-      for (const [k, v] of Object.entries(obj || {})) {
-        if (typeof v === "string") replacements[k] = v;
+      const simple = obj?.simple || {};
+      const adv = obj?.advanced || {};
+      for (const [k, v] of Object.entries(simple)) {
+        if (typeof v === "string") simpleReplacements[k] = v;
+      }
+      for (const [k, v] of Object.entries(adv)) {
+        if (typeof v === "string") advReplacements[k] = v;
       }
     }
   } catch { /* ignore */ }
+  // 从其它标签页/后台切回时自动刷新配置（不重置用户已选的替换）
+  document.addEventListener("visibilitychange", onVisibility);
 });
+
+function onVisibility() {
+  if (document.visibilityState === "visible") {
+    reload();
+  }
+}
 </script>
 
 <style scoped>
@@ -445,7 +607,7 @@ onMounted(async () => {
   flex-direction: column;
 }
 .toolbar {
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 .empty {
   padding: 20px 0;

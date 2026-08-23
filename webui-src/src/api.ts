@@ -165,6 +165,8 @@ export interface ProviderItem {
   name: string;
   type: string;
   model: string;
+  /** 供应商/模型 完整展示名（如 NVIDIA/deepseek-ai/...） */
+  display_model?: string;
   is_default?: boolean;
 }
 
@@ -187,7 +189,10 @@ export interface TestResult {
 
 export interface CompanionProviderItem {
   key: string;
+  /** 展示/匹配用的 model 名 */
   value: string;
+  /** 陪伴插件 config 里实际存的 provider id */
+  provider_id?: string;
   configured?: boolean;
   /** 中文标签（来自后端 COMPANION_KEY_LABELS 映射） */
   label?: string;
@@ -305,7 +310,7 @@ export async function startTestAllStream(
         fail_count: number;
         skip_count: number;
         error?: string | null;
-      }>(`/panel/providers/session/${r.session_id}`, undefined, 30000);
+      }>(`/panel/providers/session/${r.session_id}`, undefined, 180000);
       if (snap && Array.isArray(snap.items)) {
         for (let i = 0; i < snap.items.length; i++) {
           const it = snap.items[i];

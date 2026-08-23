@@ -130,6 +130,81 @@ def _normalize_error(exc: BaseException | str) -> tuple[str, str]:
     return "unknown", raw[:ERROR_MESSAGE_MAX]
 
 
+# 陪伴插件的 provider 配置真实存放在 schema 分组 model_assignment_config 下，
+# 同时存在一层 invisible 的顶层扁平 legacy 副本。陪伴插件读写 config 时：
+#   - 读取（_flat_get）：优先读 schema 分组嵌套值，其次读顶层扁平副本；
+#   - 写入（_set_config_value / _set_into_config / _set_schema_group_config_value）：
+#     递归同步所有出现位置（含扁平 + 分组嵌套）。
+# 我们插件原先只用 cfg[key] 操作顶层扁平副本，导致改的是"假配置"，
+# 陪伴插件仍读到分组里的旧值——这就是"自欺欺人"的根因。下面复刻陪伴插件的语义。
+_MISSING = object()
+
+# 陪伴插件 model_assignment_config（模型分流）schema 分组名
+COMPANION_PROVIDER_GROUP = "model_assignment_config"
+
+
+def _flat_get(cfg: Any, key: str, default: Any = _MISSING) -> Any:
+    """复刻陪伴插件 helpers._flat_get：嵌套 schema 分组优先，其次扁平 legacy 副本。
+
+    保证我们读到的 provider 值与陪伴插件运行时看到的一致。
+    """
+    if isinstance(cfg, dict):
+        for value in cfg.values():
+            if isinstance(value, dict):
+                found = _flat_get(value, key, _MISSING)
+                if found is not _MISSING:
+                    return found
+        if key in cfg:
+            return cfg[key]
+    for attr in ("data", "config"):
+        target = getattr(cfg, attr, None)
+        if isinstance(target, dict):
+            found = _flat_get(target, key, _MISSING)
+            if found is not _MISSING:
+                return found
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key, _MISSING)
+        except Exception:
+            value = _MISSING
+        if value is not _MISSING:
+            return value
+    return default
+
+
+def _flat_set(cfg: Any, key: str, value: Any) -> None:
+    """复刻陪伴插件 _set_config_value：把值写回 config 的所有位置。
+
+    递归更新顶层扁平副本 + 嵌套 schema 分组（model_assignment_config），
+    确保陪伴插件运行时（读分组）和我们显示（读扁平）看到一致的新值。
+    """
+    if not isinstance(cfg, dict):
+        for attr in ("data", "config"):
+            t = getattr(cfg, attr, None)
+            if isinstance(t, dict):
+                cfg = t
+                break
+    if not isinstance(cfg, dict):
+        return
+
+    def find_and_set(target: dict) -> bool:
+        changed = False
+        for child in target.values():
+            if isinstance(child, dict):
+                changed = find_and_set(child) or changed
+        if key in target:
+            target[key] = value
+            changed = True
+        return changed
+
+    find_and_set(cfg)
+    # 若分组存在但缺该 key（旧配置），补齐，保证分组内一致
+    group = cfg.get(COMPANION_PROVIDER_GROUP)
+    if isinstance(group, dict):
+        group[key] = value
+
+
 @register("astrbot_plugin_model_panel", "local", "模型管理与检测面板", "0.1.0")
 class ModelPanelPlugin(Star):
     def __init__(self, context: Context):
@@ -198,7 +273,7 @@ class ModelPanelPlugin(Star):
             ("/panel/providers/test", self.api_test_provider, ["POST"]),
             ("/panel/providers/test_all", self.api_test_all_providers, ["POST"]),
             ("/panel/providers/test_all_stream", self.api_test_all_stream, ["POST"]),
-            ("/panel/providers/session/<int:session_id>", self.api_session_state, ["GET"]),
+            ("/panel/providers/session/<session_id>", self.api_session_state, ["GET"]),
             ("/panel/providers/results", self.api_test_results, ["GET"]),
             ("/panel/providers/history", self.api_test_history, ["GET"]),
             ("/panel/preferences", self.api_get_preferences, ["GET"]),
@@ -278,12 +353,42 @@ class ModelPanelPlugin(Star):
             if not model:
                 # 标识成"未指定"而不是空字符串，避免前端下拉空白
                 model = f"{base} (model unknown)"
+        # display_model：供应商(/)模型 的完整展示名。若 model 已自带供应商前缀则不再重复。
+        display_model = model
+        try:
+            if name and model and name != model:
+                prefix = f"{name}/"
+                if not model.startswith(prefix) and not model.startswith(f"{name} ") and not model.startswith(f"{name}-"):
+                    display_model = f"{name}/{model}"
+        except Exception:
+            display_model = model
         return {
             "id": pid,
             "name": name,
             "type": ptype,
             "model": model,
+            "display_model": display_model,
         }
+
+    def _provider_model_map(self) -> dict[str, str]:
+        """provider id -> model 展示名。陪伴插件 config 里存的是 provider id，
+        但我们按"模型名"匹配替换，需要先把 id 翻译成 model 名。
+        用带供应商前缀的 display_model，保证展示和匹配都是完整路径
+        （如 NVIDIA/deepseek-ai/deepseek-v4-flash-0731）。"""
+        out: dict[str, str] = {}
+        try:
+            for p in self._chat_providers():
+                d = self._provider_display(p)
+                if d["id"]:
+                    out[d["id"]] = d.get("display_model") or d["model"]
+        except Exception:
+            pass
+        return out
+
+    def _model_for_provider_id(self, provider_id: str) -> str:
+        if not provider_id:
+            return ""
+        return self._provider_model_map().get(provider_id, "")
 
     def _companion_star(self) -> Any:
         try:
@@ -320,15 +425,82 @@ class ModelPanelPlugin(Star):
         for key in COMPANION_PROVIDER_KEYS:
             raw = None
             try:
-                raw = cfg.get(key)
+                # 用与陪伴插件一致的 _flat_get：优先 schema 分组嵌套值，
+                # 避免读到顶层 legacy 扁平副本与真实值不一致。
+                raw = _flat_get(cfg, key)
             except Exception:
                 raw = None
             values[key] = str(raw).strip() if raw else ""
         return values
 
+    # 陪伴插件"备用模型"配置：model_fallback_overrides，值为 {provider_key: 备用 provider_id}
+    # 的 JSON 字符串（顶层 legacy flat key）。用与陪伴插件一致的 _normalize 语义解析。
+    FALLBACK_CONFIG_KEY = "model_fallback_overrides"
+
+    def _companion_fallback_values(self) -> dict[str, str]:
+        """返回 {provider_key: 备用 provider_id}。解析 config 里 model_fallback_overrides。"""
+        cfg = self._companion_config()
+        if cfg is None:
+            return {}
+        raw = None
+        try:
+            raw = _flat_get(cfg, self.FALLBACK_CONFIG_KEY)
+        except Exception:
+            raw = None
+        if raw is None:
+            return {}
+        # config 里可能是 JSON 字符串，也可能是已解析的 dict
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return {}
+            try:
+                raw = json.loads(text)
+            except Exception:
+                return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for key, provider_id in raw.items():
+            k = str(key).strip()
+            pid = str(provider_id or "").strip()
+            if k in COMPANION_PROVIDER_KEYS and pid:
+                out[k] = pid
+        return out
+
+    def _set_companion_fallback(self, key: str, provider_id: str) -> None:
+        """把某 key 的备用 provider 写入 model_fallback_overrides（扁平 + 分组同步）。"""
+        cfg = self._companion_config()
+        if cfg is None:
+            return
+        current = self._companion_fallback_values()
+        if provider_id:
+            current[key] = provider_id
+        else:
+            current.pop(key, None)
+        encoded = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+        # 写扁平副本 + 可能存在的 schema 分组嵌套（_flat_set 递归同步所有位置）
+        _flat_set(cfg, self.FALLBACK_CONFIG_KEY, encoded)
+
     def _default_provider_id(self) -> str:
+        """返回 AstrBot 实际生效的默认 chat 模型 provider id。
+
+        AstrBot 在后台"切换当前模型"时写的是 SharedPreferences 的 curr_provider，
+        并同步更新 provider_manager.curr_provider_inst；配置里的
+        provider_settings.default_provider_id 不一定随之更新。因此优先取
+        curr_provider_inst（反映运行时切换），再回退配置默认值。
+        """
         try:
             pm = self.context.provider_manager
+            # 1) 实际生效：运行时切换后 curr_provider_inst 已更新
+            inst = getattr(pm, "curr_provider_inst", None)
+            if inst is not None:
+                cfg = getattr(inst, "provider_config", None)
+                if isinstance(cfg, dict):
+                    pid = str(cfg.get("id") or "").strip()
+                    if pid:
+                        return pid
+            # 2) 回退：配置里的 default_provider_id
             ps = getattr(pm, "provider_settings", None) or {}
             return str(ps.get("default_provider_id") or "")
         except Exception:
@@ -371,9 +543,11 @@ class ModelPanelPlugin(Star):
                 seen_models[model] = {"id": d["id"], "name": d.get("name") or ""}
         # models: 去重后的纯 model 名列表（兼容旧前端）
         models = list(seen_models.keys())
-        # provider_models: 去重后的 {model, vendor} 列表（新前端用 vendor · model 显示）
+        # provider_models: 去重后的 {model, vendor, id} 列表。
+        # 新前端下拉用 vendor · model 作 label、provider id 作 value，
+        # 因为陪伴插件 config 里存的是 provider id，必须写回 provider id 才能匹配上。
         provider_models = [
-            {"model": m, "vendor": seen_models[m]["name"]}
+            {"model": m, "vendor": seen_models[m]["name"], "id": seen_models[m]["id"]}
             for m in models
         ]
         logger.info(
@@ -674,7 +848,13 @@ class ModelPanelPlugin(Star):
                 logger.error(f"[ModelPanel] 一键检测异常: {e}", exc_info=True)
                 self.sessions.finish(session_db_id, error=str(e)[:200])
 
-    async def api_session_state(self, session_id: int) -> dict:
+    async def api_session_state(self, session_id: Any) -> dict:
+        # AstrBot Page 桥接层对 `<int:name>` 类型的 converter 匹配不了（只支持
+        # `<name>` / `<path:name>`），故路由用 `<session_id>` 传入字符串，这里转 int。
+        try:
+            session_id = int(session_id)
+        except (TypeError, ValueError):
+            return {"error": "invalid session_id", "session_id": str(session_id)}
         st = self.sessions.get(session_id)
         if st is None:
             return {"error": "session not found", "session_id": session_id}
@@ -748,21 +928,43 @@ class ModelPanelPlugin(Star):
                 "total_keys": len(COMPANION_PROVIDER_KEYS),
             }
         values = self._companion_provider_values()
+        # 备用模型：{key: 备用 provider_id}
+        fallback_values = self._companion_fallback_values()
+        # provider id -> model 名映射，供前端"按模型名匹配替换"使用
+        model_map = self._provider_model_map()
         items = []
         configured = 0
         for key, value in values.items():
-            is_configured = bool(value)
+            provider_id = str(value).strip()
+            is_configured = bool(provider_id)
             if is_configured:
                 configured += 1
+            # value 展示/匹配用 model 名（陪伴插件 config 里存的是 provider id，
+            # 这里转成 model 名给前端显示与替换匹配）；provider_id 保留原始值。
+            model = model_map.get(provider_id, provider_id)
             items.append({
                 "key": key,
-                "value": value,
+                "kind": "main",
+                "value": model,
+                "provider_id": provider_id,
                 "configured": is_configured,
                 "label": COMPANION_KEY_LABELS.get(key, key),
             })
+            # 备用模型条目（仅当该 key 配置了备用 provider）
+            fb_id = fallback_values.get(key, "")
+            if fb_id:
+                fb_model = model_map.get(fb_id, fb_id)
+                items.append({
+                    "key": key,
+                    "kind": "fallback",
+                    "value": fb_model,
+                    "provider_id": fb_id,
+                    "configured": True,
+                    "label": COMPANION_KEY_LABELS.get(key, key),
+                })
         config_mode = ""
         try:
-            config_mode = str(cfg.get("provider_config_mode") or "")
+            config_mode = str(_flat_get(cfg, "provider_config_mode") or "")
         except Exception:
             config_mode = ""
         logger.info(
@@ -785,17 +987,70 @@ class ModelPanelPlugin(Star):
         cfg = self._companion_config()
         if cfg is None:
             return {"ok": False, "error": f"未找到插件 {COMPANION_PLUGIN_NAME}"}
+        # 按模型名匹配替换：old 是"当前 model 名"，new 是"目标 provider id"。
+        # 陪伴插件 config 存的是 provider id，故先把每个 key 的当前值翻译成
+        # model 名来与 old 比较，命中后写回 provider id（new）。
+        # kind: "main" 替换主模型（model_assignment_config[key]），
+        #       "fallback" 替换备用模型（model_fallback_overrides[key]）。
+        model_map = self._provider_model_map()
+        fallback_values = self._companion_fallback_values()
         changed: list[dict] = []
+        # kind 语义：
+        #   "main"     只替换主模型位置（model_assignment_config[key]）
+        #   "fallback" 只替换备用模型位置（model_fallback_overrides[key]）
+        #   "any"/"all" 同名模型无论主备都替换（精简配置）
         for item in replacements:
             old = str(item.get("old") or "").strip()
             new = str(item.get("replacement") or "").strip()
-            if not old or not new or old == new:
+            kind = str(item.get("kind") or "any").strip().lower()
+            if not old or not new:
                 continue
             for key in COMPANION_PROVIDER_KEYS:
-                cur = str(cfg.get(key) or "").strip()
-                if cur == old:
-                    cfg[key] = new
-                    changed.append({"key": key, "old": old, "new": new})
+                main_cur = str(_flat_get(cfg, key) or "").strip()
+                fb_cur = fallback_values.get(key, "")
+                if kind == "fallback":
+                    if not fb_cur or fb_cur == new:
+                        continue
+                    if model_map.get(fb_cur, fb_cur) != old and fb_cur != old:
+                        continue
+                    self._set_companion_fallback(key, new)
+                    fallback_values[key] = new
+                    changed.append({"key": key, "kind": "fallback", "old": old, "new": new})
+                    continue
+                if kind == "any" or kind == "all":
+                    hit = False
+                    # 主模型位置
+                    if main_cur and main_cur != new and (
+                        model_map.get(main_cur, main_cur) == old or main_cur == old
+                    ):
+                        # 同步写扁平 + schema 分组（model_assignment_config），
+                        # 否则陪伴插件读分组旧值、我们读扁平新值，出现"自欺欺人"。
+                        _flat_set(cfg, key, new)
+                        changed.append({"key": key, "kind": "main", "old": old, "new": new})
+                        hit = True
+                    # 备用模型位置
+                    if fb_cur and fb_cur != new and (
+                        model_map.get(fb_cur, fb_cur) == old or fb_cur == old
+                    ):
+                        self._set_companion_fallback(key, new)
+                        fallback_values[key] = new
+                        changed.append({"key": key, "kind": "fallback", "old": old, "new": new})
+                        hit = True
+                    if not hit:
+                        continue
+                    continue
+                # 主模型（kind == "main" 或默认）
+                if not main_cur or main_cur == new:
+                    continue
+                # 当前值是 provider id -> 转成 model 名再和 old 比；
+                # 若 old 本身就是 provider id（旧前端/手动输入），也直接匹配。
+                cur_model = model_map.get(main_cur, main_cur)
+                if cur_model != old and main_cur != old:
+                    continue
+                # 同步写扁平 + schema 分组（model_assignment_config），
+                # 否则陪伴插件读分组旧值、我们读扁平新值，出现"自欺欺人"。
+                _flat_set(cfg, key, new)
+                changed.append({"key": key, "kind": "main", "old": old, "new": new})
         try:
             save = getattr(cfg, "save_config", None)
             if callable(save):
