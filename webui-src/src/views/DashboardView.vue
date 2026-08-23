@@ -1,29 +1,37 @@
 <template>
   <div class="dashboard">
-    <n-grid :cols="4" :x-gap="14" :y-gap="14" responsive="screen" :item-responsive="true">
-      <n-gi span="0:4 m:1">
+    <n-grid :x-gap="14" :y-gap="14" cols="1 s:2 m:4" responsive="screen">
+      <n-gi>
         <n-card size="small">
           <div class="stat-num">{{ overview?.total ?? "–" }}</div>
           <div class="stat-label">{{ t("dashboard.statTotal") }}</div>
         </n-card>
       </n-gi>
-      <n-gi span="0:4 m:1">
+      <n-gi>
         <n-card size="small">
-          <div class="stat-num" :class="overview?.default_set ? 'tag-ok' : 'tag-warn'">
+          <n-tag
+            :type="overview?.default_set ? 'success' : 'warning'"
+            size="medium"
+            round
+          >
             {{ overview?.default_set ? t("dashboard.defaultSet") : t("dashboard.defaultMissed") }}
-          </div>
+          </n-tag>
           <div class="stat-label">{{ t("dashboard.statDefault") }}</div>
         </n-card>
       </n-gi>
-      <n-gi span="0:4 m:1">
+      <n-gi>
         <n-card size="small">
-          <div class="stat-num" :class="overview?.companion_loaded ? 'tag-ok' : 'tag-err'">
+          <n-tag
+            :type="overview?.companion_loaded ? 'success' : 'error'"
+            size="medium"
+            round
+          >
             {{ overview?.companion_loaded ? t("dashboard.companionLoaded") : t("dashboard.companionUnloaded") }}
-          </div>
+          </n-tag>
           <div class="stat-label">{{ t("dashboard.statCompanion") }}</div>
         </n-card>
       </n-gi>
-      <n-gi span="0:4 m:1">
+      <n-gi>
         <n-card size="small">
           <div class="stat-num">{{ overview?.companion_provider_count ?? "–" }}</div>
           <div class="stat-label">{{ t("dashboard.statCompanionProviders") }}</div>
@@ -34,7 +42,12 @@
     <n-card :title="t('dashboard.currentDefault')" size="small" class="mt-3">
       <template v-if="overview && overview.default_provider_id">
         <n-text>{{ overview.default_provider_id }}</n-text>
-        <n-tag v-if="!overview.default_set" type="warning" size="small" style="margin-left: 8px">
+        <n-tag
+          v-if="!overview.default_set"
+          type="warning"
+          size="small"
+          style="margin-left: 8px"
+        >
           {{ t("dashboard.currentDefaultNotInList") }}
         </n-tag>
       </template>
@@ -45,7 +58,11 @@
       <template v-if="overview?.history && (overview.history.sessions_total || 0) > 0">
         <n-space vertical>
           <n-space align="center" wrap>
-            <n-tag :type="overview.history.latest_session && overview.history.latest_session.alive_rate >= 80 ? 'success' : 'warning'" round>
+            <n-tag
+              :type="overview.history.latest_session && overview.history.latest_session.alive_rate >= 80 ? 'success' : 'warning'"
+              round
+              size="medium"
+            >
               {{ t("dashboard.aliveRate") }} {{ overview.history.latest_session?.alive_rate ?? "–" }}%
             </n-tag>
             <n-text depth="3">
@@ -61,9 +78,11 @@
             （{{ t("dashboard.okCount") }} {{ overview.history.results_ok }} /
             {{ t("dashboard.failCount") }} {{ overview.history.results_fail }}）
           </n-text>
-          <n-button size="small" tag="a" :href="'#/detect'" type="primary" ghost>
-            {{ t("dashboard.goDetect") }} →
-          </n-button>
+          <div>
+            <n-button text type="primary" tag="a" href="#/detect">
+              {{ t("dashboard.goDetect") }} →
+            </n-button>
+          </div>
         </n-space>
       </template>
       <n-text v-else depth="3">{{ t("dashboard.noSession") }}</n-text>
@@ -101,10 +120,11 @@ onMounted(async () => {
 .stat-num {
   font-size: 26px;
   font-weight: 700;
+  margin-bottom: 4px;
 }
 .stat-label {
   color: var(--muted);
   font-size: 13px;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 </style>

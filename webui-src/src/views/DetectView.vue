@@ -1,10 +1,12 @@
 <template>
   <div class="detect-view">
-    <n-card :title="t('detect.title')" size="small" class="mb-3">
+    <!-- 顶部操作栏：sticky 不随主区滚动 -->
+    <n-card :title="t('detect.title')" size="small" class="toolbar-card">
       <n-space align="center" wrap>
         <n-button type="primary" :loading="testing" @click="testAll">
           {{ testing ? t("detect.btnAllLoading") : t("detect.btnAll") }}
         </n-button>
+        <n-divider vertical />
         <n-text depth="3">{{ t("detect.sortBy") }}：</n-text>
         <n-select
           v-model:value="sortKey"
@@ -13,21 +15,35 @@
           style="width: 140px"
         />
         <n-divider vertical />
-        <n-button size="small" @click="setAll(true)">{{ t("detect.selectAll") }}</n-button>
-        <n-button size="small" @click="setAll(false)">{{ t("detect.selectNone") }}</n-button>
+        <n-checkbox
+          :checked="allChecked"
+          :indeterminate="someChecked && !allChecked"
+          @update:checked="(v: boolean) => setAll(v)"
+        >
+          {{ t("detect.selectAll") }}
+        </n-checkbox>
+        <n-checkbox
+          :checked="!someChecked"
+          :disabled="allChecked"
+          @update:checked="(v: boolean) => setAll(!v)"
+        >
+          {{ t("detect.selectNone") }}
+        </n-checkbox>
         <n-text depth="3" class="hint">{{ t("detect.selectHint") }}</n-text>
       </n-space>
     </n-card>
 
-    <n-card :title="t('detect.groupTitle', { count: items.length })" size="small">
+    <!-- 主内容区 -->
+    <n-card :title="t('detect.groupTitle', { count: items.length })" size="small" class="content-card">
       <n-empty v-if="!items.length" :description="t('detect.groupNone')" />
 
-      <!-- 单页全展示：每个供应商一段标题 + 一张表 -->
       <div v-else class="groups">
         <section v-for="group in groupedItems" :key="group.name" class="group-block">
           <header class="group-head">
             <span class="group-name">{{ group.name || t("detect.groupName") }}</span>
-            <span class="group-count">{{ group.items.length }} {{ t("detect.units") || "" }}</span>
+            <n-tag size="small" :bordered="false" type="default">
+              {{ group.items.length }} {{ t("detect.units") }}
+            </n-tag>
           </header>
           <n-data-table
             :columns="columns"
@@ -37,12 +53,13 @@
             :pagination="false"
             :bordered="true"
             :single-line="false"
+            :scroll-x="1100"
           />
         </section>
       </div>
     </n-card>
 
-    <n-card v-if="lastSessionStats" size="small" class="mb-3 mt-3">
+    <n-card v-if="lastSessionStats" size="small" class="stats-card">
       <n-space align="center" wrap>
         <n-tag :type="lastSessionStats.ok_count > 0 ? 'success' : 'default'" round>
           ✓ {{ lastSessionStats.ok_count }}
@@ -63,7 +80,7 @@
       </n-space>
     </n-card>
 
-    <!-- 结果详情弹窗：显示原始 JSON + provider 完整字段 -->
+    <!-- 结果详情弹窗 -->
     <n-modal
       v-model:show="detailVisible"
       preset="card"
@@ -76,11 +93,10 @@
           size="small"
           bordered
           label-placement="left"
-          class="detail-desc"
         >
           <n-descriptions-item :label="t('detect.colModel')">
             {{ detailRow.name || detailRow.id }}
-            <span v-if="detailRow.model" class="muted"> · {{ detailRow.model }}</span>
+            <span v-if="detailRow.model" style="color: var(--muted)"> · {{ detailRow.model }}</span>
           </n-descriptions-item>
           <n-descriptions-item :label="t('detect.detail.id')">{{ detailRow.id }}</n-descriptions-item>
           <n-descriptions-item :label="t('detect.detail.checked_at')">
@@ -108,8 +124,10 @@
           </n-descriptions-item>
         </n-descriptions>
         <n-divider />
-        <div class="raw-title">{{ t("detect.detail.rawJson") }}</div>
-        <pre class="raw-json">{{ formatRawJson(detailRow) }}</pre>
+        <div style="font-size: 12px; color: var(--muted); margin-bottom: 6px">
+          {{ t("detect.detail.rawJson") }}
+        </div>
+        <n-code :code="formatRawJson(detailRow)" language="json" :show-line-numbers="false" />
       </template>
     </n-modal>
   </div>
@@ -121,6 +139,8 @@ import { useI18n } from "vue-i18n";
 import {
   NButton,
   NCard,
+  NCheckbox,
+  NCode,
   NDataTable,
   NDescriptions,
   NDescriptionsItem,
@@ -199,25 +219,19 @@ function formatRawJson(row: TestResult): string {
 function saveResults() {
   try {
     localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify(results));
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 function saveEnabled() {
   try {
     localStorage.setItem(STORAGE_KEY_ENABLED, JSON.stringify(enabled));
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 function saveLastDone() {
   try {
     if (lastSessionStats.value) {
       localStorage.setItem(STORAGE_KEY_LAST_DONE, JSON.stringify(lastSessionStats.value));
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 function loadPersisted() {
   try {
@@ -233,9 +247,7 @@ function loadPersisted() {
     }
     const ld = localStorage.getItem(STORAGE_KEY_LAST_DONE);
     if (ld) lastSessionStats.value = JSON.parse(ld);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 
 // ---------- 排序 / 分组 ----------
@@ -288,6 +300,15 @@ const groupedItems = computed(() => {
 });
 
 // ---------- 工具 ----------
+const allChecked = computed(() => {
+  if (!items.value.length) return false;
+  return items.value.every((it) => enabled[it.id] !== false);
+});
+const someChecked = computed(() => {
+  if (!items.value.length) return false;
+  return items.value.some((it) => enabled[it.id] !== false);
+});
+
 function setAll(value: boolean) {
   for (const it of items.value) enabled[it.id] = value;
   saveEnabled();
@@ -384,15 +405,13 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     key: "check",
     width: 60,
     render(row) {
-      return h(NButton, {
-        size: "tiny",
-        type: enabled[row.id] ? "primary" : "default",
-        ghost: !enabled[row.id],
-        onClick: () => {
-          enabled[row.id] = !enabled[row.id];
+      return h(NCheckbox, {
+        checked: enabled[row.id] !== false,
+        onUpdateChecked: (v: boolean) => {
+          enabled[row.id] = v;
           saveEnabled();
         },
-      }, () => (enabled[row.id] ? "✓" : ""));
+      });
     },
   },
   {
@@ -400,14 +419,15 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     key: "model",
     minWidth: 220,
     render(row) {
-      return h("div", { class: "model-cell" }, [
-        h("div", { class: "model-name" }, [
+      return h("div", null, [
+        h("div", { style: "font-weight: 600" }, [
           row.name || row.id,
           row.is_default
-            ? h("span", { class: "tag-default" }, `（${t("common.default")}）`)
+            ? h(NTag, { size: "tiny", type: "warning", style: "margin-left: 6px", round: true },
+                () => t("common.default"))
             : null,
         ]),
-        h("div", { class: "model-sub" }, [
+        h("div", { style: "color: var(--muted); font-size: 12px" }, [
           row.type || "",
           row.model ? ` · ${row.model}` : "",
         ]),
@@ -417,7 +437,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colStatus"),
     key: "status",
-    width: 110,
+    width: 120,
     render(row) {
       const id = row.id;
       if (results[id]) {
@@ -447,34 +467,28 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     },
   },
   {
-    // 新增：结果列，展示 error_code + error_msg（短文本），点击行可看详情
     title: t("detect.colResult"),
     key: "result",
-    minWidth: 180,
+    minWidth: 220,
     render(row) {
       const r = results[row.id];
       if (!r) return h(NText, { depth: 3 }, () => "—");
       const tag = resultTagFor(r);
-      return h("div", { class: "result-cell" }, [
+      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start; max-width: 280px" }, [
         h(NTag, { type: tag.type, size: "small", round: true }, () => tag.label),
-        h(
-          NTooltip,
-          { delay: 200 },
-          {
-            trigger: () =>
-              h(
-                "button",
-                {
-                  class: "link-btn",
-                  onClick: () => openDetail(row),
-                },
-                () => r.error_code || (r.ok ? "ok" : "—"),
-              ),
-            default: () => r.error || t("detect.detail.openRaw"),
-          },
-        ),
+        h(NTooltip, { delay: 200 }, {
+          trigger: () =>
+            h(NButton, {
+              text: true,
+              type: "primary",
+              size: "tiny",
+              onClick: () => openDetail(row),
+              style: "font-family: ui-monospace, Menlo, monospace; font-size: 11px; padding: 0; height: auto",
+            }, () => r.error_code || (r.ok ? "ok" : "—")),
+          default: () => r.error || t("detect.detail.openRaw"),
+        }),
         r.error
-          ? h(NText, { depth: 3, class: "result-msg" }, () => r.error)
+          ? h(NText, { depth: 3, style: "font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" }, () => r.error)
           : null,
       ]);
     },
@@ -482,12 +496,12 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colRetry"),
     key: "retry",
-    width: 70,
+    width: 80,
     render(row) {
       const r = results[row.id];
       if (!r || (r.retry_count ?? 0) <= 0) return h(NText, { depth: 3 }, () => "—");
       return h(NTooltip, null, {
-        trigger: () => h(NTag, { size: "small", type: "info" }, () => `×${r.retry_count}`),
+        trigger: () => h(NTag, { size: "small", type: "info", round: true }, () => `×${r.retry_count}`),
         default: () => t("detect.retryTimes", { n: r.retry_count }),
       });
     },
@@ -499,6 +513,8 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     render(row) {
       return h(NButton, {
         size: "small",
+        type: "primary",
+        ghost: true,
         loading: !!pending[row.id],
         disabled: testing.value,
         onClick: () => testOne(row.id),
@@ -535,12 +551,16 @@ onMounted(async () => {
 .detect-view {
   display: flex;
   flex-direction: column;
+  gap: 12px;
 }
-.mb-3 {
-  margin-bottom: 12px;
+.toolbar-card {
+  /* 顶部工具栏 sticky 在主区视口顶部，不随滚动消失 */
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
-.mt-3 {
-  margin-top: 12px;
+.toolbar-card :deep(.n-card__content) {
+  padding: 12px 16px;
 }
 .hint {
   font-size: 12px;
@@ -548,7 +568,7 @@ onMounted(async () => {
 .groups {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 20px;
 }
 .group-block {
   display: flex;
@@ -564,73 +584,5 @@ onMounted(async () => {
   font-weight: 700;
   font-size: 14px;
   color: var(--accent-2);
-}
-.group-count {
-  color: var(--muted);
-  font-size: 12px;
-}
-.model-cell {
-  display: flex;
-  flex-direction: column;
-}
-.model-name {
-  font-weight: 600;
-}
-.model-sub {
-  color: var(--muted);
-  font-size: 12px;
-}
-.tag-default {
-  margin-left: 6px;
-  color: var(--warn);
-  font-size: 12px;
-  font-weight: 400;
-}
-.result-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  align-items: flex-start;
-}
-.result-msg {
-  font-size: 12px;
-  max-width: 280px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.link-btn {
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  color: var(--accent-2);
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  font-size: 11px;
-  text-decoration: underline dotted;
-}
-.link-btn:hover {
-  color: var(--accent);
-}
-.detail-desc {
-  margin-bottom: 8px;
-}
-.raw-title {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 6px;
-}
-.raw-json {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 360px;
-  overflow: auto;
-  margin: 0;
 }
 </style>

@@ -24,7 +24,7 @@
     "dashboard": "대시보드",
     "detect": "모델 감지",
     "defaultModel": "기본 모델",
-    "companion": "반려 플러그인 교체"
+    "companion": "반려 플러그인"
   },
   "dashboard": {
     "statTotal": "LLM 모델 수",

@@ -3,6 +3,7 @@
     <n-message-provider>
       <n-dialog-provider>
         <div class="layout" :data-theme="theme">
+          <!-- 左侧菜单：sticky 不随主区滚动 -->
           <aside class="sidebar">
             <div class="brand">
               <span class="brand-dot"></span>
@@ -22,28 +23,35 @@
               <div class="footer-row">
                 <n-tooltip :delay="300">
                   <template #trigger>
-                    <button class="icon-btn" :aria-label="t('common.theme')" @click="toggleTheme">
-                      <span v-if="theme === 'dark'">🌙</span>
-                      <span v-else>☀️</span>
-                    </button>
+                    <n-button quaternary circle size="small" :aria-label="t('common.theme')" @click="toggleTheme">
+                      <template #icon>
+                        <span style="font-size: 16px">{{ theme === "dark" ? "🌙" : "☀️" }}</span>
+                      </template>
+                    </n-button>
                   </template>
                   {{ theme === "dark" ? t("common.themeDark") : t("common.themeLight") }}
                 </n-tooltip>
                 <n-dropdown :options="langOptions" trigger="click" @select="onSelectLang">
-                  <button class="icon-btn lang-btn" :aria-label="t('common.language')">
-                    <span>{{ langLabel }}</span>
-                    <span class="caret">▾</span>
-                  </button>
+                  <n-button quaternary size="small">
+                    {{ langLabel }}
+                    <template #icon>
+                      <span style="font-size: 10px">▾</span>
+                    </template>
+                  </n-button>
                 </n-dropdown>
               </div>
               <div class="version">{{ t("common.version") }} {{ version }}</div>
             </div>
           </aside>
+
+          <!-- 主区：header 固定在顶部，内容卡片可滚动 -->
           <main class="content">
             <header class="content-head">
               <h1>{{ title }}</h1>
             </header>
-            <RouterView />
+            <div class="content-body">
+              <RouterView />
+            </div>
           </main>
         </div>
       </n-dialog-provider>
@@ -65,6 +73,7 @@ import {
   enUS,
   jaJP,
   koKR,
+  NButton,
   NConfigProvider,
   NDialogProvider,
   NDropdown,
@@ -98,30 +107,21 @@ const title = computed(() => {
 const naiveTheme = computed(() => (theme.value === "dark" ? darkTheme : lightTheme));
 const naiveLocale = computed(() => {
   switch (localeStore.value) {
-    case "en":
-      return enUS;
-    case "ja":
-      return jaJP;
-    case "ko":
-      return koKR;
-    default:
-      return zhCN;
+    case "en": return enUS;
+    case "ja": return jaJP;
+    case "ko": return koKR;
+    default: return zhCN;
   }
 });
 const naiveDateLocale = computed(() => {
   switch (localeStore.value) {
-    case "en":
-      return dateEnUS;
-    case "ja":
-      return dateJaJP;
-    case "ko":
-      return dateKoKR;
-    default:
-      return dateZhCN;
+    case "en": return dateEnUS;
+    case "ja": return dateJaJP;
+    case "ko": return dateKoKR;
+    default: return dateZhCN;
   }
 });
 
-// 主题微调：背景色与原项目接近，避免硬切换时跳变
 const themeOverrides = computed(() => ({
   common: {
     primaryColor: "#4f7dff",
@@ -133,7 +133,6 @@ const themeOverrides = computed(() => ({
   },
 }));
 
-// 语言切换
 const langOptions = supported.map((l) => ({
   key: l,
   label: ({ zh: "中文", en: "English", ja: "日本語", ko: "한국어" } as Record<AppLocale, string>)[l],
@@ -150,6 +149,7 @@ function onSelectLang(key: string) {
 </script>
 
 <style>
+/* 主题色：深 / 浅 */
 :root,
 :root[data-theme="dark"] {
   --bg: #0f1626;
@@ -185,8 +185,8 @@ html,
 body,
 #app {
   height: 100%;
-  min-height: 100vh;
   margin: 0;
+  overflow: hidden;
 }
 body {
   font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -194,11 +194,16 @@ body {
   color: var(--text);
   transition: background-color 0.2s ease;
 }
+
+/* 整体布局：flex 横排 + 全屏高度 */
 .layout {
   display: flex;
-  min-height: 100vh;
   height: 100vh;
+  width: 100vw;
+  overflow: hidden;
 }
+
+/* 侧边栏：固定在左侧，内部独立滚动（自身可滚动但不参与主区滚动） */
 .sidebar {
   width: 220px;
   flex-shrink: 0;
@@ -207,8 +212,7 @@ body {
   background: var(--panel);
   display: flex;
   flex-direction: column;
-  height: 100%;
-  min-height: 100vh;
+  height: 100vh;
   overflow-y: auto;
 }
 .brand {
@@ -261,55 +265,39 @@ body {
   gap: 8px;
   padding: 4px 8px 8px;
 }
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel-2);
-  color: var(--text);
-  font-size: 13px;
-  cursor: pointer;
-}
-.icon-btn:hover {
-  filter: brightness(1.1);
-}
-.lang-btn .caret {
-  font-size: 10px;
-  color: var(--muted);
-}
 .version {
   padding: 4px 8px 4px;
   color: var(--muted);
   font-size: 12px;
 }
+
+/* 主区：整列 flex 纵向；header sticky 不滚动，content-body 独立滚动 */
 .content {
   flex: 1;
   min-width: 0;
   height: 100vh;
-  overflow-y: auto;
-  padding: 24px 28px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+.content-head {
+  flex-shrink: 0;
+  padding: 18px 28px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  z-index: 5;
 }
 .content-head h1 {
-  margin: 0 0 20px;
+  margin: 0;
   font-size: 22px;
+  font-weight: 700;
 }
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px 20px;
-  margin-bottom: 16px;
-}
-.card-title {
-  font-size: 15px;
-  font-weight: 600;
-  margin: 0 0 12px;
-  color: var(--text);
-}
-.muted {
-  color: var(--muted);
+.content-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px 28px 28px;
 }
 </style>

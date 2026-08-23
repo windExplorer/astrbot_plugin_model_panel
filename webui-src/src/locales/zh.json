@@ -22,9 +22,9 @@
   },
   "nav": {
     "dashboard": "控制台",
-    "detect": "模型检测排序",
+    "detect": "模型检测",
     "defaultModel": "默认模型",
-    "companion": "伴侣插件替换"
+    "companion": "陪伴插件"
   },
   "dashboard": {
     "statTotal": "LLM 模型数",

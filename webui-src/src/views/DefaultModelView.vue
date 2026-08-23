@@ -3,9 +3,9 @@
     <n-card :title="t('defaultModel.title')" size="small">
       <div v-if="defaultId" class="value">{{ defaultId }}</div>
       <n-text v-else depth="3">{{ t("defaultModel.notSet") }}</n-text>
-      <p class="note">
+      <div class="note">
         <n-text depth="3">{{ t("defaultModel.note") }}</n-text>
-      </p>
+      </div>
     </n-card>
   </div>
 </template>

@@ -18,7 +18,6 @@
           </n-text>
         </n-space>
 
-        <!-- 主列表：已配置项 + 替换下拉 -->
         <n-empty
           v-if="!usedModels.length"
           :description="t('companion.usedModelsEmpty')"
@@ -34,13 +33,13 @@
           :bordered="true"
           :single-line="false"
           :row-key="(row) => row.value"
+          :scroll-x="900"
         />
 
-        <!-- 未配置项（默认折叠 + 说明） -->
         <n-collapse class="mt-3" :default-expanded-names="[]">
           <n-collapse-item :title="unconfiguredTitle" name="unconfigured">
             <template #header-extra>
-              <n-tag size="small" type="warning">{{ unconfiguredItems.length }}</n-tag>
+              <n-tag size="small" type="warning" round>{{ unconfiguredItems.length }}</n-tag>
             </template>
             <n-text depth="3" class="block">
               {{ t("companion.unconfiguredExplain") }}
@@ -62,7 +61,7 @@
       </template>
     </n-card>
 
-    <!-- 模型使用详情弹窗：点模型名打开 -->
+    <!-- 模型使用详情弹窗：点"适用于"那个 tag 打开 -->
     <n-modal
       v-model:show="detailVisible"
       preset="card"
@@ -75,13 +74,12 @@
           size="small"
           bordered
           label-placement="left"
-          class="detail-desc"
         >
           <n-descriptions-item :label="t('companion.detail.modelName')">
             {{ detailModel.value }}
           </n-descriptions-item>
           <n-descriptions-item :label="t('companion.detail.usageCount')">
-            <n-tag type="info" size="small">{{ detailModel.labels.length }}</n-tag>
+            <n-tag type="info" size="small" round>{{ detailModel.keys.length }}</n-tag>
           </n-descriptions-item>
         </n-descriptions>
 
@@ -90,7 +88,7 @@
         <div class="raw-title">{{ t("companion.detail.usageKeys") }}</div>
         <n-data-table
           :columns="detailKeyColumns"
-          :data="detailModel.keys || []"
+          :data="detailModel.keys"
           :pagination="false"
           size="small"
           :bordered="true"
@@ -100,7 +98,11 @@
         <n-divider />
 
         <div class="raw-title">{{ t("companion.detail.allModels") }}</div>
-        <pre class="raw-json">{{ formatAllModels() }}</pre>
+        <n-code
+          :code="formatAllModels()"
+          language="json"
+          :show-line-numbers="false"
+        />
       </template>
     </n-modal>
   </div>
@@ -112,6 +114,7 @@ import { useI18n } from "vue-i18n";
 import {
   NButton,
   NCard,
+  NCode,
   NCollapse,
   NCollapseItem,
   NDataTable,
@@ -148,7 +151,6 @@ const configMode = ref("");
 const configuredCount = ref(0);
 const totalKeys = ref(0);
 
-// 详情弹窗
 const detailVisible = ref(false);
 const detailModel = ref<{
   value: string;
@@ -156,7 +158,11 @@ const detailModel = ref<{
   keys: { key: string; label: string }[];
 } | null>(null);
 
-function openDetail(model: { value: string; labels: string[]; keys: { key: string; label: string }[] }) {
+function openDetail(model: {
+  value: string;
+  labels: string[];
+  keys: { key: string; label: string }[];
+}) {
   detailModel.value = model;
   detailVisible.value = true;
 }
@@ -197,7 +203,10 @@ const unconfiguredTitle = computed(() =>
 );
 
 function availableOptions(value: string): { label: string; value: string }[] {
-  const opts: { label: string; value: string }[] = providers.value.map((p) => ({ label: p, value: p }));
+  const opts: { label: string; value: string }[] = providers.value.map((p) => ({
+    label: p,
+    value: p,
+  }));
   if (value && !providers.value.includes(value)) {
     opts.unshift({ label: value, value });
   }
@@ -248,37 +257,52 @@ async function reload() {
   }
 }
 
-const columns = computed<DataTableColumn<{ value: string; labels: string[]; keys: { key: string; label: string }[] }>[]>(() => [
+const columns = computed<
+  DataTableColumn<{
+    value: string;
+    labels: string[];
+    keys: { key: string; label: string }[];
+  }>[]
+>(() => [
   {
     title: t("companion.colModel"),
     key: "value",
-    minWidth: 240,
+    minWidth: 260,
     render(row) {
-      return h("div", { class: "old-cell" }, [
+      return h("div", null, [
+        // 模型名：普通 NText，不再是按钮
+        h("div", { style: "font-weight: 600" }, row.value),
+        // 适用于：NTag 包裹 + NTooltip 预览 + 点击弹窗
         h(
-          "button",
+          NTooltip,
           {
-            class: "model-link",
-            title: t("companion.detail.clickToView"),
-            onClick: () => openDetail(row),
+            delay: 200,
+            placement: "top-start",
           },
-          row.value,
-        ),
-        h("div", { class: "old-sub" }, [
-          h(NTooltip, null, {
+          {
             trigger: () =>
-              h(NTag, { size: "tiny", type: "info", round: true }, () =>
-                t("companion.labelsTitle") + ": " + row.labels.length,
+              h(
+                NTag,
+                {
+                  size: "small",
+                  type: "info",
+                  round: true,
+                  bordered: false,
+                  style: "margin-top: 4px; cursor: pointer",
+                  onClick: () => openDetail(row),
+                },
+                () => `${t("companion.labelsTitle")}: ${row.labels.length}`,
               ),
-            default: () => row.labels.join("、") || t("companion.noLabels"),
-          }),
-        ]),
+            default: () => row.keys.map((k) => k.label).join("、") || t("companion.noLabels"),
+          },
+        ),
       ]);
     },
   },
   {
     title: t("common.save"),
     key: "new",
+    minWidth: 240,
     render(row) {
       return h(NSelect, {
         value: replacements[row.value] ?? "",
@@ -297,8 +321,7 @@ const unconfiguredColumns = computed<DataTableColumn<{ key: string; label: strin
     title: "Key",
     key: "key",
     minWidth: 280,
-    render: (row) =>
-      h("code", { class: "key-cell", title: row.key }, row.key),
+    render: (row) => h(NText, { code: true }, () => row.key),
   },
   {
     title: t("companion.colLabel"),
@@ -312,7 +335,7 @@ const detailKeyColumns = computed<DataTableColumn<{ key: string; label: string }
     title: "Key",
     key: "key",
     minWidth: 280,
-    render: (row) => h("code", { class: "key-cell" }, row.key),
+    render: (row) => h(NText, { code: true }, () => row.key),
   },
   {
     title: t("companion.colLabel"),
@@ -324,7 +347,9 @@ const detailKeyColumns = computed<DataTableColumn<{ key: string; label: string }
 onMounted(async () => {
   await reload();
   try {
-    const data = await apiGet<{ items: { id: string; name: string; model: string }[] }>("/panel/providers");
+    const data = await apiGet<{
+      items: { id: string; name: string; model: string }[];
+    }>("/panel/providers");
     providers.value = (data.items || []).map((p) => p.model || p.id).filter(Boolean);
   } catch (e) {
     console.error("加载可用模型失败", e);
@@ -343,35 +368,6 @@ onMounted(async () => {
 .empty {
   padding: 20px 0;
 }
-.old-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.model-link {
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  color: var(--accent-2);
-  font-weight: 600;
-  font-size: 14px;
-  text-align: left;
-  text-decoration: underline dotted;
-}
-.model-link:hover {
-  color: var(--accent);
-}
-.old-sub {
-  font-size: 11px;
-}
-.key-cell {
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  font-size: 12px;
-  background: var(--panel-2);
-  padding: 2px 6px;
-  border-radius: 4px;
-}
 .mt-2 {
   margin-top: 8px;
 }
@@ -382,25 +378,9 @@ onMounted(async () => {
   display: block;
   margin-bottom: 6px;
 }
-.detail-desc {
-  margin-bottom: 8px;
-}
 .raw-title {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 6px;
-}
-.raw-json {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 280px;
-  overflow: auto;
-  margin: 0;
 }
 </style>

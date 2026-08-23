@@ -24,7 +24,7 @@
     "dashboard": "ダッシュボード",
     "detect": "モデル検出",
     "defaultModel": "デフォルトモデル",
-    "companion": "コンパニオン置換"
+    "companion": "コンパニオン"
   },
   "dashboard": {
     "statTotal": "LLMモデル数",
