@@ -49,26 +49,39 @@ function Get-VersionFromMeta {
     return $ver
 }
 
-Invoke-BumpVersion
-$version = Get-VersionFromMeta -Path $metaPath
-$zipName = "${pluginName}_${version}.zip"
-$zipPath = [System.IO.Path]::Combine($distDir, $zipName)
-
-# if the same-name zip already exists, bump again until we get a fresh one;
-# historical zips are always kept
-$guard = 0
-while (Test-Path $zipPath) {
-    $guard++
-    if ($guard -gt 50) {
-        Write-Host "ERROR: same-name zip still exists after $guard bumps" -ForegroundColor Red
-        exit 1
-    }
+# If the declared metadata version has not been packed in dist yet, use it directly
+# (first build for a new minor, e.g. after manually setting version to v0.6.0).
+$declaredVersion = Get-VersionFromMeta -Path $metaPath
+$declaredZip = [System.IO.Path]::Combine($distDir, "${pluginName}_${declaredVersion}.zip")
+if (-not (Test-Path $declaredZip)) {
+    Write-Host "build_zip: using declared version $declaredVersion (first build for it)"
+    $version = $declaredVersion
+} else {
     Invoke-BumpVersion
     $version = Get-VersionFromMeta -Path $metaPath
-    $zipName = "${pluginName}_${version}.zip"
-    $zipPath = [System.IO.Path]::Combine($distDir, $zipName)
+    # if the same-name zip already exists, bump again until we get a fresh one;
+    # historical zips are always kept
+    $guard = 0
+    while (Test-Path ([System.IO.Path]::Combine($distDir, "${pluginName}_${version}.zip"))) {
+        $guard++
+        if ($guard -gt 50) {
+            Write-Host "ERROR: same-name zip still exists after $guard bumps" -ForegroundColor Red
+            exit 1
+        }
+        Invoke-BumpVersion
+        $version = Get-VersionFromMeta -Path $metaPath
+    }
 }
+$zipName = "${pluginName}_${version}.zip"
+$zipPath = [System.IO.Path]::Combine($distDir, $zipName)
 Write-Host "build_zip: target zip $zipName"
+
+# Make sure version.ts matches the zip version (declaredVersion branch skips bump).
+$versionFile = Join-Path (Join-Path $_scriptDir "webui-src") "src\version.ts"
+$ts = "export const PLUGIN_VERSION = `"$version`";`n"
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+[System.IO.File]::WriteAllText($versionFile, $ts, $utf8Bom)
+Write-Host "build_zip: version.ts -> $version"
 
 # Step 2: rebuild vite bundle so bundle PLUGIN_VERSION matches the zip name
 $webui = [System.IO.Path]::Combine($_scriptDir, "webui-src")

@@ -769,6 +769,10 @@ class ModelPanelPlugin(Star):
         cfg = self._test_config()
         timeout = float(payload.get("timeout") or cfg["test_timeout"])
         providers = self._chat_providers()
+        # 可选：只测指定的 provider 子集（分组一键测试用）
+        only_ids = set(str(x).strip() for x in (payload.get("ids") or []) if str(x).strip())
+        if only_ids:
+            providers = [p for p in providers if str(self._provider_display(p)["id"]) in only_ids]
         # 创建持久会话记录（同时返回 id 给前端轮询）
         session_db_id: Optional[int] = None
         if self.storage:

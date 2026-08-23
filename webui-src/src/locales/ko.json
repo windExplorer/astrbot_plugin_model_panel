@@ -1,6 +1,6 @@
 {
   "common": {
-    "appName": "모델 콘솔",
+    "appName": "냐옹 모델 콘솔",
     "yes": "예",
     "no": "아니오",
     "confirm": "확인",
@@ -91,6 +91,9 @@
     "latencyMs": "{n} ms",
     "msUnit": "ms",
     "btnSingle": "개별 감지",
+    "btnTesting": "감지 중…",
+    "btnGroupTest": "이 그룹 감지",
+    "colCheckedAt": "감지 시각",
     "btnRetrying": "재시도 중…",
     "btnRetry": "재시도",
     "btnRefresh": "새로고침",

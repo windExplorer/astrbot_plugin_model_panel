@@ -6,7 +6,7 @@
           <!-- 左侧菜单：sticky 不随主区滚动 -->
           <aside class="sidebar">
             <div class="brand">
-              <span class="brand-dot"></span>
+              <img class="brand-logo" :src="logoUrl" alt="logo" />
               <span class="brand-name">{{ t("common.appName") }}</span>
             </div>
             <nav class="nav">
@@ -85,6 +85,7 @@ import { useI18n } from "vue-i18n";
 import { PLUGIN_VERSION } from "./version";
 import { useTheme } from "./stores/theme";
 import { useLocale, type AppLocale } from "./stores/locale";
+import logoUrl from "./assets/logo.jpg";
 
 const route = useRoute();
 const { t, locale } = useI18n();
@@ -125,10 +126,12 @@ const naiveDateLocale = computed(() => {
 
 const themeOverrides = computed(() => ({
   common: {
-    primaryColor: "#4f7dff",
-    primaryColorHover: "#6ea0ff",
-    primaryColorPressed: "#3b66e0",
-    primaryColorSuppl: "#6ea0ff",
+    primaryColor: "#ff7eb6",
+    primaryColorHover: "#ff9cc6",
+    primaryColorPressed: "#e05f9d",
+    primaryColorSuppl: "#ff9cc6",
+    borderRadius: "12px",
+    borderRadiusSmall: "10px",
     fontFamily:
       '-apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif',
   },
@@ -153,30 +156,30 @@ function onSelectLang(key: string) {
 /* 主题色：深 / 浅 */
 :root,
 :root[data-theme="dark"] {
-  --bg: #0f1626;
-  --panel: #1a2337;
-  --panel-2: #202c44;
-  --border: #2c3a56;
-  --text: #e6ebf4;
-  --muted: #8a97ad;
-  --accent: #4f7dff;
-  --accent-2: #6ea0ff;
-  --ok: #34c98a;
-  --err: #ff6b6b;
-  --warn: #ffb454;
+  --bg: #1a1430;
+  --panel: #241d38;
+  --panel-2: #2e2550;
+  --border: #3a2f58;
+  --text: #f1e8f5;
+  --muted: #b3a3c9;
+  --accent: #ff7eb6;
+  --accent-2: #c49bff;
+  --ok: #5ad1a8;
+  --err: #ff7d8f;
+  --warn: #ffc56e;
 }
 :root[data-theme="light"] {
-  --bg: #f4f6fb;
+  --bg: #fff5f9;
   --panel: #ffffff;
-  --panel-2: #f4f6fb;
-  --border: #e0e6f0;
-  --text: #1f2638;
-  --muted: #6b7385;
-  --accent: #2f6bff;
-  --accent-2: #4f7dff;
-  --ok: #19a974;
-  --err: #e0444c;
-  --warn: #d68900;
+  --panel-2: #fff0f6;
+  --border: #ffdce9;
+  --text: #3d2b3f;
+  --muted: #9a7f9a;
+  --accent: #ff5d9e;
+  --accent-2: #b47bff;
+  --ok: #3fae84;
+  --err: #ef4d68;
+  --warn: #e59a2b;
 }
 
 * {
@@ -219,18 +222,25 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   padding: 6px 8px 18px;
 }
-.brand-dot {
-  width: 10px;
-  height: 10px;
+.brand-logo {
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  object-fit: cover;
+  box-shadow: 0 0 0 2px var(--border), 0 4px 10px rgba(255, 125, 182, 0.35);
+  flex-shrink: 0;
 }
 .brand-name {
-  font-weight: 700;
+  font-weight: 800;
   font-size: 16px;
+  letter-spacing: 0.5px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 .nav {
   display: flex;
@@ -240,8 +250,8 @@ body {
 }
 .nav-item {
   display: block;
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 10px 14px;
+  border-radius: 12px;
   color: var(--muted);
   text-decoration: none;
   font-size: 14px;
@@ -252,9 +262,9 @@ body {
   color: var(--text);
 }
 .nav-item.router-link-active {
-  background: rgba(79, 125, 255, 0.16);
-  color: var(--accent-2);
-  font-weight: 600;
+  background: linear-gradient(135deg, rgba(255, 125, 182, 0.18), rgba(180, 123, 255, 0.18));
+  color: var(--accent);
+  font-weight: 700;
 }
 .sidebar-footer {
   margin-top: auto;
@@ -280,7 +290,10 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg);
+  /* 柔和萌系渐变背景 */
+  background: radial-gradient(1200px 600px at 90% -10%, rgba(255, 125, 182, 0.10), transparent 60%),
+    radial-gradient(1000px 500px at -10% 110%, rgba(180, 123, 255, 0.10), transparent 55%),
+    var(--bg);
 }
 .content-head {
   flex-shrink: 0;

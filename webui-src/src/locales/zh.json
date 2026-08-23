@@ -1,6 +1,6 @@
 {
   "common": {
-    "appName": "模型控制台",
+    "appName": "喵喵模型控制台",
     "yes": "是",
     "no": "否",
     "confirm": "确认",
@@ -91,6 +91,9 @@
     "latencyMs": "{n} ms",
     "msUnit": "ms",
     "btnSingle": "单独检测",
+    "btnTesting": "检测中…",
+    "btnGroupTest": "测试此分组",
+    "colCheckedAt": "检测时间",
     "btnRetrying": "重试中…",
     "btnRetry": "重试",
     "btnRefresh": "刷新",

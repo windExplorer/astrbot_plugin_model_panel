@@ -85,6 +85,16 @@
             <n-tag size="small" :bordered="false" type="default">
               {{ group.items.length }} {{ t("detect.units") }}
             </n-tag>
+            <n-button
+              size="tiny"
+              type="primary"
+              ghost
+              :loading="testing && testingGroup === group.name"
+              :disabled="testing || refreshing"
+              @click="testGroup(group.name)"
+            >
+              {{ t("detect.btnGroupTest") }}
+            </n-button>
           </header>
           <n-data-table
             :columns="columns"
@@ -440,7 +450,8 @@ async function testOne(id: string) {
   }
 }
 
-async function testAll() {
+// 一键检测（全测）或分组一键测试。ids 为空 = 全部；否则只测指定 provider。
+async function testMany(ids: string[] | null = null) {
   if (testing.value) return;
   testing.value = true;
   // 重置检测进度与统计
@@ -448,17 +459,20 @@ async function testAll() {
   testProgress.total = 0;
   testProgress.percent = 0;
   lastSessionStats.value = null;
-  const skip = Object.keys(enabled).filter((k) => !enabled[k]);
+  const skip = ids ? [] : Object.keys(enabled).filter((k) => !enabled[k]);
+  const scope = ids ? new Set(ids) : null;
   for (const k of Object.keys(pending)) pending[k] = false;
   try {
     await new Promise<void>((resolve, reject) => {
       startTestAllStream(
-        { skip },
+        { skip, ids: ids || undefined },
         {
           onStart: (e) => {
             testProgress.total = e.total || 0;
             for (const k of Object.keys(enabled)) {
-              if (enabled[k]) pending[k] = true;
+              if (!scope || scope.has(k)) {
+                if (enabled[k] || ids) pending[k] = true;
+              }
             }
           },
           onItem: (e) => {
@@ -499,12 +513,28 @@ async function testAll() {
     }
   } finally {
     testing.value = false;
+    testingGroup.value = null;
     testProgress.current = 0;
     testProgress.total = 0;
     testProgress.percent = 0;
     for (const k of Object.keys(pending)) pending[k] = false;
   }
 }
+
+function testAll() {
+  return testMany(null);
+}
+
+// 分组一键测试
+async function testGroup(name: string) {
+  const group = groupedRows.value.find((g) => g.name === name);
+  if (!group || !group.items.length) return;
+  testingGroup.value = name;
+  await testMany(group.items.map((it) => it.id));
+}
+
+// 当前正在测试的分组名（用于分组按钮 loading 显示）
+const testingGroup = ref<string | null>(null);
 
 async function manualRefresh() {
   if (refreshing.value) return;
@@ -526,6 +556,7 @@ const COL = {
   vendor: 160,
   status: 110,
   latency: 100,
+  checked_at: 170,
   result: 220,
   retry: 70,
   action: 110,
@@ -596,6 +627,18 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     },
   },
   {
+    title: t("detect.colCheckedAt"),
+    key: "checked_at",
+    width: COL.checked_at,
+    render(row) {
+      const r = results[row.id];
+      if (!r || !r.checked_at) return h(NText, { depth: 3 }, () => "—");
+      return h(NText, { depth: 3, style: "font-size: 12px; white-space: nowrap" }, () =>
+        formatTime(r.checked_at),
+      );
+    },
+  },
+  {
     title: t("detect.colResult"),
     key: "result",
     width: COL.result,
@@ -647,7 +690,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
         loading: !!pending[row.id],
         disabled: testing.value,
         onClick: () => testOne(row.id),
-      }, () => (pending[row.id] ? t("detect.btnRetrying") : t("detect.btnSingle")));
+      }, () => (pending[row.id] ? t("detect.btnTesting") : t("detect.btnSingle")));
     },
   },
 ]);

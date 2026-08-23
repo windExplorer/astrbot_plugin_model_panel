@@ -1,9 +1,9 @@
 ﻿name: astrbot_plugin_model_panel
-display_name: 模型控制台
+display_name: 喵喵模型控制台
 author: local
-version: v0.3.42
-description: 模型管理与检测面板：全局 LLM 模型延迟/存活检测、排序、AstrBot 默认模型查看、伴侣插件精准模型一键替换。
-desc: 统一管理与检测 AstrBot 及各插件的模型配置。
+version: v0.6.0
+description: 自用的萌系模型管理与检测面板：全局 LLM 模型延迟/存活检测、分组一键测试、AstrBot 默认模型查看、伴侣插件（我会永远陪着你）精准模型一键替换。
+desc: 用最可爱的方式，快速更换“我会永远陪着你”的模型并检测可用性。
 repo: https://github.com/windExplorer/astrbot_plugin_model_panel
 category: AI 增强
 tags:
@@ -11,9 +11,10 @@ tags:
   - 模型检测
   - 延迟检测
   - 一键替换
+  - 陪伴插件
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.22.0"
 pages:
   - name: model-panel
-    title: 模型控制台
+    title: 喵喵模型控制台

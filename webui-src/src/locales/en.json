@@ -1,6 +1,6 @@
 {
   "common": {
-    "appName": "Model Console",
+    "appName": "Mew Mew Model Console",
     "yes": "Yes",
     "no": "No",
     "confirm": "Confirm",
@@ -90,6 +90,9 @@
     "latencyMs": "{n} ms",
     "msUnit": "ms",
     "btnSingle": "Test",
+    "btnTesting": "Testing…",
+    "btnGroupTest": "Test this group",
+    "colCheckedAt": "Checked at",
     "btnRetrying": "Retrying…",
     "btnRetry": "Retry",
     "btnRefresh": "Refresh",

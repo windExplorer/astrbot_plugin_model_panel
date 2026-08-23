@@ -278,7 +278,7 @@ export interface TestAllStreamHandlers {
 }
 
 export async function startTestAllStream(
-  body: { skip?: string[]; timeout?: number },
+  body: { skip?: string[]; ids?: string[]; timeout?: number },
   handlers: TestAllStreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {

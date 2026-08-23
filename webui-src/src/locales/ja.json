@@ -1,6 +1,6 @@
 {
   "common": {
-    "appName": "モデルコンソール",
+    "appName": "にゃんにゃんモデルコンソール",
     "yes": "はい",
     "no": "いいえ",
     "confirm": "確認",
@@ -91,6 +91,9 @@
     "latencyMs": "{n} ms",
     "msUnit": "ms",
     "btnSingle": "個別検出",
+    "btnTesting": "検出中…",
+    "btnGroupTest": "このグループを検出",
+    "colCheckedAt": "検出時刻",
     "btnRetrying": "再試行中…",
     "btnRetry": "再試行",
     "btnRefresh": "更新",
