@@ -1,1 +1,1 @@
-﻿export const PLUGIN_VERSION = "v0.11.1";
+﻿export const PLUGIN_VERSION = "v0.3.1";

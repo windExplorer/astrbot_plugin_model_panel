@@ -1,13 +1,18 @@
-# Auto bump plugin version before build.
-# Version format: v0.{minor}.{patch} (pure numeric, no date in version)
-#   - major = 0
-#   - minor = git commit count on HEAD (auto-derived)
-#   - patch = today's build sequence under dist/ (1..N), resets next day
-# Sequence is read from both:
-#   1) existing zip files in dist/ matching v0.{minor}.{seq}.zip today pattern
-#   2) metadata.yaml current version (handles incremental builds without zip yet)
-# Idempotent: re-running without a fresh build cycle produces the same number
-# unless a new commit or zip is present.
+# Auto bump plugin patch version before build.
+# Version format: v0.{minor}.{patch}
+#   - major = 0 (reserved)
+#   - minor = manual, declared in metadata.yaml (e.g. "version: v0.2.0")
+#             Bump only when shipping new features; reset patch to 0 when bumping minor.
+#   - patch = auto-increment per build, sourced from the highest patch number
+#             seen in dist/*.zip + metadata.yaml under the current minor.
+#
+# Behavior:
+#   - Read metadata.yaml. If version matches v0.{minor}.{patch} with the same
+#     minor as the highest seen patch, advance patch+1.
+#   - If metadata version has a different minor (you bumped minor manually),
+#     treat it as patch=0 and start from 1.
+#   - Always write the resulting v0.{minor}.{patch} back to metadata.yaml
+#     and to webui-src/src/version.ts.
 [CmdletBinding()]
 param(
     [string]$Root = ""
@@ -15,7 +20,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# When dot-sourced, $PSScriptRoot is empty; fall back to $MyInvocation.
 if ([string]::IsNullOrEmpty($Root)) {
     if ($PSScriptRoot) {
         $Root = $PSScriptRoot
@@ -27,42 +31,34 @@ if ([string]::IsNullOrEmpty($Root)) {
     }
 }
 
-function Get-CommitCount {
-    try {
-        $n = (& git -C $Root rev-list --count HEAD 2>&1) | Select-Object -Last 1
-        if ($LASTEXITCODE -ne 0) { return 0 }
-        return [int]$n
-    } catch {
-        return 0
-    }
-}
-
-function Get-DistMaxSeq {
-    # Scan dist/*.zip and return the highest patch value matching v0.{minor}.{seq}.zip
+function Get-DistMaxPatch {
+    # Scan dist/*.zip and return the highest patch number for the given minor.
     param([string]$DistDir, [string]$PluginName, [int]$Minor)
     if (-not (Test-Path $DistDir)) { return 0 }
-    $files = Get-ChildItem -Path $DistDir -Filter "${PluginName}_v0.${Minor}.*.zip" -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -Path $DistDir -Filter "${PluginName}_v*.zip" -ErrorAction SilentlyContinue
     if (-not $files) { return 0 }
     $pattern = "^${PluginName}_v0\.${Minor}\.(\d+)\.zip$"
-    $maxSeq = 0
+    $maxPatch = 0
     foreach ($f in $files) {
         $m = [regex]::Match($f.Name, $pattern)
         if ($m.Success) {
             $n = [int]$m.Groups[1].Value
-            if ($n -gt $maxSeq) { $maxSeq = $n }
+            if ($n -gt $maxPatch) { $maxPatch = $n }
         }
     }
-    return $maxSeq
+    return $maxPatch
 }
 
-function Get-MetadataPatch {
-    # Read the current patch number from metadata.yaml version: v0.{minor}.{patch}
-    param([string]$MetaPath, [int]$Minor)
-    if (-not (Test-Path $MetaPath)) { return 0 }
+function Get-MetadataVersion {
+    # Parse metadata.yaml's version field. Returns @{ minor=N; patch=N } or $null.
+    param([string]$MetaPath)
+    if (-not (Test-Path $MetaPath)) { return $null }
     $txt = [System.IO.File]::ReadAllText($MetaPath)
-    $m = [regex]::Match($txt, "(?m)^version:\s*v0\.${Minor}\.(\d+)")
-    if ($m.Success) { return [int]$m.Groups[1].Value }
-    return 0
+    $m = [regex]::Match($txt, "(?m)^version:\s*v0\.(\d+)\.(\d+)")
+    if ($m.Success) {
+        return @{ minor = [int]$m.Groups[1].Value; patch = [int]$m.Groups[2].Value }
+    }
+    return $null
 }
 
 $metaPath = Join-Path $Root "metadata.yaml"
@@ -71,23 +67,28 @@ if (-not (Test-Path $metaPath)) {
     return
 }
 
-$commitCount = Get-CommitCount
-$minor = [Math]::Max(0, $commitCount)
 $distDir = Join-Path $Root "dist"
 $pluginName = "astrbot_plugin_model_panel"
 
-$distSeq = Get-DistMaxSeq -DistDir $distDir -PluginName $pluginName -Minor $minor
-$metaSeq = Get-MetadataPatch -MetaPath $metaPath -Minor $minor
-$startSeq = [Math]::Max($distSeq, $metaSeq)
-$nextSeq = $startSeq + 1
-$version = "v0.${minor}.${nextSeq}"
+$metaVer = Get-MetadataVersion -MetaPath $metaPath
+if ($null -eq $metaVer) {
+    # No version in metadata; default to 0.0 and start patch=1.
+    Write-Host "[bump_version] metadata.yaml has no version, starting from v0.0.1"
+    $metaVer = @{ minor = 0; patch = 0 }
+}
 
-# Patch metadata.yaml version line (preserve other lines exactly).
+$minor = $metaVer.minor
+$distPatch = Get-DistMaxPatch -DistDir $distDir -PluginName $pluginName -Minor $minor
+$startPatch = [Math]::Max($metaVer.patch, $distPatch)
+$nextPatch = $startPatch + 1
+$version = "v0.${minor}.${nextPatch}"
+
+# Write back to metadata.yaml (preserve other lines exactly).
 $content = Get-Content -Path $metaPath -Raw -Encoding UTF8
 $newContent = [regex]::Replace($content, "(?m)^version:\s*v?[0-9]+\.[0-9]+\.[0-9]+.*$", "version: $version")
 if ($newContent -ne $content) {
     Set-Content -Path $metaPath -Value $newContent -Encoding UTF8 -NoNewline
-    Write-Host "[bump_version] metadata.yaml version -> $version (commit=$commitCount, prevSeq=$startSeq)"
+    Write-Host "[bump_version] metadata.yaml version -> $version (minor=$minor, prevPatch=$startPatch)"
 } else {
     Write-Host "[bump_version] metadata.yaml unchanged (already $version)"
 }
