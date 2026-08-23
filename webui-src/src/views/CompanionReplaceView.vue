@@ -18,6 +18,7 @@
           </n-text>
         </n-space>
 
+        <!-- 主列表：已配置项 + 替换下拉 -->
         <n-empty
           v-if="!usedModels.length"
           :description="t('companion.usedModelsEmpty')"
@@ -30,23 +31,78 @@
           :data="usedModels"
           :pagination="false"
           size="small"
-          :bordered="false"
+          :bordered="true"
           :single-line="false"
+          :row-key="(row) => row.value"
         />
 
-        <n-collapse v-if="unconfiguredItems.length" class="mt-3">
-          <n-collapse-item :title="t('companion.sectionUnconfigured', { n: unconfiguredItems.length })" name="unconfigured">
+        <!-- 未配置项（默认折叠 + 说明） -->
+        <n-collapse class="mt-3" :default-expanded-names="[]">
+          <n-collapse-item :title="unconfiguredTitle" name="unconfigured">
+            <template #header-extra>
+              <n-tag size="small" type="warning">{{ unconfiguredItems.length }}</n-tag>
+            </template>
+            <n-text depth="3" class="block">
+              {{ t("companion.unconfiguredExplain") }}
+            </n-text>
+            <n-text depth="3" class="block">
+              {{ t("companion.unconfiguredHowto") }}
+            </n-text>
             <n-data-table
               :columns="unconfiguredColumns"
               :data="unconfiguredItems"
               :pagination="false"
               size="small"
               :bordered="false"
+              :row-key="(row) => row.key"
+              class="mt-2"
             />
           </n-collapse-item>
         </n-collapse>
       </template>
     </n-card>
+
+    <!-- 模型使用详情弹窗：点模型名打开 -->
+    <n-modal
+      v-model:show="detailVisible"
+      preset="card"
+      :title="t('companion.detail.title')"
+      style="max-width: 720px"
+    >
+      <template v-if="detailModel">
+        <n-descriptions
+          :column="1"
+          size="small"
+          bordered
+          label-placement="left"
+          class="detail-desc"
+        >
+          <n-descriptions-item :label="t('companion.detail.modelName')">
+            {{ detailModel.value }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('companion.detail.usageCount')">
+            <n-tag type="info" size="small">{{ detailModel.labels.length }}</n-tag>
+          </n-descriptions-item>
+        </n-descriptions>
+
+        <n-divider />
+
+        <div class="raw-title">{{ t("companion.detail.usageKeys") }}</div>
+        <n-data-table
+          :columns="detailKeyColumns"
+          :data="detailModel.keys || []"
+          :pagination="false"
+          size="small"
+          :bordered="true"
+          :row-key="(row) => row.key"
+        />
+
+        <n-divider />
+
+        <div class="raw-title">{{ t("companion.detail.allModels") }}</div>
+        <pre class="raw-json">{{ formatAllModels() }}</pre>
+      </template>
+    </n-modal>
   </div>
 </template>
 
@@ -59,7 +115,11 @@ import {
   NCollapse,
   NCollapseItem,
   NDataTable,
+  NDescriptions,
+  NDescriptionsItem,
+  NDivider,
   NEmpty,
+  NModal,
   NSelect,
   NSpace,
   NTag,
@@ -88,21 +148,53 @@ const configMode = ref("");
 const configuredCount = ref(0);
 const totalKeys = ref(0);
 
+// 详情弹窗
+const detailVisible = ref(false);
+const detailModel = ref<{
+  value: string;
+  labels: string[];
+  keys: { key: string; label: string }[];
+} | null>(null);
+
+function openDetail(model: { value: string; labels: string[]; keys: { key: string; label: string }[] }) {
+  detailModel.value = model;
+  detailVisible.value = true;
+}
+
+function formatAllModels(): string {
+  try {
+    return JSON.stringify(usedModels.value, null, 2);
+  } catch {
+    return String(usedModels.value);
+  }
+}
+
+// value(模型名) -> [{ key, label }, ...]
 const usedModels = computed(() => {
-  const map = new Map<string, string[]>();
+  const map = new Map<string, { key: string; label: string }[]>();
   for (const it of items.value) {
     if (!it.value) continue;
     if (!map.has(it.value)) map.set(it.value, []);
-    map.get(it.value)!.push(it.key);
+    map.get(it.value)!.push({ key: it.key, label: it.label || it.key });
   }
-  return [...map.entries()].map(([value, labels]) => ({ value, labels }));
+  return [...map.entries()].map(([value, keys]) => ({
+    value,
+    keys,
+    labels: keys.map((k) => k.key),
+  }));
 });
 
 const unconfiguredItems = computed(() =>
-  items.value.filter((it) => !it.configured).map((it) => ({ key: it.key })),
+  items.value
+    .filter((it) => !it.configured)
+    .map((it) => ({ key: it.key, label: it.label || it.key })),
 );
 
 const unconfiguredCount = computed(() => unconfiguredItems.value.length);
+
+const unconfiguredTitle = computed(() =>
+  t("companion.sectionUnconfigured", { n: unconfiguredItems.value.length }),
+);
 
 function availableOptions(value: string): { label: string; value: string }[] {
   const opts: { label: string; value: string }[] = providers.value.map((p) => ({ label: p, value: p }));
@@ -156,30 +248,33 @@ async function reload() {
   }
 }
 
-const columns = computed<DataTableColumn<{ value: string; labels: string[] }>[]>(() => [
+const columns = computed<DataTableColumn<{ value: string; labels: string[]; keys: { key: string; label: string }[] }>[]>(() => [
   {
-    title: t("common.default"),
+    title: t("companion.colModel"),
     key: "value",
+    minWidth: 240,
     render(row) {
       return h("div", { class: "old-cell" }, [
-        h("div", { class: "old-name", title: row.value }, row.value),
-        h(NTooltip, null, {
-          trigger: () =>
-            h("div", { class: "old-sub" }, [
+        h(
+          "button",
+          {
+            class: "model-link",
+            title: t("companion.detail.clickToView"),
+            onClick: () => openDetail(row),
+          },
+          row.value,
+        ),
+        h("div", { class: "old-sub" }, [
+          h(NTooltip, null, {
+            trigger: () =>
               h(NTag, { size: "tiny", type: "info", round: true }, () =>
                 t("companion.labelsTitle") + ": " + row.labels.length,
               ),
-            ]),
-          default: () => row.labels.join("、") || t("companion.noLabels"),
-        }),
+            default: () => row.labels.join("、") || t("companion.noLabels"),
+          }),
+        ]),
       ]);
     },
-  },
-  {
-    title: "→",
-    key: "arrow",
-    width: 32,
-    render: () => h("span", { class: "arrow" }, "→"),
   },
   {
     title: t("common.save"),
@@ -197,11 +292,32 @@ const columns = computed<DataTableColumn<{ value: string; labels: string[] }>[]>
   },
 ]);
 
-const unconfiguredColumns = computed<DataTableColumn<{ key: string }>[]>(() => [
+const unconfiguredColumns = computed<DataTableColumn<{ key: string; label: string }>[]>(() => [
   {
     title: "Key",
     key: "key",
+    minWidth: 280,
+    render: (row) =>
+      h("code", { class: "key-cell", title: row.key }, row.key),
+  },
+  {
+    title: t("companion.colLabel"),
+    key: "label",
+    render: (row) => h(NText, { depth: 3 }, () => row.label),
+  },
+]);
+
+const detailKeyColumns = computed<DataTableColumn<{ key: string; label: string }>[]>(() => [
+  {
+    title: "Key",
+    key: "key",
+    minWidth: 280,
     render: (row) => h("code", { class: "key-cell" }, row.key),
+  },
+  {
+    title: t("companion.colLabel"),
+    key: "label",
+    render: (row) => h(NText, { depth: 3 }, () => row.label || row.key),
   },
 ]);
 
@@ -230,21 +346,24 @@ onMounted(async () => {
 .old-cell {
   display: flex;
   flex-direction: column;
+  gap: 4px;
 }
-.old-name {
+.model-link {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--accent-2);
   font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 320px;
+  font-size: 14px;
+  text-align: left;
+  text-decoration: underline dotted;
+}
+.model-link:hover {
+  color: var(--accent);
 }
 .old-sub {
-  color: var(--muted);
   font-size: 11px;
-  margin-top: 2px;
-}
-.arrow {
-  color: var(--muted);
 }
 .key-cell {
   font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
@@ -253,7 +372,35 @@ onMounted(async () => {
   padding: 2px 6px;
   border-radius: 4px;
 }
+.mt-2 {
+  margin-top: 8px;
+}
 .mt-3 {
   margin-top: 12px;
+}
+.block {
+  display: block;
+  margin-bottom: 6px;
+}
+.detail-desc {
+  margin-bottom: 8px;
+}
+.raw-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.raw-json {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 280px;
+  overflow: auto;
+  margin: 0;
 }
 </style>

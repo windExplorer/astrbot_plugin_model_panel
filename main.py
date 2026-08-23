@@ -65,6 +65,47 @@ COMPANION_PROVIDER_KEYS = [
     "EMOTION_JUDGEMENT_PROVIDER_ID",
 ]
 
+# 伴侣插件 provider key 的中文标签（在伴侣插件 command_handlers.py 中整理）。
+# 这里只内置我们关心的部分；找不到时前端显示 key 原名。
+COMPANION_KEY_LABELS: dict[str, str] = {
+    "FAST_RESPONSE_PROVIDER_ID": "快速响应模型",
+    "COMPLEX_REASONING_PROVIDER_ID": "复杂推理模型",
+    "CREATIVE_MODEL_PROVIDER_ID": "创作模型",
+    "LLM_PROVIDER_ID": "插件主模型",
+    "MAI_STYLE_PROVIDER_ID": "风格/轻量任务模型",
+    "DAILY_PLAN_PROVIDER_ID": "每日计划模型",
+    "DETAIL_ENHANCEMENT_PROVIDER_ID": "细节增强模型",
+    "DREAM_DIARY_PROVIDER_ID": "梦境日记模型",
+    "CREATIVE_PROVIDER_ID": "通用创作模型",
+    "CREATIVE_OUTLINE_PROVIDER_ID": "创作大纲模型",
+    "CREATIVE_REVIEW_PROVIDER_ID": "创作审阅模型",
+    "VOICE_PROMPT_PROVIDER_ID": "语音提示词模型",
+    "tts_conversion_provider_id": "TTS 文本转换",
+    "PHOTO_PROMPT_PROVIDER_ID": "生图提示词模型",
+    "NARRATION_PROVIDER_ID": "叙述模型",
+    "HISTORY_SUMMARY_PROVIDER_ID": "历史摘要模型",
+    "RESPONSE_REVIEW_PROVIDER_ID": "回复复核模型",
+    "SMART_SILENCE_PROVIDER_ID": "智能沉默模型",
+    "PROACTIVE_PERSONA_JUDGE_PROVIDER_ID": "主动人格判定模型",
+    "TROUBLESHOOTING_PROVIDER_ID": "插件答疑/排障模型",
+    "DAILY_REVIEW_PROVIDER_ID": "每日复盘模型",
+    "SMART_MESSAGE_DEBOUNCE_PROVIDER_ID": "智能收口小模型",
+    "REST_WAKEUP_PROVIDER_ID": "休息醒来判断模型",
+    "RELATIONSHIP_ANALYSIS_PROVIDER_ID": "关系分析模型",
+    "COMPANION_MEMORY_PROVIDER_ID": "陪伴记忆模型",
+    "DIALOGUE_EPISODE_PROVIDER_ID": "对话剧集模型",
+    "GROUP_INTERJECT_PROVIDER_ID": "群聊插话模型",
+    "GROUP_EPISODE_PROVIDER_ID": "群聊剧集模型",
+    "GROUP_SLANG_PROVIDER_ID": "群聊俚语模型",
+    "GROUP_FOLLOWUP_JUDGE_PROVIDER_ID": "群聊连续对话判断模型",
+    "FORWARD_MESSAGE_PROVIDER_ID": "转发消息模型",
+    "PLUGIN_VISION_PROVIDER_ID": "插件视觉模型",
+    "PRIVATE_READING_VISION_PROVIDER_ID": "私读视觉模型",
+    "NEWS_PROVIDER_ID": "新闻模型",
+    "WEB_EXPLORATION_PROVIDER_ID": "联网探索模型",
+    "EMOTION_JUDGEMENT_PROVIDER_ID": "情绪判定模型",
+}
+
 # 错误归一化规则：按关键字匹配出 error_code，避免把接口返回的整段堆栈塞到前端
 _ERROR_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("timeout", re.compile(r"timeout|timed?\s*out|超时", re.I)),
@@ -577,6 +618,7 @@ class ModelPanelPlugin(Star):
                 "key": key,
                 "value": value,
                 "configured": is_configured,
+                "label": COMPANION_KEY_LABELS.get(key, key),
             })
         config_mode = ""
         try:

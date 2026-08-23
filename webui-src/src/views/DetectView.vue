@@ -19,37 +19,30 @@
       </n-space>
     </n-card>
 
-    <n-card
-      :title="t('detect.groupTitle', { count: items.length })"
-      size="small"
-    >
+    <n-card :title="t('detect.groupTitle', { count: items.length })" size="small">
       <n-empty v-if="!items.length" :description="t('detect.groupNone')" />
-      <n-tabs
-        v-else
-        type="line"
-        :value="activeGroup"
-        @update:value="(v: string) => (activeGroup = v)"
-      >
-        <n-tab-pane
-          v-for="group in groupedItems"
-          :key="group.name"
-          :name="group.name"
-          :tab="`${group.name} (${group.items.length})`"
-        >
+
+      <!-- 单页全展示：每个供应商一段标题 + 一张表 -->
+      <div v-else class="groups">
+        <section v-for="group in groupedItems" :key="group.name" class="group-block">
+          <header class="group-head">
+            <span class="group-name">{{ group.name || t("detect.groupName") }}</span>
+            <span class="group-count">{{ group.items.length }} {{ t("detect.units") || "" }}</span>
+          </header>
           <n-data-table
             :columns="columns"
             :data="group.items"
             :row-key="rowKey"
             size="small"
             :pagination="false"
-            :bordered="false"
+            :bordered="true"
             :single-line="false"
           />
-        </n-tab-pane>
-      </n-tabs>
+        </section>
+      </div>
     </n-card>
 
-    <n-card v-if="lastSessionStats" size="small" class="mb-3">
+    <n-card v-if="lastSessionStats" size="small" class="mb-3 mt-3">
       <n-space align="center" wrap>
         <n-tag :type="lastSessionStats.ok_count > 0 ? 'success' : 'default'" round>
           ✓ {{ lastSessionStats.ok_count }}
@@ -69,6 +62,56 @@
         </n-text>
       </n-space>
     </n-card>
+
+    <!-- 结果详情弹窗：显示原始 JSON + provider 完整字段 -->
+    <n-modal
+      v-model:show="detailVisible"
+      preset="card"
+      :title="t('detect.detailTitle')"
+      style="max-width: 720px"
+    >
+      <template v-if="detailRow">
+        <n-descriptions
+          :column="1"
+          size="small"
+          bordered
+          label-placement="left"
+          class="detail-desc"
+        >
+          <n-descriptions-item :label="t('detect.colModel')">
+            {{ detailRow.name || detailRow.id }}
+            <span v-if="detailRow.model" class="muted"> · {{ detailRow.model }}</span>
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.id')">{{ detailRow.id }}</n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.checked_at')">
+            {{ formatTime(detailRow.checked_at) }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.ok')">
+            <n-tag :type="detailRow.ok ? 'success' : 'error'" size="small">
+              {{ detailRow.ok ? t("detect.result.ok") : t("detect.result.fail") }}
+            </n-tag>
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.latency_ms')">
+            {{ detailRow.latency_ms ?? "—" }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.error_code')">
+            {{ detailRow.error_code || "—" }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.error')">
+            {{ detailRow.error || "—" }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.retry_count')">
+            {{ detailRow.retry_count ?? 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item :label="t('detect.detail.skipped')">
+            {{ detailRow.skipped ? t("common.yes") : t("common.no") }}
+          </n-descriptions-item>
+        </n-descriptions>
+        <n-divider />
+        <div class="raw-title">{{ t("detect.detail.rawJson") }}</div>
+        <pre class="raw-json">{{ formatRawJson(detailRow) }}</pre>
+      </template>
+    </n-modal>
   </div>
 </template>
 
@@ -79,15 +122,17 @@ import {
   NButton,
   NCard,
   NDataTable,
+  NDescriptions,
+  NDescriptionsItem,
   NDivider,
   NEmpty,
+  NModal,
   NSelect,
   NSpace,
-  NTabPane,
-  NTabs,
   NTag,
   NText,
   NTooltip,
+  useMessage,
   type DataTableColumn,
 } from "naive-ui";
 
@@ -100,6 +145,7 @@ import {
 } from "../api";
 
 const { t } = useI18n();
+const message = useMessage();
 
 const STORAGE_KEY_RESULTS = "model_panel.detect.results";
 const STORAGE_KEY_ENABLED = "model_panel.detect.enabled";
@@ -111,13 +157,43 @@ const pending = reactive<Record<string, boolean>>({});
 const enabled = reactive<Record<string, boolean>>({});
 const testing = ref(false);
 const sortKey = ref<"latency" | "name" | "status">("latency");
-const activeGroup = ref<string>("");
 const lastSessionStats = ref<{
   ok_count: number;
   fail_count: number;
   skip_count: number;
   total: number;
 } | null>(null);
+
+// 详情弹窗
+const detailVisible = ref(false);
+const detailRow = ref<TestResult | null>(null);
+
+function openDetail(row: ProviderItem) {
+  const r = results[row.id];
+  if (!r) {
+    message.info(t("detect.detail.noResult"));
+    return;
+  }
+  detailRow.value = r;
+  detailVisible.value = true;
+}
+
+function formatTime(ts?: number): string {
+  if (!ts) return "—";
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch {
+    return String(ts);
+  }
+}
+
+function formatRawJson(row: TestResult): string {
+  try {
+    return JSON.stringify(row, null, 2);
+  } catch {
+    return String(row);
+  }
+}
 
 // ---------- 持久化 ----------
 function saveResults() {
@@ -187,7 +263,6 @@ const groupedItems = computed(() => {
       arr.sort((a, b) => {
         const ra = results[a.id];
         const rb = results[b.id];
-        // pending 排前 → ok 排前 → fail 排前 → 未检测
         const score = (x?: TestResult) => {
           if (!x) return 3;
           if (x.skipped) return 4;
@@ -209,9 +284,6 @@ const groupedItems = computed(() => {
     return { name, items: arr };
   });
   groups.sort((a, b) => a.name.localeCompare(b.name, "zh"));
-  if (!activeGroup.value && groups.length) {
-    activeGroup.value = groups[0].name;
-  }
   return groups;
 });
 
@@ -227,7 +299,6 @@ function latencyClass(ms: number): "success" | "warning" | "error" {
   return "error";
 }
 
-// 把后端 error_code 翻译成归一化文案
 function resultTagFor(item: TestResult): { type: "success" | "warning" | "error" | "default"; label: string } {
   if (item.skipped) return { type: "default", label: t("detect.result.skipped") };
   if (item.ok) return { type: "success", label: t("detect.result.ok") };
@@ -263,7 +334,6 @@ async function testAll() {
   if (testing.value) return;
   testing.value = true;
   const skip = Object.keys(enabled).filter((k) => !enabled[k]);
-  // 清空未勾选项的旧 pending，避免视觉残留
   for (const k of Object.keys(pending)) pending[k] = false;
   try {
     await new Promise<void>((resolve, reject) => {
@@ -271,7 +341,6 @@ async function testAll() {
         { skip },
         {
           onStart: () => {
-            // 开始：把已勾选的标 pending（让用户立即看到"正在检测"）
             for (const k of Object.keys(enabled)) {
               if (enabled[k]) pending[k] = true;
             }
@@ -304,7 +373,6 @@ async function testAll() {
     console.error("一键检测失败", e);
   } finally {
     testing.value = false;
-    // 兜底清掉 pending
     for (const k of Object.keys(pending)) pending[k] = false;
   }
 }
@@ -330,6 +398,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colModel"),
     key: "model",
+    minWidth: 220,
     render(row) {
       return h("div", { class: "model-cell" }, [
         h("div", { class: "model-name" }, [
@@ -378,9 +447,42 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     },
   },
   {
+    // 新增：结果列，展示 error_code + error_msg（短文本），点击行可看详情
+    title: t("detect.colResult"),
+    key: "result",
+    minWidth: 180,
+    render(row) {
+      const r = results[row.id];
+      if (!r) return h(NText, { depth: 3 }, () => "—");
+      const tag = resultTagFor(r);
+      return h("div", { class: "result-cell" }, [
+        h(NTag, { type: tag.type, size: "small", round: true }, () => tag.label),
+        h(
+          NTooltip,
+          { delay: 200 },
+          {
+            trigger: () =>
+              h(
+                "button",
+                {
+                  class: "link-btn",
+                  onClick: () => openDetail(row),
+                },
+                () => r.error_code || (r.ok ? "ok" : "—"),
+              ),
+            default: () => r.error || t("detect.detail.openRaw"),
+          },
+        ),
+        r.error
+          ? h(NText, { depth: 3, class: "result-msg" }, () => r.error)
+          : null,
+      ]);
+    },
+  },
+  {
     title: t("detect.colRetry"),
     key: "retry",
-    width: 80,
+    width: 70,
     render(row) {
       const r = results[row.id];
       if (!r || (r.retry_count ?? 0) <= 0) return h(NText, { depth: 3 }, () => "—");
@@ -393,7 +495,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colAction"),
     key: "action",
-    width: 110,
+    width: 130,
     render(row) {
       return h(NButton, {
         size: "small",
@@ -410,12 +512,10 @@ onMounted(async () => {
   try {
     const data = await apiGet<{ items: ProviderItem[] }>("/panel/providers");
     items.value = data.items || [];
-    // 给新增模型默认勾选（不覆盖用户已设置的）
     for (const it of items.value) {
       if (!(it.id in enabled)) enabled[it.id] = true;
     }
     saveEnabled();
-    // 拉取最新一次检测结果（确保切回页面数据是同步的）
     try {
       const r = await apiGet<{ items: Record<string, TestResult> }>("/panel/providers/results");
       for (const k of Object.keys(r.items || {})) {
@@ -429,7 +529,6 @@ onMounted(async () => {
     console.error("加载模型列表失败", e);
   }
 });
-
 </script>
 
 <style scoped>
@@ -440,7 +539,34 @@ onMounted(async () => {
 .mb-3 {
   margin-bottom: 12px;
 }
+.mt-3 {
+  margin-top: 12px;
+}
 .hint {
+  font-size: 12px;
+}
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.group-block {
+  display: flex;
+  flex-direction: column;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 2px 8px;
+}
+.group-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--accent-2);
+}
+.group-count {
+  color: var(--muted);
   font-size: 12px;
 }
 .model-cell {
@@ -459,5 +585,52 @@ onMounted(async () => {
   color: var(--warn);
   font-size: 12px;
   font-weight: 400;
+}
+.result-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+}
+.result-msg {
+  font-size: 12px;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--accent-2);
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 11px;
+  text-decoration: underline dotted;
+}
+.link-btn:hover {
+  color: var(--accent);
+}
+.detail-desc {
+  margin-bottom: 8px;
+}
+.raw-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.raw-json {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
 }
 </style>

@@ -188,6 +188,8 @@ export interface CompanionProviderItem {
   key: string;
   value: string;
   configured?: boolean;
+  /** 中文标签（来自后端 COMPANION_KEY_LABELS 映射） */
+  label?: string;
 }
 
 export interface OverviewHistory {

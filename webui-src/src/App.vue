@@ -185,6 +185,7 @@ html,
 body,
 #app {
   height: 100%;
+  min-height: 100vh;
   margin: 0;
 }
 body {
@@ -195,7 +196,8 @@ body {
 }
 .layout {
   display: flex;
-  height: 100%;
+  min-height: 100vh;
+  height: 100vh;
 }
 .sidebar {
   width: 220px;
@@ -205,6 +207,9 @@ body {
   background: var(--panel);
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-height: 100vh;
+  overflow-y: auto;
 }
 .brand {
   display: flex;
@@ -283,6 +288,7 @@ body {
 .content {
   flex: 1;
   min-width: 0;
+  height: 100vh;
   overflow-y: auto;
   padding: 24px 28px;
 }
