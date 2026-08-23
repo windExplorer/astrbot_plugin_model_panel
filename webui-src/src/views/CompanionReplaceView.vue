@@ -330,6 +330,13 @@ const columns = computed<
         size: "small",
         onUpdateValue: (v: string) => {
           replacements[row.value] = v;
+          // 持久化用户的替换选择（localStorage，避免误刷新丢失）
+          try {
+            localStorage.setItem(
+              "model_panel.companion.replacements",
+              JSON.stringify(replacements),
+            );
+          } catch { /* ignore */ }
         },
       });
     },
@@ -369,11 +376,29 @@ onMounted(async () => {
   try {
     const data = await apiGet<{
       items: { id: string; name: string; model: string }[];
+      models: string[];
     }>("/panel/providers");
-    providers.value = (data.items || []).map((p) => p.model || p.id).filter(Boolean);
+    // 优先用后端返回的去重 models 列表，避免 NSelect 里出现多个相同名字的选项
+    const set = new Set<string>();
+    if (Array.isArray(data.models) && data.models.length) {
+      data.models.forEach((m) => m && set.add(m));
+    } else if (data.items) {
+      data.items.forEach((p) => (p.model || p.id) && set.add(p.model || p.id));
+    }
+    providers.value = [...set];
   } catch (e) {
     console.error("加载可用模型失败", e);
   }
+  // 恢复用户上次的替换选择（localStorage，避免误操作刷新丢失）
+  try {
+    const saved = localStorage.getItem("model_panel.companion.replacements");
+    if (saved) {
+      const obj = JSON.parse(saved);
+      for (const [k, v] of Object.entries(obj || {})) {
+        if (typeof v === "string") replacements[k] = v;
+      }
+    }
+  } catch { /* ignore */ }
 });
 </script>
 
@@ -428,6 +453,34 @@ onMounted(async () => {
    缺少 min-height: 0 + overflow-y: auto，导致内容溢出时撑高整个 card。
    这里补齐。 */
 .companion-view :deep(.n-card__content) {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+</style>
+
+<style>
+/* 全局弹窗尺寸控制：n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
+   会让 modal 在内容较少时也撑满 viewport。这里覆盖 .n-modal / .n-card /
+   .n-card__content 三个层级，让 modal 自适应内容高度且上限为 viewport-64px，
+   内容区溢出滚动，关闭按钮始终可见。 */
+.n-modal-scroll-content {
+  min-height: auto !important;
+}
+.n-modal {
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.n-modal .n-card {
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.n-modal .n-card__content {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;

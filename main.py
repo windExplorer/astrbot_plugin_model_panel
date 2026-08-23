@@ -201,6 +201,8 @@ class ModelPanelPlugin(Star):
             ("/panel/providers/session/<int:session_id>", self.api_session_state, ["GET"]),
             ("/panel/providers/results", self.api_test_results, ["GET"]),
             ("/panel/providers/history", self.api_test_history, ["GET"]),
+            ("/panel/preferences", self.api_get_preferences, ["GET"]),
+            ("/panel/preferences", self.api_set_preferences, ["POST"]),
             ("/panel/default_model", self.api_default_model, ["GET"]),
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
@@ -331,15 +333,59 @@ class ModelPanelPlugin(Star):
         providers = self._chat_providers()
         default_id = self._default_provider_id()
         items = []
+        seen_models: dict[str, str] = {}  # model -> first id (记录是谁先出现的)
         for p in providers:
             d = self._provider_display(p)
             d["is_default"] = bool(d["id"] and d["id"] == default_id)
             items.append(d)
+            model = d.get("model") or ""
+            if model and model not in seen_models:
+                seen_models[model] = d["id"]
+        # 去重后的 model 名列表（按首次出现顺序），伴侣页用作 select 选项
+        models = list(seen_models.keys())
         logger.info(
-            f"[ModelPanel] /panel/providers 返回 {len(items)} 个模型, "
-            f"默认={default_id or '无'}"
+            f"[ModelPanel] /panel/providers 返回 {len(items)} 个 provider, "
+            f"{len(models)} 个去重模型, 默认={default_id or '无'}"
         )
-        return {"items": items, "default_provider_id": default_id}
+        return {
+            "items": items,
+            "models": models,
+            "default_provider_id": default_id,
+        }
+
+    # ---------- 检测勾选偏好 ----------
+    async def api_get_preferences(self) -> dict:
+        try:
+            if not self.storage:
+                return {"items": {}}
+            prefs = await self.storage.get_detection_preferences()
+            return {"items": prefs}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/preferences GET 失败: {e}")
+            return {"items": {}, "error": str(e)}
+
+    async def api_set_preferences(self) -> dict:
+        """批量设置用户对 provider 的勾选偏好。
+
+        body: { "items": { provider_id: true|false } }
+        不传 provider_id 视为默认勾选（即从前端传完整的当前集合）。
+        """
+        payload = await self._json_payload()
+        raw = payload.get("items")
+        if not isinstance(raw, dict):
+            return {"ok": False, "error": "items 必须是对象 {provider_id: bool}"}
+        prefs: dict[str, bool] = {}
+        for k, v in raw.items():
+            if not k:
+                continue
+            prefs[str(k)] = bool(v)
+        try:
+            if self.storage:
+                await self.storage.set_detection_preferences(prefs)
+            return {"ok": True, "count": len(prefs)}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/preferences PUT 失败: {e}")
+            return {"ok": False, "error": str(e)}
 
     async def api_test_provider(self) -> dict:
         payload = await self._json_payload()

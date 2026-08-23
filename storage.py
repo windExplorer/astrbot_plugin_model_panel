@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS model_test_results (
 CREATE INDEX IF NOT EXISTS idx_results_checked_at ON model_test_results(checked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_results_provider   ON model_test_results(provider_id);
 CREATE INDEX IF NOT EXISTS idx_results_session    ON model_test_results(session_id);
+
+-- 用户对每个 provider 是否勾选参与一键检测。
+-- 默认全部勾选（enabled 默认 1）；用户取消勾选后写入 0；
+-- 不存在的行视为 enabled=1。
+CREATE TABLE IF NOT EXISTS detection_preferences (
+    provider_id     TEXT PRIMARY KEY,
+    enabled         INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
 """
 
 
@@ -259,6 +268,48 @@ class Storage:
                 )
                 await db.commit()
                 return cur.rowcount or 0
+
+    # ---------- 检测勾选偏好 ----------
+    async def get_detection_preferences(self) -> dict[str, bool]:
+        """返回 {provider_id: enabled}。缺失的 provider 视为 True（默认勾选）。"""
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT provider_id, enabled FROM detection_preferences")
+            rows = await cur.fetchall()
+        return {row["provider_id"]: bool(row["enabled"]) for row in rows}
+
+    async def set_detection_preference(self, provider_id: str, enabled: bool) -> None:
+        await self.init()
+        now = int(time.time())
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO detection_preferences (provider_id, enabled, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(provider_id) DO UPDATE SET enabled=?, updated_at=?""",
+                    (provider_id, 1 if enabled else 0, now, 1 if enabled else 0, now),
+                )
+                await db.commit()
+
+    async def set_detection_preferences(self, prefs: dict[str, bool]) -> None:
+        """批量写入；先清空再插入，确保与前端传来的集合一致（缺失项回到默认 True）。"""
+        await self.init()
+        now = int(time.time())
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                # 删除所有 preference，由调用方传入完整集合（缺失即默认勾选）
+                await db.execute("DELETE FROM detection_preferences")
+                rows = [
+                    (pid, 1 if enabled else 0, now)
+                    for pid, enabled in prefs.items()
+                ]
+                if rows:
+                    await db.executemany(
+                        "INSERT INTO detection_preferences (provider_id, enabled, updated_at) VALUES (?, ?, ?)",
+                        rows,
+                    )
+                await db.commit()
 
 
 # ---------- helpers ----------

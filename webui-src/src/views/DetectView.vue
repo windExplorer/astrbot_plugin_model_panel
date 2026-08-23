@@ -6,6 +6,9 @@
         <n-button type="primary" :loading="testing" @click="testAll">
           {{ testing ? t("detect.btnAllLoading") : t("detect.btnAll") }}
         </n-button>
+        <n-button quaternary :loading="refreshing" @click="manualRefresh">
+          {{ t("detect.btnRefresh") }}
+        </n-button>
         <n-divider vertical />
         <n-text depth="3">{{ t("detect.sortBy") }}：</n-text>
         <n-select
@@ -33,30 +36,23 @@
       </n-space>
     </n-card>
 
-    <!-- 主内容区 -->
+    <!-- 主内容区：单张大表（按供应商列分组，所有列宽一致） -->
     <n-card :title="t('detect.groupTitle', { count: items.length })" size="small" class="content-card">
       <n-empty v-if="!items.length" :description="t('detect.groupNone')" />
 
-      <div v-else class="groups">
-        <section v-for="group in groupedItems" :key="group.name" class="group-block">
-          <header class="group-head">
-            <span class="group-name">{{ group.name || t("detect.groupName") }}</span>
-            <n-tag size="small" :bordered="false" type="default">
-              {{ group.items.length }} {{ t("detect.units") }}
-            </n-tag>
-          </header>
-          <n-data-table
-            :columns="columns"
-            :data="group.items"
-            :row-key="rowKey"
-            size="small"
-            :pagination="false"
-            :bordered="true"
-            :single-line="false"
-            :scroll-x="1100"
-          />
-        </section>
-      </div>
+      <n-data-table
+        v-else
+        :columns="columns"
+        :data="flatRows"
+        :row-key="rowKey"
+        size="small"
+        :pagination="false"
+        :bordered="true"
+        :single-line="false"
+        :scroll-x="1200"
+        :max-height="560"
+        flex-height
+      />
     </n-card>
 
     <n-card v-if="lastSessionStats" size="small" class="stats-card">
@@ -85,7 +81,8 @@
       v-model:show="detailVisible"
       preset="card"
       :title="t('detect.detailTitle')"
-      style="max-width: 720px"
+      style="max-width: 720px; width: calc(100vw - 48px)"
+      :style="{ maxHeight: 'calc(100vh - 64px)' }"
     >
       <template v-if="detailRow">
         <n-descriptions
@@ -167,15 +164,12 @@ import {
 const { t } = useI18n();
 const message = useMessage();
 
-const STORAGE_KEY_RESULTS = "model_panel.detect.results";
-const STORAGE_KEY_ENABLED = "model_panel.detect.enabled";
-const STORAGE_KEY_LAST_DONE = "model_panel.detect.lastDone";
-
 const items = ref<ProviderItem[]>([]);
 const results = reactive<Record<string, TestResult>>({});
 const pending = reactive<Record<string, boolean>>({});
 const enabled = reactive<Record<string, boolean>>({});
 const testing = ref(false);
+const refreshing = ref(false);
 const sortKey = ref<"latency" | "name" | "status">("latency");
 const lastSessionStats = ref<{
   ok_count: number;
@@ -215,42 +209,7 @@ function formatRawJson(row: TestResult): string {
   }
 }
 
-// ---------- 持久化 ----------
-function saveResults() {
-  try {
-    localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify(results));
-  } catch { /* ignore */ }
-}
-function saveEnabled() {
-  try {
-    localStorage.setItem(STORAGE_KEY_ENABLED, JSON.stringify(enabled));
-  } catch { /* ignore */ }
-}
-function saveLastDone() {
-  try {
-    if (lastSessionStats.value) {
-      localStorage.setItem(STORAGE_KEY_LAST_DONE, JSON.stringify(lastSessionStats.value));
-    }
-  } catch { /* ignore */ }
-}
-function loadPersisted() {
-  try {
-    const r = localStorage.getItem(STORAGE_KEY_RESULTS);
-    if (r) {
-      const obj = JSON.parse(r);
-      for (const k of Object.keys(obj || {})) (results as any)[k] = obj[k];
-    }
-    const e = localStorage.getItem(STORAGE_KEY_ENABLED);
-    if (e) {
-      const obj = JSON.parse(e);
-      for (const k of Object.keys(obj || {})) (enabled as any)[k] = obj[k];
-    }
-    const ld = localStorage.getItem(STORAGE_KEY_LAST_DONE);
-    if (ld) lastSessionStats.value = JSON.parse(ld);
-  } catch { /* ignore */ }
-}
-
-// ---------- 排序 / 分组 ----------
+// ---------- 排序 ----------
 function rowKey(row: ProviderItem) {
   return row.id;
 }
@@ -260,19 +219,22 @@ const sortOptions = computed(() => [
   { label: t("detect.sort.status"), value: "status" },
 ]);
 
-const groupedItems = computed(() => {
-  const byGroup = new Map<string, ProviderItem[]>();
+// 把分组摊平为单表行，每行附 vendor 字段；保持同列宽
+const flatRows = computed<ProviderItem[]>(() => {
+  const groups = new Map<string, ProviderItem[]>();
   for (const item of items.value) {
     const g = item.name || t("detect.groupName");
-    if (!byGroup.has(g)) byGroup.set(g, []);
-    byGroup.get(g)!.push(item);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g)!.push(item);
   }
-  const groups = [...byGroup.entries()].map(([name, list]) => {
-    const arr = [...list];
+  const orderedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], "zh"));
+  const all: ProviderItem[] = [];
+  for (const [name, list] of orderedGroups) {
+    const sorted = [...list];
     if (sortKey.value === "name") {
-      arr.sort((a, b) => (a.model || a.id).localeCompare(b.model || b.id, "zh"));
+      sorted.sort((a, b) => (a.model || a.id).localeCompare(b.model || b.id, "zh"));
     } else if (sortKey.value === "status") {
-      arr.sort((a, b) => {
+      sorted.sort((a, b) => {
         const ra = results[a.id];
         const rb = results[b.id];
         const score = (x?: TestResult) => {
@@ -284,7 +246,7 @@ const groupedItems = computed(() => {
         return score(ra) - score(rb);
       });
     } else {
-      arr.sort((a, b) => {
+      sorted.sort((a, b) => {
         const la = results[a.id]?.latency_ms;
         const lb = results[b.id]?.latency_ms;
         if (la == null && lb == null) return 0;
@@ -293,10 +255,10 @@ const groupedItems = computed(() => {
         return la - lb;
       });
     }
-    return { name, items: arr };
-  });
-  groups.sort((a, b) => a.name.localeCompare(b.name, "zh"));
-  return groups;
+    // 同组内行渲染时使用“相同 vendor”前缀，列宽统一靠表头“供应商”列固定 width
+    for (const item of sorted) all.push(item);
+  }
+  return all;
 });
 
 // ---------- 工具 ----------
@@ -311,7 +273,8 @@ const someChecked = computed(() => {
 
 function setAll(value: boolean) {
   for (const it of items.value) enabled[it.id] = value;
-  saveEnabled();
+  // 同步到后端 + localStorage
+  persistEnabled();
 }
 
 function latencyClass(ms: number): "success" | "warning" | "error" {
@@ -327,13 +290,74 @@ function resultTagFor(item: TestResult): { type: "success" | "warning" | "error"
   return { type: "error", label: t(`detect.result.${code}`) };
 }
 
+// ---------- 持久化（localStorage + 后端）----------
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+function persistEnabled(immediate = false) {
+  // 防抖：避免连续勾选时频繁请求
+  if (persistTimer) clearTimeout(persistTimer);
+  const flush = () => {
+    try {
+      localStorage.setItem(
+        "model_panel.detect.enabled",
+        JSON.stringify(enabled),
+      );
+    } catch { /* ignore */ }
+    // 后端持久化：传完整当前集合（缺失的 provider 在后端视为默认勾选）
+    apiPost("/panel/preferences", { items: { ...enabled } }).catch(() => { /* ignore */ });
+  };
+  if (immediate) flush();
+  else persistTimer = setTimeout(flush, 300);
+}
+
+async function loadPreferences() {
+  // 1. 先从后端拉
+  let serverPrefs: Record<string, boolean> | null = null;
+  try {
+    const r = await apiGet<{ items: Record<string, boolean> }>(
+      "/panel/preferences",
+    );
+    serverPrefs = r.items || {};
+  } catch { /* ignore */ }
+  // 2. 合并 localStorage（localStorage 优先级高于后端，仅在初次覆盖）
+  try {
+    const local = localStorage.getItem("model_panel.detect.enabled");
+    if (local) {
+      const obj = JSON.parse(local);
+      // localStorage 已有：用户之前在此设备有选择 → 用 localStorage
+      serverPrefs = { ...(serverPrefs || {}), ...obj };
+    }
+  } catch { /* ignore */ }
+  return serverPrefs || {};
+}
+
+async function loadResults() {
+  try {
+    const r = await apiGet<{ items: Record<string, TestResult> }>(
+      "/panel/providers/results",
+    );
+    for (const k of Object.keys(r.items || {})) {
+      results[k] = r.items[k];
+    }
+  } catch (e) {
+    console.warn("拉取最新结果失败", e);
+  }
+}
+
+async function loadProviders() {
+  const data = await apiGet<{ items: ProviderItem[] }>("/panel/providers");
+  items.value = data.items || [];
+  // 默认勾选
+  for (const it of items.value) {
+    if (!(it.id in enabled)) enabled[it.id] = true;
+  }
+}
+
 // ---------- 检测 ----------
 async function testOne(id: string) {
   pending[id] = true;
   try {
     const r = await apiPost<TestResult>("/panel/providers/test", { id });
     results[id] = r;
-    saveResults();
   } catch (e) {
     results[id] = {
       id,
@@ -345,7 +369,6 @@ async function testOne(id: string) {
       error: String((e as Error).message || e),
       retry_count: 0,
     };
-    saveResults();
   } finally {
     pending[id] = false;
   }
@@ -370,7 +393,6 @@ async function testAll() {
             const it = e.item;
             results[it.id] = it;
             pending[it.id] = false;
-            saveResults();
           },
           onDone: (e) => {
             lastSessionStats.value = {
@@ -379,7 +401,6 @@ async function testAll() {
               skip_count: e.skip_count,
               total: e.total,
             };
-            saveLastDone();
             for (const k of Object.keys(pending)) pending[k] = false;
             resolve();
           },
@@ -398,26 +419,58 @@ async function testAll() {
   }
 }
 
-// ---------- 表格列 ----------
+async function manualRefresh() {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await Promise.all([loadProviders(), loadResults()]);
+    message.success(t("detect.refreshed"));
+  } catch (e) {
+    console.error(e);
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+// ---------- 表格列（固定宽度，所有列对齐）----------
+const COL = {
+  check: 56,
+  provider: 220,
+  vendor: 160,
+  status: 110,
+  latency: 100,
+  result: 220,
+  retry: 70,
+  action: 110,
+};
 const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colCheck"),
     key: "check",
-    width: 60,
+    width: COL.check,
+    align: "center",
     render(row) {
       return h(NCheckbox, {
         checked: enabled[row.id] !== false,
         onUpdateChecked: (v: boolean) => {
           enabled[row.id] = v;
-          saveEnabled();
+          persistEnabled();
         },
       });
     },
   },
   {
+    title: t("detect.colVendor"),
+    key: "name",
+    width: COL.vendor,
+    render(row) {
+      return h(NText, { depth: 3 }, () => row.name || t("detect.groupName"));
+    },
+  },
+  {
     title: t("detect.colModel"),
     key: "model",
-    minWidth: 220,
+    width: COL.provider,
     render(row) {
       return h("div", null, [
         h("div", { style: "font-weight: 600" }, [
@@ -437,7 +490,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colStatus"),
     key: "status",
-    width: 120,
+    width: COL.status,
     render(row) {
       const id = row.id;
       if (results[id]) {
@@ -453,7 +506,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colLatency"),
     key: "latency",
-    width: 110,
+    width: COL.latency,
     render(row) {
       const r = results[row.id];
       if (!r) return h(NText, { depth: 3 }, () => "—");
@@ -469,12 +522,12 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colResult"),
     key: "result",
-    minWidth: 220,
+    width: COL.result,
     render(row) {
       const r = results[row.id];
       if (!r) return h(NText, { depth: 3 }, () => "—");
       const tag = resultTagFor(r);
-      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start; max-width: 280px" }, [
+      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start" }, [
         h(NTag, { type: tag.type, size: "small", round: true }, () => tag.label),
         h(NTooltip, { delay: 200 }, {
           trigger: () =>
@@ -488,7 +541,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
           default: () => r.error || t("detect.detail.openRaw"),
         }),
         r.error
-          ? h(NText, { depth: 3, style: "font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" }, () => r.error)
+          ? h(NText, { depth: 3, style: "font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" }, () => r.error)
           : null,
       ]);
     },
@@ -496,7 +549,8 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colRetry"),
     key: "retry",
-    width: 80,
+    width: COL.retry,
+    align: "center",
     render(row) {
       const r = results[row.id];
       if (!r || (r.retry_count ?? 0) <= 0) return h(NText, { depth: 3 }, () => "—");
@@ -509,7 +563,8 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
   {
     title: t("detect.colAction"),
     key: "action",
-    width: 130,
+    width: COL.action,
+    fixed: "right",
     render(row) {
       return h(NButton, {
         size: "small",
@@ -524,26 +579,21 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
 ]);
 
 onMounted(async () => {
-  loadPersisted();
+  // 并行加载 providers + preferences + results
   try {
-    const data = await apiGet<{ items: ProviderItem[] }>("/panel/providers");
-    items.value = data.items || [];
-    for (const it of items.value) {
-      if (!(it.id in enabled)) enabled[it.id] = true;
-    }
-    saveEnabled();
-    try {
-      const r = await apiGet<{ items: Record<string, TestResult> }>("/panel/providers/results");
-      for (const k of Object.keys(r.items || {})) {
-        results[k] = r.items[k];
-      }
-      saveResults();
-    } catch (e) {
-      console.warn("拉取最新结果失败", e);
-    }
+    const [_, prefs] = await Promise.all([
+      loadProviders(),
+      loadPreferences().then((p) => {
+        for (const [k, v] of Object.entries(p)) {
+          enabled[k] = v;
+        }
+        return p;
+      }),
+    ]);
   } catch (e) {
-    console.error("加载模型列表失败", e);
+    console.error("初始化失败", e);
   }
+  await loadResults();
 });
 </script>
 
@@ -554,7 +604,6 @@ onMounted(async () => {
   gap: 12px;
 }
 .toolbar-card {
-  /* 顶部工具栏 sticky 在主区视口顶部，不随滚动消失 */
   position: sticky;
   top: 0;
   z-index: 10;
@@ -565,45 +614,31 @@ onMounted(async () => {
 .hint {
   font-size: 12px;
 }
-.groups {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-.group-block {
-  display: flex;
-  flex-direction: column;
-}
-.group-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 4px 2px 8px;
-}
-.group-name {
-  font-weight: 700;
-  font-size: 14px;
-  color: var(--accent-2);
-}
-/* 弹窗尺寸控制：详见 CompanionReplaceView 中的说明。
-   三层级覆盖（scroll-content / n-modal / n-card）+ n-card__content 加
-   min-height:0 + overflow-y:auto，让 modal 自适应内容高度且上限为 viewport-64px。 */
-.detect-view :deep(.n-modal-scroll-content) {
+</style>
+
+<style>
+/* 全局覆盖：弹窗尺寸控制（不分 view）。
+   n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
+   会让 modal 在内容较少时也撑满 viewport（关闭按钮被推到顶部之外）。
+   这里覆盖 .n-modal / .n-card / .n-card__content 三个层级，
+   让 modal 自适应内容高度且上限为 viewport - 64px，
+   内容区溢出滚动，关闭按钮始终可见。 */
+.n-modal-scroll-content {
   min-height: auto !important;
 }
-.detect-view :deep(.n-modal) {
+.n-modal {
   max-height: calc(100vh - 64px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
-.detect-view :deep(.n-card) {
+.n-modal .n-card {
   max-height: calc(100vh - 64px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
-.detect-view :deep(.n-card__content) {
+.n-modal .n-card__content {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
