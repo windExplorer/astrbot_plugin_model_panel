@@ -7,7 +7,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
+# $PSScriptRoot can be empty under some hosts; fall back gracefully.
+if ($PSScriptRoot) {
+    $root = $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $root = (Get-Location).Path
+}
 $webui = Join-Path $root "webui-src"
 
 if (-not $SkipBumpVersion) {
