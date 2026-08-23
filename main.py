@@ -208,8 +208,11 @@ def _flat_set(cfg: Any, key: str, value: Any) -> None:
 
 @register("astrbot_plugin_model_panel", "local", "模型管理与检测面板", "0.1.0")
 class ModelPanelPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: Optional[Any] = None):
         super().__init__(context)
+        # AstrBot 注入的插件配置（AstrBotConfig，dict 子类，含 save_config()）。
+        # 必须保存为 self.config，否则 api_set_config 等写入接口拿不到配置对象。
+        self.config: Optional[Any] = config
         self.storage: Optional[Storage] = None
         self.sessions = SessionManager()
         # 全局并发去重：同时只允许一个一键检测任务在跑
