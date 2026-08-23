@@ -23,3 +23,6 @@ _References/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Reasonix agent scratch
+.reasonix/

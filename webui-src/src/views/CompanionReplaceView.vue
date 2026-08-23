@@ -1,49 +1,92 @@
 <template>
-  <div>
-    <div class="card">
-      <div class="card-title">陪伴插件精准模型配置</div>
-      <div v-if="!loaded" class="muted">
-        {{ loaded === null ? "加载中…" : "未找到陪伴插件（astrbot_plugin_private_companion），请确认已安装并启用。" }}
-      </div>
+  <div class="companion-view">
+    <n-card :title="t('companion.title')" size="small">
+      <n-text v-if="loaded === false" depth="3">{{ t("companion.notLoaded") }}</n-text>
       <template v-else>
-        <div class="toolbar">
-          <button class="btn btn-primary" :disabled="saving" @click="save">
-            {{ saving ? "保存中…" : "保存替换" }}
-          </button>
-          <span class="muted">已使用模型 {{ usedModels.length }} 个（未选择替换的保持原样）</span>
-        </div>
+        <n-space align="center" wrap class="toolbar">
+          <n-button type="primary" :loading="saving" @click="save">
+            {{ saving ? t("companion.btnSaving") : t("companion.btnSave") }}
+          </n-button>
+          <n-text v-if="configMode" depth="3">
+            {{ t("companion.configMode", { mode: configMode || t("companion.configModeNone") }) }}
+          </n-text>
+          <n-text depth="3">
+            {{ t("companion.configuredCount", { n: configuredCount, total: totalKeys }) }}
+          </n-text>
+          <n-text v-if="unconfiguredCount > 0" type="warning">
+            {{ t("companion.unconfiguredHint", { n: unconfiguredCount }) }}
+          </n-text>
+        </n-space>
 
-        <div v-if="!usedModels.length" class="muted empty">陪伴插件精准配置中没有已配置的模型。</div>
+        <n-empty
+          v-if="!usedModels.length"
+          :description="t('companion.usedModelsEmpty')"
+          class="empty"
+        />
 
-        <div v-else class="list">
-          <div v-for="item in usedModels" :key="item.value" class="row">
-            <div class="row-old">
-              <div class="old-name" :title="item.value">{{ item.value }}</div>
-              <div class="old-sub">{{ item.labels.join("、") }}</div>
-            </div>
-            <div class="row-arrow">→</div>
-            <div class="row-new">
-              <select v-model="replacements[item.value]" class="select">
-                <option value="">（不替换）</option>
-                <option v-for="opt in availableOptions(item.value)" :key="opt" :value="opt">{{ opt }}</option>
-              </select>
-            </div>
-          </div>
-        </div>
+        <n-data-table
+          v-else
+          :columns="columns"
+          :data="usedModels"
+          :pagination="false"
+          size="small"
+          :bordered="false"
+          :single-line="false"
+        />
+
+        <n-collapse v-if="unconfiguredItems.length" class="mt-3">
+          <n-collapse-item :title="t('companion.sectionUnconfigured', { n: unconfiguredItems.length })" name="unconfigured">
+            <n-data-table
+              :columns="unconfiguredColumns"
+              :data="unconfiguredItems"
+              :pagination="false"
+              size="small"
+              :bordered="false"
+            />
+          </n-collapse-item>
+        </n-collapse>
       </template>
-    </div>
+    </n-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
-import { apiGet, apiPost, CompanionProviderItem } from "../api";
+import { computed, h, onMounted, reactive, ref } from "vue";
+import { useI18n } from "vue-i18n";
+import {
+  NButton,
+  NCard,
+  NCollapse,
+  NCollapseItem,
+  NDataTable,
+  NEmpty,
+  NSelect,
+  NSpace,
+  NTag,
+  NText,
+  NTooltip,
+  useMessage,
+  type DataTableColumn,
+} from "naive-ui";
+
+import {
+  apiGet,
+  apiPost,
+  type CompanionProviderItem,
+  type CompanionProvidersResponse,
+} from "../api";
+
+const { t } = useI18n();
+const message = useMessage();
 
 const loaded = ref<boolean | null>(null);
 const items = ref<CompanionProviderItem[]>([]);
 const providers = ref<string[]>([]);
 const replacements = reactive<Record<string, string>>({});
 const saving = ref(false);
+const configMode = ref("");
+const configuredCount = ref(0);
+const totalKeys = ref(0);
 
 const usedModels = computed(() => {
   const map = new Map<string, string[]>();
@@ -55,10 +98,18 @@ const usedModels = computed(() => {
   return [...map.entries()].map(([value, labels]) => ({ value, labels }));
 });
 
-function availableOptions(value: string): string[] {
-  const opts = [...providers.value];
-  if (value && !opts.includes(value)) opts.unshift(value);
-  return opts;
+const unconfiguredItems = computed(() =>
+  items.value.filter((it) => !it.configured).map((it) => ({ key: it.key })),
+);
+
+const unconfiguredCount = computed(() => unconfiguredItems.value.length);
+
+function availableOptions(value: string): { label: string; value: string }[] {
+  const opts: { label: string; value: string }[] = providers.value.map((p) => ({ label: p, value: p }));
+  if (value && !providers.value.includes(value)) {
+    opts.unshift({ label: value, value });
+  }
+  return [{ label: t("companion.selectNone"), value: "" }, ...opts];
 }
 
 async function save() {
@@ -69,22 +120,23 @@ async function save() {
     }
   }
   if (!replacementsList.length) {
-    alert("没有需要替换的模型。");
+    message.warning(t("companion.saveEmpty"));
     return;
   }
   saving.value = true;
   try {
-    const res = await apiPost<{ ok: boolean; changed_count: number; error?: string }>("/panel/companion/replace", {
-      replacements: replacementsList,
-    });
+    const res = await apiPost<{ ok: boolean; changed_count: number; error?: string }>(
+      "/panel/companion/replace",
+      { replacements: replacementsList },
+    );
     if (res.ok) {
-      alert(`替换成功，共 ${res.changed_count} 处。`);
+      message.success(t("companion.saveSuccess", { n: res.changed_count }));
       await reload();
     } else {
-      alert(`替换失败：${res.error || "未知错误"}`);
+      message.error(t("companion.saveFail", { msg: res.error || "" }));
     }
-  } catch (e) {
-    alert("替换失败：" + String((e as Error).message || e));
+  } catch (e: any) {
+    message.error(t("companion.saveFail", { msg: e?.message || String(e) }));
   } finally {
     saving.value = false;
   }
@@ -92,14 +144,66 @@ async function save() {
 
 async function reload() {
   try {
-    const data = await apiGet<{ loaded: boolean; items: CompanionProviderItem[] }>("/panel/companion/providers");
+    const data = await apiGet<CompanionProvidersResponse>("/panel/companion/providers");
     loaded.value = data.loaded;
     items.value = data.items || [];
+    configMode.value = data.config_mode || "";
+    configuredCount.value = data.configured_count || 0;
+    totalKeys.value = data.total_keys || 0;
   } catch (e) {
     loaded.value = false;
     console.error("加载陪伴插件配置失败", e);
   }
 }
+
+const columns = computed<DataTableColumn<{ value: string; labels: string[] }>[]>(() => [
+  {
+    title: t("common.default"),
+    key: "value",
+    render(row) {
+      return h("div", { class: "old-cell" }, [
+        h("div", { class: "old-name", title: row.value }, row.value),
+        h(NTooltip, null, {
+          trigger: () =>
+            h("div", { class: "old-sub" }, [
+              h(NTag, { size: "tiny", type: "info", round: true }, () =>
+                t("companion.labelsTitle") + ": " + row.labels.length,
+              ),
+            ]),
+          default: () => row.labels.join("、") || t("companion.noLabels"),
+        }),
+      ]);
+    },
+  },
+  {
+    title: "→",
+    key: "arrow",
+    width: 32,
+    render: () => h("span", { class: "arrow" }, "→"),
+  },
+  {
+    title: t("common.save"),
+    key: "new",
+    render(row) {
+      return h(NSelect, {
+        value: replacements[row.value] ?? "",
+        options: availableOptions(row.value),
+        size: "small",
+        onUpdateValue: (v: string) => {
+          replacements[row.value] = v;
+        },
+      });
+    },
+  },
+]);
+
+const unconfiguredColumns = computed<DataTableColumn<{ key: string }>[]>(() => [
+  {
+    title: "Key",
+    key: "key",
+    render: (row) => h("code", { class: "key-cell" }, row.key),
+  },
+]);
 
 onMounted(async () => {
   await reload();
@@ -113,56 +217,43 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.toolbar {
+.companion-view {
   display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 14px;
-  flex-wrap: wrap;
+  flex-direction: column;
 }
-.list {
-  display: grid;
-  gap: 8px;
+.toolbar {
+  margin-bottom: 12px;
 }
-.row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel-2);
+.empty {
+  padding: 20px 0;
 }
-.row-old {
-  min-width: 0;
+.old-cell {
+  display: flex;
+  flex-direction: column;
 }
 .old-name {
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  max-width: 320px;
 }
 .old-sub {
   color: var(--muted);
   font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  margin-top: 2px;
 }
-.row-arrow {
+.arrow {
   color: var(--muted);
 }
-.select {
-  width: 100%;
-  height: 34px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #fff;
-  color: #1c2533;
+.key-cell {
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 12px;
+  background: var(--panel-2);
+  padding: 2px 6px;
+  border-radius: 4px;
 }
-.empty {
-  padding: 20px 0;
+.mt-3 {
+  margin-top: 12px;
 }
 </style>

@@ -1,19 +1,25 @@
 import { createApp } from "vue";
 import { createRouter, createWebHashHistory } from "vue-router";
+
 import App from "./App.vue";
 import DashboardView from "./views/DashboardView.vue";
 import DetectView from "./views/DetectView.vue";
 import DefaultModelView from "./views/DefaultModelView.vue";
 import CompanionReplaceView from "./views/CompanionReplaceView.vue";
 
+import { i18n } from "./i18n";
+
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: "/", name: "dashboard", component: DashboardView, meta: { title: "控制台" } },
-    { path: "/detect", name: "detect", component: DetectView, meta: { title: "模型检测排序" } },
-    { path: "/default", name: "default", component: DefaultModelView, meta: { title: "默认模型" } },
-    { path: "/companion", name: "companion", component: CompanionReplaceView, meta: { title: "伴侣插件替换" } },
+    { path: "/", name: "dashboard", component: DashboardView, meta: { titleKey: "nav.dashboard" } },
+    { path: "/detect", name: "detect", component: DetectView, meta: { titleKey: "nav.detect" } },
+    { path: "/default", name: "default", component: DefaultModelView, meta: { titleKey: "nav.defaultModel" } },
+    { path: "/companion", name: "companion", component: CompanionReplaceView, meta: { titleKey: "nav.companion" } },
   ],
 });
 
-createApp(App).use(router).mount("#app");
+const app = createApp(App);
+app.use(router);
+app.use(i18n);
+app.mount("#app");

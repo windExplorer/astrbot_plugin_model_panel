@@ -1,18 +1,23 @@
 <template>
-  <div>
-    <div class="card">
-      <div class="card-title">AstrBot 当前默认模型</div>
+  <div class="default-view">
+    <n-card :title="t('defaultModel.title')" size="small">
       <div v-if="defaultId" class="value">{{ defaultId }}</div>
-      <div v-else class="muted">未设置默认模型</div>
-      <p class="muted note">当前为只读展示。切换默认模型的写入能力将在后续版本提供。</p>
-    </div>
+      <n-text v-else depth="3">{{ t("defaultModel.notSet") }}</n-text>
+      <p class="note">
+        <n-text depth="3">{{ t("defaultModel.note") }}</n-text>
+      </p>
+    </n-card>
   </div>
 </template>
 
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import { useI18n } from "vue-i18n";
+import { NCard, NText } from "naive-ui";
+
 import { apiGet } from "../api";
 
+const { t } = useI18n();
 const defaultId = ref("");
 
 onMounted(async () => {

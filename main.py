@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
-from quart import request
+from quart import Response, request
+
+from storage import Storage
+from session_manager import SessionManager
 
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 
@@ -15,6 +21,9 @@ COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 # 前端 bridge 写相对路径，由 Dashboard 自动转发。
 PLUGIN_NAME = "astrbot_plugin_model_panel"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}"
+
+# 默认数据库路径：AstrBot 插件数据目录 / model_panel.db
+DEFAULT_DB_PATH = os.path.join("data", "model_panel.db")
 
 # 伴侣插件精准模型配置的 provider 字段（与伴侣插件 _allowed_provider_keys 一致）
 COMPANION_PROVIDER_KEYS = [
@@ -56,15 +65,89 @@ COMPANION_PROVIDER_KEYS = [
     "EMOTION_JUDGEMENT_PROVIDER_ID",
 ]
 
+# 错误归一化规则：按关键字匹配出 error_code，避免把接口返回的整段堆栈塞到前端
+_ERROR_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("timeout", re.compile(r"timeout|timed?\s*out|超时", re.I)),
+    ("refused", re.compile(r"connection\s*refused", re.I)),
+    ("connect", re.compile(r"connection\s*(reset|aborted)|could\s*not\s*connect|connect\s*timeout|网络|unreachable|NameResolutionError", re.I)),
+    ("auth", re.compile(r"unauthorized|invalid\s*api\s*key|invalid\s*token|forbidden|401|403|auth", re.I)),
+    ("rate_limit", re.compile(r"rate\s*limit|too\s*many\s*requests|429|quota", re.I)),
+    ("not_found", re.compile(r"model\s*not\s*found|404|not\s*found", re.I)),
+    ("server", re.compile(r"internal\s*server|502|503|504|bad\s*gateway|service\s*unavailable", re.I)),
+]
+
+# 错误短消息最长字符数（防止 200 字符堆栈塞满前端）
+ERROR_MESSAGE_MAX = 80
+
+
+def _normalize_error(exc: BaseException | str) -> tuple[str, str]:
+    """把异常归一化为 (error_code, error_message)。"""
+    raw = str(exc or "")
+    for code, pattern in _ERROR_RULES:
+        if pattern.search(raw):
+            return code, raw[:ERROR_MESSAGE_MAX]
+    return "unknown", raw[:ERROR_MESSAGE_MAX]
+
 
 @register("astrbot_plugin_model_panel", "local", "模型管理与检测面板", "0.1.0")
 class ModelPanelPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        self.storage: Optional[Storage] = None
+        self.sessions = SessionManager()
+        # 全局并发去重：同时只允许一个一键检测任务在跑
+        self._test_all_lock = asyncio.Lock()
 
     async def initialize(self):
+        # 数据库路径：优先用 AstrBot 提供的数据目录，回退到相对路径
+        db_path = DEFAULT_DB_PATH
+        try:
+            base = getattr(self.context, "data_dir", None) or getattr(self.context, "_data_dir", None)
+            if base:
+                db_path = os.path.join(str(base), "model_panel.db")
+        except Exception:
+            pass
+        self.storage = Storage(db_path)
+        await self.storage.init()
+        # 历史清理一次
+        try:
+            retention = self._test_config().get("history_retention_days") or 30
+            deleted = await self.storage.cleanup_older_than(int(retention))
+            if deleted:
+                logger.info(f"[ModelPanel] 清理历史会话 {deleted} 条（> {retention} 天）")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 清理历史失败: {e}")
         self._register_routes()
-        logger.info("[ModelPanel] 模型控制台插件已初始化")
+        logger.info(f"[ModelPanel] 模型控制台插件已初始化（db={db_path}）")
+
+    # ---------------- 配置读取 ----------------
+    def _test_config(self) -> dict[str, Any]:
+        """从插件 config 读取检测参数；字段不存在则用默认值。"""
+        defaults = {
+            "test_timeout": 45,
+            "test_retry_count": 1,
+            "test_retry_backoff": 2.0,
+            "history_retention_days": 30,
+        }
+        try:
+            cfg = getattr(self, "config", None)
+            if cfg is not None and hasattr(cfg, "get"):
+                for k in defaults:
+                    v = cfg.get(k)
+                    if v is None:
+                        continue
+                    if k == "test_retry_backoff":
+                        defaults[k] = float(v)
+                    elif k == "history_retention_days":
+                        defaults[k] = max(0, int(v))
+                    else:
+                        defaults[k] = int(v)
+        except Exception:
+            pass
+        defaults["test_timeout"] = max(1, int(defaults["test_timeout"]))
+        defaults["test_retry_count"] = max(0, int(defaults["test_retry_count"]))
+        defaults["test_retry_backoff"] = max(0.0, float(defaults["test_retry_backoff"]))
+        return defaults
 
     # ---------------- 路由注册 ----------------
     def _register_routes(self) -> None:
@@ -73,6 +156,10 @@ class ModelPanelPlugin(Star):
             ("/panel/providers", self.api_list_providers, ["GET"]),
             ("/panel/providers/test", self.api_test_provider, ["POST"]),
             ("/panel/providers/test_all", self.api_test_all_providers, ["POST"]),
+            ("/panel/providers/test_all_stream", self.api_test_all_stream, ["POST"]),
+            ("/panel/providers/session/<int:session_id>", self.api_session_state, ["GET"]),
+            ("/panel/providers/results", self.api_test_results, ["GET"]),
+            ("/panel/providers/history", self.api_test_history, ["GET"]),
             ("/panel/default_model", self.api_default_model, ["GET"]),
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
@@ -100,8 +187,6 @@ class ModelPanelPlugin(Star):
         cfg = cfg if isinstance(cfg, dict) else {}
         pid = str(cfg.get("id") or "")
         ptype = str(cfg.get("type") or cfg.get("provider_type") or "")
-        # 供应商名 = 提供商源唯一 ID（provider_source_id），其次 name/provider。
-        # 绝不能退回用 type（openai_chat_completion 这类）当供应商名。
         name = str(
             cfg.get("provider_source_id")
             or cfg.get("name")
@@ -130,7 +215,6 @@ class ModelPanelPlugin(Star):
         }
 
     def _companion_star(self) -> Any:
-        # 用 get_all_stars 遍历，按插件目录名/name 匹配，比 get_registered_star 更稳
         try:
             stars = self.context.get_all_stars()
             logger.debug(f"[ModelPanel] get_all_stars 数量: {len(stars)}")
@@ -140,7 +224,6 @@ class ModelPanelPlugin(Star):
                 if name == COMPANION_PLUGIN_NAME or root == COMPANION_PLUGIN_NAME:
                     logger.debug(f"[ModelPanel] 已找到陪伴插件: name={name} root={root}")
                     return star
-            # 找不到时记录全部插件名，便于排查
             all_names = [
                 f"{getattr(s, 'root_dir_name', '?')}({getattr(s, 'name', '?')})"
                 for s in stars
@@ -185,12 +268,22 @@ class ModelPanelPlugin(Star):
         providers = self._chat_providers()
         ids = {p["id"] for p in (self._provider_display(p) for p in providers)}
         default_id = self._default_provider_id()
+        stats: dict = {}
+        latest_results: dict = {}
+        try:
+            if self.storage:
+                stats = await self.storage.session_stats()
+                latest_results = await self.storage.latest_per_provider()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] overview 统计失败: {e}")
         return {
             "total": len(providers),
             "default_provider_id": default_id,
             "default_set": bool(default_id and default_id in ids),
             "companion_loaded": self._companion_star() is not None,
             "companion_provider_count": sum(1 for v in self._companion_provider_values().values() if v),
+            "history": stats,
+            "latest_results": latest_results,
         }
 
     async def api_list_providers(self) -> dict:
@@ -210,30 +303,254 @@ class ModelPanelPlugin(Star):
     async def api_test_provider(self) -> dict:
         payload = await self._json_payload()
         provider_id = str(payload.get("id") or "").strip()
-        timeout = float(payload.get("timeout") or 45)
+        cfg = self._test_config()
+        timeout = float(payload.get("timeout") or cfg["test_timeout"])
         for p in self._chat_providers():
             d = self._provider_display(p)
             if d["id"] == provider_id:
-                result = await self._test_one(p, timeout)
-                result.update({"id": provider_id, "name": d["name"], "model": d["model"]})
+                result = await self._test_one(p, timeout, cfg)
+                result.update({
+                    "id": provider_id,
+                    "name": d["name"],
+                    "model": d["model"],
+                    "checked_at": int(time.time()),
+                })
+                try:
+                    if self.storage:
+                        session = await self.storage.create_session("single", 1)
+                        await self.storage.insert_result(session["id"], result)
+                        await self.storage.finish_session(
+                            session["id"],
+                            ok_count=1 if result.get("ok") else 0,
+                            fail_count=0 if result.get("ok") else 1,
+                            skip_count=0,
+                        )
+                except Exception as e:
+                    logger.warning(f"[ModelPanel] 写历史失败: {e}")
                 return result
-        return {"id": provider_id, "ok": False, "error": "provider not found", "latency_ms": None}
+        return {
+            "id": provider_id,
+            "name": "",
+            "model": "",
+            "ok": False,
+            "latency_ms": None,
+            "error_code": "not_found",
+            "error": "provider not found",
+            "retry_count": 0,
+        }
 
     async def api_test_all_providers(self) -> dict:
+        """同步版本：一次性跑完所有模型再返回。兼容老前端。"""
+        if self.sessions.is_busy():
+            return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "items": []}
+        if self._test_all_lock.locked():
+            return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "items": []}
+        async with self._test_all_lock:
+            payload = await self._json_payload()
+            skip = set(payload.get("skip") or [])
+            cfg = self._test_config()
+            timeout = float(payload.get("timeout") or cfg["test_timeout"])
+            providers = self._chat_providers()
+            results: list[dict] = []
+            session_id: Optional[int] = None
+            for p in providers:
+                d = self._provider_display(p)
+                if d["id"] in skip:
+                    results.append({
+                        "id": d["id"],
+                        "name": d["name"],
+                        "model": d["model"],
+                        "skipped": True,
+                        "ok": False,
+                        "latency_ms": None,
+                        "error_code": "skipped",
+                        "error": "",
+                        "retry_count": 0,
+                        "checked_at": int(time.time()),
+                    })
+                    continue
+                r = await self._test_one(p, timeout, cfg)
+                r.update({
+                    "id": d["id"],
+                    "name": d["name"],
+                    "model": d["model"],
+                    "skipped": False,
+                    "checked_at": int(time.time()),
+                })
+                results.append(r)
+            try:
+                if self.storage:
+                    session = await self.storage.create_session("all", len(providers))
+                    session_id = session["id"]
+                    ok_n = sum(1 for x in results if x.get("ok"))
+                    fail_n = sum(1 for x in results if not x.get("ok") and not x.get("skipped"))
+                    skip_n = sum(1 for x in results if x.get("skipped"))
+                    for r in results:
+                        await self.storage.insert_result(session_id, r)
+                    await self.storage.finish_session(session_id, ok_n, fail_n, skip_n)
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 写历史失败: {e}")
+            return {"items": results, "total": len(providers), "session_id": session_id}
+
+    async def api_test_all_stream(self) -> dict:
+        """异步任务版：立即返回 session_id，由前端轮询 /session/{id} 拿进度。
+
+        为什么不用真 SSE：AstrBot 插件 Page 桥接层只支持 JSON 同步调用。
+        异步任务 + 轮询既能给前端"边跑边显示"的体验，又能稳定运行。
+        """
+        if self.sessions.is_busy():
+            return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "session_id": None}
+        if self._test_all_lock.locked():
+            return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "session_id": None}
         payload = await self._json_payload()
         skip = set(payload.get("skip") or [])
-        timeout = float(payload.get("timeout") or 45)
+        cfg = self._test_config()
+        timeout = float(payload.get("timeout") or cfg["test_timeout"])
         providers = self._chat_providers()
-        results = []
-        for p in providers:
-            d = self._provider_display(p)
-            if d["id"] in skip:
-                results.append({"id": d["id"], "name": d["name"], "model": d["model"], "skipped": True})
-                continue
-            r = await self._test_one(p, timeout)
-            r.update({"id": d["id"], "name": d["name"], "model": d["model"], "skipped": False})
-            results.append(r)
-        return {"items": results, "total": len(providers)}
+        # 创建持久会话记录（同时返回 id 给前端轮询）
+        session_db_id: Optional[int] = None
+        if self.storage:
+            try:
+                s = await self.storage.create_session("stream", len(providers))
+                session_db_id = s["id"]
+            except Exception as e:
+                logger.warning(f"[ModelPanel] stream 创建 session 失败: {e}")
+        if session_db_id is None:
+            # storage 不可用时给个虚拟 id，session_manager 不依赖 SQLite
+            session_db_id = int(time.time() * 1000) % 1_000_000_000
+        await self.sessions.create(session_db_id, len(providers))
+        # 在后台启动任务跑检测；不 await 以便立即返回
+        asyncio.create_task(
+            self._run_stream(session_db_id, providers, skip, timeout, cfg)
+        )
+        return {"ok": True, "session_id": session_db_id, "total": len(providers)}
+
+    async def _run_stream(
+        self,
+        session_db_id: int,
+        providers: list[Any],
+        skip: set[str],
+        timeout: float,
+        cfg: dict,
+    ) -> None:
+        async with self._test_all_lock:
+            ok_n = fail_n = skip_n = 0
+            try:
+                for p in providers:
+                    d = self._provider_display(p)
+                    item: dict
+                    if d["id"] in skip:
+                        item = {
+                            "id": d["id"],
+                            "name": d["name"],
+                            "model": d["model"],
+                            "ok": False,
+                            "latency_ms": None,
+                            "error_code": "skipped",
+                            "error": "",
+                            "retry_count": 0,
+                            "skipped": True,
+                            "checked_at": int(time.time()),
+                        }
+                        skip_n += 1
+                    else:
+                        r = await self._test_one(p, timeout, cfg)
+                        item = {
+                            "id": d["id"],
+                            "name": d["name"],
+                            "model": d["model"],
+                            "ok": r["ok"],
+                            "latency_ms": r["latency_ms"],
+                            "error_code": r.get("error_code") or "",
+                            "error": r.get("error") or "",
+                            "retry_count": r.get("retry_count") or 0,
+                            "skipped": False,
+                            "checked_at": int(time.time()),
+                        }
+                        if item["ok"]:
+                            ok_n += 1
+                        else:
+                            fail_n += 1
+                    # 推进内存 session（前端轮询可见）
+                    self.sessions.append_item(session_db_id, item)
+                    # 写 SQLite 历史
+                    if self.storage:
+                        try:
+                            await self.storage.insert_result(session_db_id, item)
+                        except Exception as e:
+                            logger.warning(f"[ModelPanel] stream 写历史失败: {e}")
+                if self.storage:
+                    try:
+                        await self.storage.finish_session(session_db_id, ok_n, fail_n, skip_n)
+                    except Exception as e:
+                        logger.warning(f"[ModelPanel] stream finish_session 失败: {e}")
+                self.sessions.finish(session_db_id, error=None)
+                logger.info(
+                    f"[ModelPanel] 一键检测完成 session={session_db_id} "
+                    f"ok={ok_n} fail={fail_n} skip={skip_n}"
+                )
+            except Exception as e:
+                logger.error(f"[ModelPanel] 一键检测异常: {e}", exc_info=True)
+                self.sessions.finish(session_db_id, error=str(e)[:200])
+
+    async def api_session_state(self, session_id: int) -> dict:
+        st = self.sessions.get(session_id)
+        if st is None:
+            return {"error": "session not found", "session_id": session_id}
+        return st.snapshot()
+
+    async def api_test_results(self) -> dict:
+        """每个 provider 的最新一次检测结果。"""
+        try:
+            if not self.storage:
+                return {"items": {}}
+            items = await self.storage.latest_per_provider()
+            return {"items": items}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/providers/results 失败: {e}")
+            return {"items": {}, "error": str(e)}
+
+    async def api_test_history(self) -> dict:
+        """最近若干条历史记录，按时间倒序。"""
+        try:
+            if not self.storage:
+                return {"items": [], "stats": {}}
+            limit = 50
+            try:
+                limit_raw = request.args.get("limit")
+                if limit_raw:
+                    limit = max(1, min(500, int(limit_raw)))
+            except Exception:
+                pass
+            import aiosqlite
+            async with aiosqlite.connect(self.storage.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    """SELECT * FROM model_test_results ORDER BY checked_at DESC, id DESC LIMIT ?""",
+                    (limit,),
+                )
+                rows = await cur.fetchall()
+            items = [
+                {
+                    "id": r["provider_id"],
+                    "name": r["provider_name"] or "",
+                    "model": r["provider_model"] or "",
+                    "ok": bool(r["ok"]),
+                    "latency_ms": r["latency_ms"],
+                    "error_code": r["error_code"] or "",
+                    "error": r["error_message"] or "",
+                    "retry_count": int(r["retry_count"] or 0),
+                    "checked_at": int(r["checked_at"] or 0),
+                    "session_id": int(r["session_id"] or 0),
+                }
+                for r in rows
+            ]
+            stats = await self.storage.session_stats()
+            latest_session = await self.storage.latest_session()
+            return {"items": items, "stats": stats, "latest_session": latest_session}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/providers/history 失败: {e}")
+            return {"items": [], "stats": {}, "error": str(e)}
 
     async def api_default_model(self) -> dict:
         return {"default_provider_id": self._default_provider_id()}
@@ -242,17 +559,41 @@ class ModelPanelPlugin(Star):
         cfg = self._companion_config()
         if cfg is None:
             logger.warning("[ModelPanel] /panel/companion/providers: 未找到陪伴插件配置")
-            return {"loaded": False, "items": []}
+            return {
+                "loaded": False,
+                "items": [],
+                "config_mode": "",
+                "configured_count": 0,
+                "total_keys": len(COMPANION_PROVIDER_KEYS),
+            }
         values = self._companion_provider_values()
         items = []
+        configured = 0
         for key, value in values.items():
-            items.append({"key": key, "value": value})
-        configured = sum(1 for v in values.values() if v)
+            is_configured = bool(value)
+            if is_configured:
+                configured += 1
+            items.append({
+                "key": key,
+                "value": value,
+                "configured": is_configured,
+            })
+        config_mode = ""
+        try:
+            config_mode = str(cfg.get("provider_config_mode") or "")
+        except Exception:
+            config_mode = ""
         logger.info(
             f"[ModelPanel] /panel/companion/providers: 共 {len(items)} 项, "
-            f"已配置 {configured} 项, 模式={cfg.get('provider_config_mode') or '无'}"
+            f"已配置 {configured} 项, 模式={config_mode or '无'}"
         )
-        return {"loaded": True, "items": items, "config_mode": str(cfg.get("provider_config_mode") or "")}
+        return {
+            "loaded": True,
+            "items": items,
+            "config_mode": config_mode,
+            "configured_count": configured,
+            "total_keys": len(COMPANION_PROVIDER_KEYS),
+        }
 
     async def api_companion_replace(self) -> dict:
         payload = await self._json_payload()
@@ -290,16 +631,55 @@ class ModelPanelPlugin(Star):
         except Exception:
             return {}
 
-    async def _test_one(self, provider: Any, timeout: float) -> dict:
-        start = time.monotonic()
-        try:
-            await asyncio.wait_for(provider.test(timeout=timeout), timeout=timeout + 5)
-            latency_ms = round((time.monotonic() - start) * 1000, 1)
-            return {"ok": True, "latency_ms": latency_ms, "error": None}
-        except asyncio.TimeoutError:
-            return {"ok": False, "latency_ms": None, "error": "timeout"}
-        except Exception as e:
-            return {"ok": False, "latency_ms": None, "error": str(e)[:200]}
+    async def _test_one(self, provider: Any, timeout: float, cfg: dict) -> dict:
+        """检测单个模型，支持重试 + 错误归一化。
+
+        返回：
+        {
+          ok: bool,
+          latency_ms: float | None,
+          error_code: str,
+          error: str,
+          retry_count: int,
+        }
+        """
+        retry_count = max(0, int(cfg.get("test_retry_count") or 0))
+        backoff = max(0.0, float(cfg.get("test_retry_backoff") or 0.0))
+        attempts = retry_count + 1  # 至少一次
+        last_err_code = "unknown"
+        last_err_msg = ""
+        for i in range(attempts):
+            start = time.monotonic()
+            try:
+                await asyncio.wait_for(provider.test(timeout=timeout), timeout=timeout + 5)
+                latency_ms = round((time.monotonic() - start) * 1000, 1)
+                return {
+                    "ok": True,
+                    "latency_ms": latency_ms,
+                    "error_code": "",
+                    "error": "",
+                    "retry_count": i,
+                }
+            except asyncio.TimeoutError as e:
+                last_err_code, last_err_msg = _normalize_error("timeout")
+            except Exception as e:
+                last_err_code, last_err_msg = _normalize_error(e)
+            if i < attempts - 1 and backoff > 0:
+                try:
+                    await asyncio.sleep(backoff * (i + 1))
+                except Exception:
+                    pass
+        return {
+            "ok": False,
+            "latency_ms": None,
+            "error_code": last_err_code,
+            "error": last_err_msg,
+            "retry_count": max(0, attempts - 1),
+        }
 
     async def terminate(self):
-        pass
+        try:
+            if self.storage:
+                await self.storage.close()
+        except Exception:
+            pass

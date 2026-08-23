@@ -40,9 +40,6 @@ async function getPageBridge(timeoutMs = 2500): Promise<Bridge> {
 function endpointForStyle(style: string, routePath: string): string {
   const clean = routePath.replace(/^\/+/, "");
   switch (style) {
-    // AstrBot 插件页面 API：前端写相对路径（不带插件名、不带 /page），
-    // 由 Dashboard 自动转发到 /api/v1/plugins/extensions/<plugin_name>/<endpoint>。
-    // 兜底再尝试带插件名前缀的完整路径。
     case "bare": return clean;
     case "slash": return "/" + clean;
     case "full": return PAGE_PLUGIN_NAME + "/" + clean;
@@ -176,13 +173,35 @@ export interface TestResult {
   model: string;
   ok: boolean;
   latency_ms: number | null;
+  /** 归一化错误码：timeout/connect/refused/auth/rate_limit/not_found/server/unknown/skipped */
+  error_code?: string;
+  /** 短错误文本（≤80 字符），前端不要直接把堆栈展示给用户 */
   error: string | null;
+  /** 实际重试次数，0 表示一次就过 */
+  retry_count?: number;
+  /** 检测时间戳（秒） */
+  checked_at?: number;
   skipped?: boolean;
 }
 
 export interface CompanionProviderItem {
   key: string;
   value: string;
+  configured?: boolean;
+}
+
+export interface OverviewHistory {
+  sessions_total: number;
+  results_total: number;
+  results_ok: number;
+  results_fail: number;
+  latest_session?: {
+    ok_count: number;
+    fail_count: number;
+    skip_count: number;
+    total: number;
+    alive_rate: number;
+  } | null;
 }
 
 export interface Overview {
@@ -191,4 +210,122 @@ export interface Overview {
   default_set: boolean;
   companion_loaded: boolean;
   companion_provider_count: number;
+  history?: OverviewHistory;
+  latest_results?: Record<string, TestResult>;
+}
+
+export interface CompanionProvidersResponse {
+  loaded: boolean;
+  items: CompanionProviderItem[];
+  config_mode?: string;
+  configured_count?: number;
+  total_keys?: number;
+}
+
+export interface TestAllStreamItemEvent {
+  type: "item";
+  index: number;
+  total: number;
+  item: TestResult;
+}
+
+export interface TestAllStreamStartEvent {
+  type: "start";
+  session_id: number | null;
+  total: number;
+  ts: number;
+}
+
+export interface TestAllStreamDoneEvent {
+  type: "done";
+  session_id: number | null;
+  ok_count: number;
+  fail_count: number;
+  skip_count: number;
+  total: number;
+}
+
+export interface TestAllStreamErrorEvent {
+  type: "error";
+  message: string;
+}
+
+export type TestAllStreamEvent =
+  | TestAllStreamStartEvent
+  | TestAllStreamItemEvent
+  | TestAllStreamDoneEvent
+  | TestAllStreamErrorEvent;
+
+/**
+ * 异步一键检测：先 POST 启动任务拿到 session_id，再轮询 /session/{id} 拿进度，
+ * 每次进度有更新就把新增 item 推给 handlers.onItem()。
+ * 这种"启动 + 轮询"模式适配 AstrBot Page 桥接层只能同步 JSON 的限制，
+ * 同时能实现"边跑边显示"。
+ */
+export interface TestAllStreamHandlers {
+  onStart?: (e: TestAllStreamStartEvent) => void;
+  onItem?: (e: TestAllStreamItemEvent) => void;
+  onDone?: (e: TestAllStreamDoneEvent) => void;
+  onError?: (msg: string) => void;
+}
+
+export async function startTestAllStream(
+  body: { skip?: string[]; timeout?: number },
+  handlers: TestAllStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const { onStart, onItem, onDone, onError } = handlers;
+  try {
+    const r = await apiPost<{ ok: boolean; session_id: number | null; total: number; error?: string }>(
+      "/panel/providers/test_all_stream",
+      body,
+    );
+    if (!r.ok || r.session_id == null) {
+      onError?.(r.error || "启动检测任务失败");
+      return;
+    }
+    onStart?.({ type: "start", session_id: r.session_id, total: r.total, ts: Math.floor(Date.now() / 1000) });
+    const seen = new Set<string>();
+    const startTime = Date.now();
+    const maxWaitMs = 1000 * 60 * 10; // 最多等 10 分钟
+    while (!signal?.aborted) {
+      if (Date.now() - startTime > maxWaitMs) {
+        onError?.("检测超时未完成");
+        return;
+      }
+      const snap = await apiGet<{
+        session_id: number;
+        total: number;
+        done: boolean;
+        items: TestResult[];
+        ok_count: number;
+        fail_count: number;
+        skip_count: number;
+        error?: string | null;
+      }>(`/panel/providers/session/${r.session_id}`);
+      if (snap && Array.isArray(snap.items)) {
+        for (let i = 0; i < snap.items.length; i++) {
+          const it = snap.items[i];
+          if (seen.has(it.id + "@" + i)) continue;
+          seen.add(it.id + "@" + i);
+          onItem?.({ type: "item", index: i + 1, total: snap.total, item: it });
+        }
+      }
+      if (snap?.done) {
+        onDone?.({
+          type: "done",
+          session_id: snap.session_id,
+          ok_count: snap.ok_count || 0,
+          fail_count: snap.fail_count || 0,
+          skip_count: snap.skip_count || 0,
+          total: snap.total || 0,
+        });
+        if (snap.error) onError?.(snap.error);
+        return;
+      }
+      await new Promise((res) => setTimeout(res, 600));
+    }
+  } catch (e: any) {
+    onError?.(e?.message || String(e));
+  }
 }

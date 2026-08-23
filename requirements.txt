@@ -1,2 +1,2 @@
-# 本插件无额外第三方依赖。
-# 使用 AstrBot 内置的 astrbot.api / quart。
+# 第三方依赖
+aiosqlite>=0.19.0

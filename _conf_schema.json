@@ -4,5 +4,23 @@
     "type": "int",
     "hint": "一键检测/单独检测时，单个模型测试的超时时间。默认 45 秒。",
     "default": 45
+  },
+  "test_retry_count": {
+    "description": "检测失败后自动重试次数（0=不重试）",
+    "type": "int",
+    "hint": "当模型检测失败（超时/网络异常/鉴权错误）时自动重试的次数。建议 1~2，过高会导致总耗时变长。",
+    "default": 1
+  },
+  "test_retry_backoff": {
+    "description": "重试退避秒数",
+    "type": "float",
+    "hint": "每次重试之间的等待时间（秒），按此值线性退避（首次失败等 1×backoff，第二次等 2×backoff …）。默认 2.0。",
+    "default": 2.0
+  },
+  "history_retention_days": {
+    "description": "检测历史保留天数（0=永久保留）",
+    "type": "int",
+    "hint": "超过该天数的检测历史会自动清理，释放磁盘空间。默认 30 天。",
+    "default": 30
   }
 }

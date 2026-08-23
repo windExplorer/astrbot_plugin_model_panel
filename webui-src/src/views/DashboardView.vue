@@ -1,43 +1,84 @@
 <template>
-  <div>
-    <div class="stat-grid">
-      <div class="stat-card">
-        <div class="stat-num">{{ overview?.total ?? "–" }}</div>
-        <div class="stat-label">LLM 模型数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num" :class="overview?.default_set ? 'tag-ok' : 'tag-warn'">
-          {{ overview?.default_set ? "已设置" : "未命中" }}
-        </div>
-        <div class="stat-label">默认模型</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num" :class="overview?.companion_loaded ? 'tag-ok' : 'tag-err'">
-          {{ overview?.companion_loaded ? "已加载" : "未加载" }}
-        </div>
-        <div class="stat-label">伴侣插件</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num">{{ overview?.companion_provider_count ?? "–" }}</div>
-        <div class="stat-label">伴侣已配置模型</div>
-      </div>
-    </div>
+  <div class="dashboard">
+    <n-grid :cols="4" :x-gap="14" :y-gap="14" responsive="screen" :item-responsive="true">
+      <n-gi span="0:4 m:1">
+        <n-card size="small">
+          <div class="stat-num">{{ overview?.total ?? "–" }}</div>
+          <div class="stat-label">{{ t("dashboard.statTotal") }}</div>
+        </n-card>
+      </n-gi>
+      <n-gi span="0:4 m:1">
+        <n-card size="small">
+          <div class="stat-num" :class="overview?.default_set ? 'tag-ok' : 'tag-warn'">
+            {{ overview?.default_set ? t("dashboard.defaultSet") : t("dashboard.defaultMissed") }}
+          </div>
+          <div class="stat-label">{{ t("dashboard.statDefault") }}</div>
+        </n-card>
+      </n-gi>
+      <n-gi span="0:4 m:1">
+        <n-card size="small">
+          <div class="stat-num" :class="overview?.companion_loaded ? 'tag-ok' : 'tag-err'">
+            {{ overview?.companion_loaded ? t("dashboard.companionLoaded") : t("dashboard.companionUnloaded") }}
+          </div>
+          <div class="stat-label">{{ t("dashboard.statCompanion") }}</div>
+        </n-card>
+      </n-gi>
+      <n-gi span="0:4 m:1">
+        <n-card size="small">
+          <div class="stat-num">{{ overview?.companion_provider_count ?? "–" }}</div>
+          <div class="stat-label">{{ t("dashboard.statCompanionProviders") }}</div>
+        </n-card>
+      </n-gi>
+    </n-grid>
 
-    <div class="card">
-      <div class="card-title">当前默认模型</div>
-      <div v-if="overview && overview.default_provider_id" class="muted">
-        {{ overview.default_provider_id }}
-        <span v-if="!overview.default_set" class="tag-warn">（当前 provider 列表中未命中）</span>
-      </div>
-      <div v-else class="muted">未设置</div>
-    </div>
+    <n-card :title="t('dashboard.currentDefault')" size="small" class="mt-3">
+      <template v-if="overview && overview.default_provider_id">
+        <n-text>{{ overview.default_provider_id }}</n-text>
+        <n-tag v-if="!overview.default_set" type="warning" size="small" style="margin-left: 8px">
+          {{ t("dashboard.currentDefaultNotInList") }}
+        </n-tag>
+      </template>
+      <n-text v-else depth="3">{{ t("dashboard.notSet") }}</n-text>
+    </n-card>
+
+    <n-card :title="t('dashboard.historyTitle')" size="small" class="mt-3">
+      <template v-if="overview?.history && (overview.history.sessions_total || 0) > 0">
+        <n-space vertical>
+          <n-space align="center" wrap>
+            <n-tag :type="overview.history.latest_session && overview.history.latest_session.alive_rate >= 80 ? 'success' : 'warning'" round>
+              {{ t("dashboard.aliveRate") }} {{ overview.history.latest_session?.alive_rate ?? "–" }}%
+            </n-tag>
+            <n-text depth="3">
+              {{ t("dashboard.latestSession") }} ·
+              {{ t("dashboard.okCount") }} {{ overview.history.latest_session?.ok_count ?? 0 }} /
+              {{ t("dashboard.failCount") }} {{ overview.history.latest_session?.fail_count ?? 0 }} /
+              {{ t("dashboard.skipCount") }} {{ overview.history.latest_session?.skip_count ?? 0 }}
+            </n-text>
+          </n-space>
+          <n-text depth="3">
+            {{ t("dashboard.totalSessions") }} {{ overview.history.sessions_total }} ·
+            {{ t("dashboard.totalChecks") }} {{ overview.history.results_total }}
+            （{{ t("dashboard.okCount") }} {{ overview.history.results_ok }} /
+            {{ t("dashboard.failCount") }} {{ overview.history.results_fail }}）
+          </n-text>
+          <n-button size="small" tag="a" :href="'#/detect'" type="primary" ghost>
+            {{ t("dashboard.goDetect") }} →
+          </n-button>
+        </n-space>
+      </template>
+      <n-text v-else depth="3">{{ t("dashboard.noSession") }}</n-text>
+    </n-card>
   </div>
 </template>
 
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { apiGet, Overview } from "../api";
+import { useI18n } from "vue-i18n";
+import { NButton, NCard, NGrid, NGi, NSpace, NTag, NText } from "naive-ui";
 
+import { apiGet, type Overview } from "../api";
+
+const { t } = useI18n();
 const overview = ref<Overview | null>(null);
 
 onMounted(async () => {
@@ -50,17 +91,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 14px;
-  margin-bottom: 18px;
+.dashboard {
+  display: flex;
+  flex-direction: column;
 }
-.stat-card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px;
+.mt-3 {
+  margin-top: 12px;
 }
 .stat-num {
   font-size: 26px;

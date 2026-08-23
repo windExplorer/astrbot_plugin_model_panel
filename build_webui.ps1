@@ -1,11 +1,23 @@
 # Build Vue3 WebUI for the model-panel plugin.
-# Reads version from metadata.yaml and injects it into the frontend,
-# then runs vite build. Output goes to pages/model-panel/.
+# 默认会先调用 _bump_version.ps1 递增版本号，再注入 version.ts 并执行 vite build。
+# 输出到 pages/model-panel/。
+[CmdletBinding()]
+param(
+    [switch]$SkipBumpVersion
+)
+
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $webui = Join-Path $root "webui-src"
 
-# Inject version from metadata.yaml
+if (-not $SkipBumpVersion) {
+    $bumpScript = Join-Path $root "_bump_version.ps1"
+    if (Test-Path $bumpScript) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $bumpScript -Root $root
+    }
+}
+
+# 读版本号
 $metaPath = Join-Path $root "metadata.yaml"
 $version = "v0.1.0"
 if (Test-Path $metaPath) {
@@ -16,7 +28,7 @@ if (Test-Path $metaPath) {
 }
 Write-Host "Using version $version"
 
-# Write version.ts (gitignored, auto-generated)
+# 写 version.ts
 $versionFile = Join-Path $webui "src\version.ts"
 $versionTs = "export const PLUGIN_VERSION = `"$version`";`n"
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
@@ -30,7 +42,7 @@ if (-not (Test-Path (Join-Path $webui "node_modules"))) {
 }
 
 Push-Location $webui
-npm run build 2>&1 | Select-Object -Last 12
+npm run build 2>&1 | Select-Object -Last 20
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red
     exit 1
