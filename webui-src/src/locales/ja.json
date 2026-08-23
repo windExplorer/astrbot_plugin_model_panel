@@ -157,6 +157,7 @@
     "selectNone": "（置換しない）",
     "labelsTitle": "用途",
     "noLabels": "未使用",
+    "tooltipMore": "残り {n} 件 · クリックで詳細表示",
     "saveSuccess": "{n} 件を正常に置換しました。",
     "saveEmpty": "置換対象のモデルがありません。",
     "saveFail": "置換失敗：{msg}",

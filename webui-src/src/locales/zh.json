@@ -157,6 +157,7 @@
     "selectNone": "（不替换）",
     "labelsTitle": "使用于",
     "noLabels": "未使用",
+    "tooltipMore": "其余 {n} 个 · 点击查看",
     "saveSuccess": "替换成功，共 {n} 处。",
     "saveEmpty": "没有需要替换的模型。",
     "saveFail": "替换失败：{msg}",

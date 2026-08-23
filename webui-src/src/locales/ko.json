@@ -157,6 +157,7 @@
     "selectNone": "(교체하지 않음)",
     "labelsTitle": "용도",
     "noLabels": "미사용",
+    "tooltipMore": "외 {n}개 · 클릭하여 보기",
     "saveSuccess": "{n}개 항목을 교체했습니다.",
     "saveEmpty": "교체할 모델이 없습니다.",
     "saveFail": "교체 실패: {msg}",

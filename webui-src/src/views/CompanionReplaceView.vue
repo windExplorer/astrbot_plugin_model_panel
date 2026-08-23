@@ -66,7 +66,10 @@
       v-model:show="detailVisible"
       preset="card"
       :title="t('companion.detail.title')"
-      style="max-width: 720px"
+      style="max-width: 720px; width: calc(100vw - 48px)"
+      :style="{ maxHeight: 'calc(100vh - 64px)' }"
+      :scrollbar-props="{ trigger: 'none' }"
+      :mask-closable="true"
     >
       <template v-if="detailModel">
         <n-descriptions
@@ -269,6 +272,21 @@ const columns = computed<
     key: "value",
     minWidth: 260,
     render(row) {
+      // 悬浮 tooltip：最多展示前 TOOLTIP_PREVIEW 个 key 的中文标签，
+      // 其余折叠为"+N 个 · 点击查看"，避免超长溢出屏幕被截断。
+      const PREVIEW = 7;
+      const total = row.keys.length;
+      const previewLabels = row.keys
+        .slice(0, PREVIEW)
+        .map((k) => k.label)
+        .join("\n");
+      const rest = total - PREVIEW;
+      const tooltipBody =
+        rest > 0
+          ? previewLabels +
+            "\n" +
+            t("companion.tooltipMore", { n: rest })
+          : previewLabels || t("companion.noLabels");
       return h("div", null, [
         // 模型名：普通 NText，不再是按钮
         h("div", { style: "font-weight: 600" }, row.value),
@@ -278,6 +296,8 @@ const columns = computed<
           {
             delay: 200,
             placement: "top-start",
+            // 控制 tooltip 内容换行与最大宽度，避免屏幕边缘被截断
+            style: "max-width: 360px; white-space: pre-line; word-break: break-all",
           },
           {
             trigger: () =>
@@ -293,7 +313,7 @@ const columns = computed<
                 },
                 () => `${t("companion.labelsTitle")}: ${row.labels.length}`,
               ),
-            default: () => row.keys.map((k) => k.label).join("、") || t("companion.noLabels"),
+            default: () => tooltipBody,
           },
         ),
       ]);
@@ -382,5 +402,24 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 6px;
+}
+/* 弹窗尺寸控制：n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
+   会让 modal 在内容较少时也撑满 viewport。这里覆盖为 auto，让 modal 自适应
+   内容 + 我们设的 maxHeight（calc(100vh - 64px)）。 */
+.companion-view :deep(.n-modal-scroll-content) {
+  min-height: auto !important;
+}
+.companion-view :deep(.n-modal) {
+  max-height: calc(100vh - 64px);
+}
+.companion-view :deep(.n-modal .n-card) {
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+}
+.companion-view :deep(.n-modal .n-card__content) {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 </style>

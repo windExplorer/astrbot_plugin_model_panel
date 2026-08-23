@@ -585,4 +585,21 @@ onMounted(async () => {
   font-size: 14px;
   color: var(--accent-2);
 }
+/* 弹窗尺寸控制：同上，n-modal 默认 min-height: 100% 会撑满 viewport */
+.detect-view :deep(.n-modal-scroll-content) {
+  min-height: auto !important;
+}
+.detect-view :deep(.n-modal) {
+  max-height: calc(100vh - 64px);
+}
+.detect-view :deep(.n-modal .n-card) {
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+}
+.detect-view :deep(.n-modal .n-card__content) {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
 </style>

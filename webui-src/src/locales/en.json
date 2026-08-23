@@ -157,6 +157,7 @@
     "selectNone": "(Keep original)",
     "labelsTitle": "Used by",
     "noLabels": "Unused",
+    "tooltipMore": "and {n} more · click to view",
     "saveSuccess": "Replaced {n} entries successfully.",
     "saveEmpty": "Nothing to replace.",
     "saveFail": "Replace failed: {msg}",
