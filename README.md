@@ -27,6 +27,8 @@
 | `test_retry_backoff` | float | 2.0 | 重试退避（秒），按 (1×, 2×, 3×…) 线性退避 |
 | `history_retention_days` | int | 30 | 历史保留天数（0 = 永久保留） |
 
+> 这些配置可以通过 WebUI 左侧「设置」页面直接修改并保存，会同步写入插件 `_conf_schema`（AstrBot 配置 UI 中同样可见）。
+
 ## 安装
 
 1. 克隆本仓库到 AstrBot `data/plugins/` 目录
