@@ -8,7 +8,7 @@
 
 用 AstrBot 跑私人伴侣（[astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)）时，想换一个更聪明 / 更便宜的模型，总要去后台一个个改 provider 配置，麻烦又容易漏。于是做了这个面板：在 WebUI 里一键检测所有模型的延迟和存活、批量把旧模型替换成新模型，几秒钟搞定，不用碰后台。
 
-> 若你也使用「我会永远陪着你」插件，强烈建议同时安装：[https://github.com/menglimi/astrbot_plugin_private_companion](https://github.com/menglimi/astrbot_plugin_private_companion)
+> 本插件即为此配套而生。「我会永远陪着你」插件的官方地址：https://github.com/menglimi/astrbot_plugin_private_companion
 
 ## 功能
 
