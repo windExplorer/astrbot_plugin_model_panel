@@ -1,4 +1,4 @@
-# 🐱 喵喵模型控制台（astrbot_plugin_model_panel）
+# 🌸 萌萌模型控制台（astrbot_plugin_model_panel）
 
 > ⚠️ **自用插件**：本插件主要为我个人使用而开发，功能围绕自己的实际需求打磨，非通用商业产品。介意勿用，也欢迎 fork 自改。
 
@@ -40,7 +40,7 @@
 
 1. 克隆本仓库到 AstrBot `data/plugins/` 目录
 2. 在 AstrBot 面板启用插件
-3. 打开「喵喵模型控制台」页面
+3. 打开「萌萌模型控制台」页面
 
 依赖 AstrBot `>= 4.22.0`、Python 包 `aiosqlite`。
 
