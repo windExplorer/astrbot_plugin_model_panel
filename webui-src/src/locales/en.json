@@ -94,6 +94,7 @@
     "btnRetry": "Retry",
     "btnRefresh": "Refresh",
     "refreshed": "Refreshed",
+    "loadFailed": "Failed to load models",
     "colVendor": "Vendor",
     "errorBanner": "Test did not finish: {msg}",
     "streamStartHint": "Detection started, results will stream in…",

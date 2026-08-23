@@ -94,6 +94,7 @@
     "btnRetry": "재시도",
     "btnRefresh": "새로고침",
     "refreshed": "새로고침 완료",
+    "loadFailed": "모델 목록 불러오기 실패",
     "colVendor": "공급자",
     "errorBanner": "일괄 감지가 완료되지 않았습니다: {msg}",
     "streamStartHint": "감지가 시작되었습니다. 결과가 순차적으로 표시됩니다…",

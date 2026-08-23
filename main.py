@@ -359,16 +359,21 @@ class ModelPanelPlugin(Star):
         providers = self._chat_providers()
         default_id = self._default_provider_id()
         items = []
-        seen_models: dict[str, str] = {}  # model -> first id (记录是谁先出现的)
+        seen_models: dict[str, dict] = {}  # model -> {id, name}
         for p in providers:
             d = self._provider_display(p)
             d["is_default"] = bool(d["id"] and d["id"] == default_id)
             items.append(d)
             model = d.get("model") or ""
             if model and model not in seen_models:
-                seen_models[model] = d["id"]
-        # 去重后的 model 名列表（按首次出现顺序），伴侣页用作 select 选项
+                seen_models[model] = {"id": d["id"], "name": d.get("name") or ""}
+        # models: 去重后的纯 model 名列表（兼容旧前端）
         models = list(seen_models.keys())
+        # provider_models: 去重后的 {model, vendor} 列表（新前端用 vendor · model 显示）
+        provider_models = [
+            {"model": m, "vendor": seen_models[m]["name"]}
+            for m in models
+        ]
         logger.info(
             f"[ModelPanel] /panel/providers 返回 {len(items)} 个 provider, "
             f"{len(models)} 个去重模型, 默认={default_id or '无'}"
@@ -376,6 +381,7 @@ class ModelPanelPlugin(Star):
         return {
             "items": items,
             "models": models,
+            "provider_models": provider_models,
             "default_provider_id": default_id,
         }
 

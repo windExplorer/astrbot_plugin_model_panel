@@ -94,6 +94,7 @@
     "btnRetry": "重试",
     "btnRefresh": "刷新",
     "refreshed": "已刷新",
+    "loadFailed": "加载模型列表失败",
     "colVendor": "供应商",
     "errorBanner": "一键检测未完成：{msg}",
     "streamStartHint": "检测已开始，正在逐个返回结果…",

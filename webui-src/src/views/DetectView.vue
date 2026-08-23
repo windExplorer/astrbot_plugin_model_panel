@@ -36,23 +36,47 @@
       </n-space>
     </n-card>
 
-    <!-- 主内容区：单张大表（按供应商列分组，所有列宽一致） -->
+    <!-- 主内容区：每个供应商一张独立表格，标题显示供应商名 + 模型数 -->
     <n-card :title="t('detect.groupTitle', { count: items.length })" size="small" class="content-card">
-      <n-empty v-if="!items.length" :description="t('detect.groupNone')" />
+      <n-empty v-if="!items.length && !loadingFailed" :description="t('detect.groupNone')" />
+      <n-empty
+        v-else-if="!items.length && loadingFailed"
+        :description="t('detect.loadFailed')"
+      >
+        <template #extra>
+          <n-text depth="3" style="font-size: 12px">{{ loadingErrorMsg }}</n-text>
+          <div style="margin-top: 12px">
+            <n-button size="small" type="primary" @click="manualRefresh">
+              {{ t("detect.btnRefresh") }}
+            </n-button>
+          </div>
+        </template>
+      </n-empty>
 
-      <n-data-table
-        v-else
-        :columns="columns"
-        :data="flatRows"
-        :row-key="rowKey"
-        size="small"
-        :pagination="false"
-        :bordered="true"
-        :single-line="false"
-        :scroll-x="1200"
-        :max-height="560"
-        flex-height
-      />
+      <div v-else class="groups">
+        <section
+          v-for="group in groupedRows"
+          :key="group.name"
+          class="group-block"
+        >
+          <header class="group-head">
+            <span class="group-name">{{ group.name || t("detect.groupName") }}</span>
+            <n-tag size="small" :bordered="false" type="default">
+              {{ group.items.length }} {{ t("detect.units") }}
+            </n-tag>
+          </header>
+          <n-data-table
+            :columns="columns"
+            :data="group.items"
+            :row-key="rowKey"
+            size="small"
+            :pagination="false"
+            :bordered="true"
+            :single-line="false"
+            :scroll-x="1200"
+          />
+        </section>
+      </div>
     </n-card>
 
     <n-card v-if="lastSessionStats" size="small" class="stats-card">
@@ -177,6 +201,8 @@ const lastSessionStats = ref<{
   skip_count: number;
   total: number;
 } | null>(null);
+const loadingFailed = ref(false);
+const loadingErrorMsg = ref("");
 
 // 详情弹窗
 const detailVisible = ref(false);
@@ -219,8 +245,8 @@ const sortOptions = computed(() => [
   { label: t("detect.sort.status"), value: "status" },
 ]);
 
-// 把分组摊平为单表行，每行附 vendor 字段；保持同列宽
-const flatRows = computed<ProviderItem[]>(() => {
+// 按供应商分组：[{name, items[]}, ...]
+const groupedRows = computed<{ name: string; items: ProviderItem[] }[]>(() => {
   const groups = new Map<string, ProviderItem[]>();
   for (const item of items.value) {
     const g = item.name || t("detect.groupName");
@@ -228,7 +254,7 @@ const flatRows = computed<ProviderItem[]>(() => {
     groups.get(g)!.push(item);
   }
   const orderedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], "zh"));
-  const all: ProviderItem[] = [];
+  const result: { name: string; items: ProviderItem[] }[] = [];
   for (const [name, list] of orderedGroups) {
     const sorted = [...list];
     if (sortKey.value === "name") {
@@ -255,10 +281,9 @@ const flatRows = computed<ProviderItem[]>(() => {
         return la - lb;
       });
     }
-    // 同组内行渲染时使用“相同 vendor”前缀，列宽统一靠表头“供应商”列固定 width
-    for (const item of sorted) all.push(item);
+    result.push({ name, items: sorted });
   }
-  return all;
+  return result;
 });
 
 // ---------- 工具 ----------
@@ -344,8 +369,22 @@ async function loadResults() {
 }
 
 async function loadProviders() {
-  const data = await apiGet<{ items: ProviderItem[] }>("/panel/providers");
-  items.value = data.items || [];
+  loadingFailed.value = false;
+  loadingErrorMsg.value = "";
+  try {
+    const data = await apiGet<{ items: ProviderItem[]; models?: string[] }>("/panel/providers");
+    items.value = data.items || [];
+    if (!items.value.length) {
+      loadingFailed.value = true;
+      loadingErrorMsg.value = "后端 /panel/providers 返回 items 为空，请检查 AstrBot 是否成功获取到 chat provider";
+    }
+  } catch (e: any) {
+    console.error("loadProviders 失败", e);
+    items.value = [];
+    loadingFailed.value = true;
+    loadingErrorMsg.value = String(e?.message || e || "未知错误");
+    return;
+  }
   // 默认勾选
   for (const it of items.value) {
     if (!(it.id in enabled)) enabled[it.id] = true;
@@ -460,14 +499,6 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
     },
   },
   {
-    title: t("detect.colVendor"),
-    key: "name",
-    width: COL.vendor,
-    render(row) {
-      return h(NText, { depth: 3 }, () => row.name || t("detect.groupName"));
-    },
-  },
-  {
     title: t("detect.colModel"),
     key: "model",
     width: COL.provider,
@@ -480,9 +511,9 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
                 () => t("common.default"))
             : null,
         ]),
-        h("div", { style: "color: var(--muted); font-size: 12px" }, [
-          row.type || "",
-          row.model ? ` · ${row.model}` : "",
+        h("div", { style: "color: var(--muted); font-size: 12px; word-break: break-all" }, [
+          // 完整 model 字符串，包括 xx/xx/xx 路径形式，绝不截断
+          row.model || row.type || row.id || "",
         ]),
       ]);
     },
@@ -527,7 +558,7 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
       const r = results[row.id];
       if (!r) return h(NText, { depth: 3 }, () => "—");
       const tag = resultTagFor(r);
-      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start" }, [
+      return h("div", { style: "display: flex; flex-direction: column; gap: 2px; align-items: flex-start; width: 100%" }, [
         h(NTag, { type: tag.type, size: "small", round: true }, () => tag.label),
         h(NTooltip, { delay: 200 }, {
           trigger: () =>
@@ -541,7 +572,13 @@ const columns = computed<DataTableColumn<ProviderItem>[]>(() => [
           default: () => r.error || t("detect.detail.openRaw"),
         }),
         r.error
-          ? h(NText, { depth: 3, style: "font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" }, () => r.error)
+          ? h(NText, {
+              depth: 3,
+              style:
+                "font-size: 12px; width: 100%; word-break: break-all; " +
+                "white-space: normal; overflow: hidden; text-overflow: ellipsis; " +
+                "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;",
+            }, () => r.error)
           : null,
       ]);
     },
@@ -613,6 +650,26 @@ onMounted(async () => {
 }
 .hint {
   font-size: 12px;
+}
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.group-block {
+  display: flex;
+  flex-direction: column;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px 8px;
+}
+.group-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--accent-2);
 }
 </style>
 

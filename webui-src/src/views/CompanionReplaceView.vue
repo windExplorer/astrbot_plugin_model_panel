@@ -147,7 +147,7 @@ const message = useMessage();
 
 const loaded = ref<boolean | null>(null);
 const items = ref<CompanionProviderItem[]>([]);
-const providers = ref<string[]>([]);
+const providers = ref<{ model: string; vendor: string }[]>([]);
 const replacements = reactive<Record<string, string>>({});
 const saving = ref(false);
 const configMode = ref("");
@@ -205,15 +205,31 @@ const unconfiguredTitle = computed(() =>
   t("companion.sectionUnconfigured", { n: unconfiguredItems.value.length }),
 );
 
+// value(模型名) 完整 model 字符串（含 xx/xx/xx 路径形式）作为 NSelect 的 value
+function modelLabel(p: { model: string; vendor: string }): string {
+  if (p.vendor && p.vendor !== p.model) {
+    return `${p.vendor} · ${p.model}`;
+  }
+  return p.model;
+}
+
 function availableOptions(value: string): { label: string; value: string }[] {
   const opts: { label: string; value: string }[] = providers.value.map((p) => ({
-    label: p,
-    value: p,
+    label: modelLabel(p),
+    value: p.model,
   }));
-  if (value && !providers.value.includes(value)) {
-    opts.unshift({ label: value, value });
+  // 去重
+  const seen = new Set<string>();
+  const dedup = opts.filter((o) => {
+    if (seen.has(o.value)) return false;
+    seen.add(o.value);
+    return true;
+  });
+  // 如果原值不在列表里（如旧版缓存），加在最前面
+  if (value && !seen.has(value)) {
+    dedup.unshift({ label: value, value });
   }
-  return [{ label: t("companion.selectNone"), value: "" }, ...opts];
+  return [{ label: t("companion.selectNone"), value: "" }, ...dedup];
 }
 
 async function save() {
@@ -377,19 +393,30 @@ onMounted(async () => {
     const data = await apiGet<{
       items: { id: string; name: string; model: string }[];
       models?: string[];
+      provider_models?: { model: string; vendor: string }[];
     }>("/panel/providers");
-    // 优先用后端返回的去重 models 列表，避免 NSelect 里出现多个相同名字的选项
-    // 后端未返回 models（旧版 zip 兼容）时，从 items 去重 fallback
-    const set = new Set<string>();
-    if (Array.isArray(data.models) && data.models.length) {
-      data.models.forEach((m) => m && set.add(m));
+    // 优先用后端返回的 provider_models（{model, vendor}），下拉 label 可拼 "vendor · model"；
+    // 旧版 zip 没这字段时，从 items/models 去重 fallback
+    const list: { model: string; vendor: string }[] = [];
+    if (Array.isArray(data.provider_models) && data.provider_models.length) {
+      for (const m of data.provider_models) {
+        if (m && m.model) list.push({ model: m.model, vendor: m.vendor || "" });
+      }
+    } else if (Array.isArray(data.models) && data.models.length) {
+      for (const m of data.models) {
+        if (m) list.push({ model: m, vendor: "" });
+      }
     } else if (data.items) {
-      data.items.forEach((p) => {
+      const seen = new Set<string>();
+      for (const p of data.items) {
         const m = (p.model || p.id || "").trim();
-        if (m) set.add(m);
-      });
+        if (m && !seen.has(m)) {
+          seen.add(m);
+          list.push({ model: m, vendor: p.name || "" });
+        }
+      }
     }
-    providers.value = [...set];
+    providers.value = list;
   } catch (e) {
     console.error("加载可用模型失败", e);
   }
