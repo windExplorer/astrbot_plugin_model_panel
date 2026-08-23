@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
+from astrbot.core.provider.entities import ProviderType
 from quart import Response, request
 
 from .storage import Storage
@@ -482,35 +483,41 @@ class ModelPanelPlugin(Star):
         # 写扁平副本 + 可能存在的 schema 分组嵌套（_flat_set 递归同步所有位置）
         _flat_set(cfg, self.FALLBACK_CONFIG_KEY, encoded)
 
-    def _default_provider_id(self) -> str:
-        """返回 AstrBot 实际生效的默认 chat 模型 provider id。
-
-        AstrBot 在后台"切换当前模型"时写的是 SharedPreferences 的 curr_provider，
-        并同步更新 provider_manager.curr_provider_inst；配置里的
-        provider_settings.default_provider_id 不一定随之更新。因此优先取
-        curr_provider_inst（反映运行时切换），再回退配置默认值。
-        """
+    def _default_provider_id_sync(self) -> str:
+        """同步兜底：读配置里的 default_provider_id。"""
         try:
             pm = self.context.provider_manager
-            # 1) 实际生效：运行时切换后 curr_provider_inst 已更新
-            inst = getattr(pm, "curr_provider_inst", None)
-            if inst is not None:
-                cfg = getattr(inst, "provider_config", None)
-                if isinstance(cfg, dict):
-                    pid = str(cfg.get("id") or "").strip()
-                    if pid:
-                        return pid
-            # 2) 回退：配置里的 default_provider_id
             ps = getattr(pm, "provider_settings", None) or {}
             return str(ps.get("default_provider_id") or "")
         except Exception:
             return ""
 
+    async def _default_provider_id(self) -> str:
+        """返回 AstrBot 实际生效的默认 chat 模型 provider id。
+
+        使用 AstrBot 官方 get_using_provider_async(CHAT_COMPLETION) 决议，
+        与 AstrBot 运行时"实际用哪个模型"完全一致（优先配置 default_provider_id，
+        校验 provider 是否已加载）。避免读已弃用的 curr_provider_inst（不随
+        配置页改动更新）或 SharedPreferences 残留的 curr_provider。
+        """
+        try:
+            pm = self.context.provider_manager
+            provider = await pm.get_using_provider_async(ProviderType.CHAT_COMPLETION)
+            if provider is not None:
+                cfg = getattr(provider, "provider_config", None)
+                if isinstance(cfg, dict):
+                    pid = str(cfg.get("id") or "").strip()
+                    if pid:
+                        return pid
+        except Exception:
+            pass
+        return self._default_provider_id_sync()
+
     # ---------------- API ----------------
     async def api_overview(self) -> dict:
         providers = self._chat_providers()
         ids = {p["id"] for p in (self._provider_display(p) for p in providers)}
-        default_id = self._default_provider_id()
+        default_id = await self._default_provider_id()
         stats: dict = {}
         latest_results: dict = {}
         try:
@@ -531,7 +538,7 @@ class ModelPanelPlugin(Star):
 
     async def api_list_providers(self) -> dict:
         providers = self._chat_providers()
-        default_id = self._default_provider_id()
+        default_id = await self._default_provider_id()
         items = []
         seen_models: dict[str, dict] = {}  # model -> {id, name}
         for p in providers:
@@ -914,7 +921,7 @@ class ModelPanelPlugin(Star):
             return {"items": [], "stats": {}, "error": str(e)}
 
     async def api_default_model(self) -> dict:
-        return {"default_provider_id": self._default_provider_id()}
+        return {"default_provider_id": await self._default_provider_id()}
 
     async def api_companion_providers(self) -> dict:
         cfg = self._companion_config()

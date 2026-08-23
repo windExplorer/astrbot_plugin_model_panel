@@ -22,30 +22,9 @@ if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Path $distDir | Out-Null
 }
 
-# Step 1: rebuild vite bundle so bundle PLUGIN_VERSION matches the zip name
-$webui = [System.IO.Path]::Combine($_scriptDir, "webui-src")
-$packageJson = [System.IO.Path]::Combine($webui, "package.json")
-$nodeModules = [System.IO.Path]::Combine($webui, "node_modules")
-if (Test-Path $packageJson) {
-    Push-Location $webui
-    if (-not (Test-Path $nodeModules)) {
-        Write-Host "build_zip: node_modules missing, running npm install..."
-        npm install 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
-    }
-    Write-Host "build_zip: rebuilding vite bundle..."
-    npm run build 2>&1 | Select-Object -Last 8 | ForEach-Object { Write-Host $_ }
-    $npmExit = $LASTEXITCODE
-    Pop-Location
-    if ($npmExit -ne 0) {
-        Write-Host "build_zip: ERROR vite build failed ($npmExit)" -ForegroundColor Red
-        exit 1
-    }
-}
-else {
-    Write-Host "build_zip: WARNING webui-src/package.json missing, skip vite build"
-}
-
-# Step 2: bump version so the zip file name is unique
+# Step 1: bump version so the zip file name is unique.
+# IMPORTANT: bump BEFORE building vite, because _bump_version.ps1 writes
+# version.ts and the front-end bundle must embed the NEW version number.
 $bumpScript = [System.IO.Path]::Combine($_scriptDir, "_bump_version.ps1")
 function Invoke-BumpVersion {
     if (Test-Path $bumpScript) {
@@ -90,6 +69,29 @@ while (Test-Path $zipPath) {
     $zipPath = [System.IO.Path]::Combine($distDir, $zipName)
 }
 Write-Host "build_zip: target zip $zipName"
+
+# Step 2: rebuild vite bundle so bundle PLUGIN_VERSION matches the zip name
+$webui = [System.IO.Path]::Combine($_scriptDir, "webui-src")
+$packageJson = [System.IO.Path]::Combine($webui, "package.json")
+$nodeModules = [System.IO.Path]::Combine($webui, "node_modules")
+if (Test-Path $packageJson) {
+    Push-Location $webui
+    if (-not (Test-Path $nodeModules)) {
+        Write-Host "build_zip: node_modules missing, running npm install..."
+        npm install 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
+    }
+    Write-Host "build_zip: rebuilding vite bundle..."
+    npm run build 2>&1 | Select-Object -Last 8 | ForEach-Object { Write-Host $_ }
+    $npmExit = $LASTEXITCODE
+    Pop-Location
+    if ($npmExit -ne 0) {
+        Write-Host "build_zip: ERROR vite build failed ($npmExit)" -ForegroundColor Red
+        exit 1
+    }
+}
+else {
+    Write-Host "build_zip: WARNING webui-src/package.json missing, skip vite build"
+}
 
 # Step 3: pack zip (excluding build artifacts / agent scratch dirs)
 $excludeDirs  = @("dist", "webui-src", ".git", "__pycache__", ".codegraph", ".codebuddy", "node_modules", "tests", "docs", "_References", ".reasonix")
