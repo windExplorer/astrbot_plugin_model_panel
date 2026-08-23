@@ -24,7 +24,8 @@
     "dashboard": "ダッシュボード",
     "detect": "モデル検出",
     "defaultModel": "デフォルトモデル",
-    "companion": "コンパニオン"
+    "companion": "コンパニオン",
+    "settings": "設定"
   },
   "dashboard": {
     "statTotal": "LLMモデル数",
@@ -177,5 +178,25 @@
       "usageKeys": "このモデルが使われているシナリオ",
       "allModels": "使用中モデルの全リスト"
     }
+  },
+  "settings": {
+    "title": "検出設定",
+    "testTimeout": "1回あたりのタイムアウト（秒）",
+    "testTimeoutHint": "単一モデル検出の最大待機時間。",
+    "testRetryCount": "失敗時の再試行回数",
+    "testRetryCountHint": "検出失敗時の自動再試行回数（0=再試行なし）。",
+    "testRetryBackoff": "再試行バックオフ（秒）",
+    "testRetryBackoffHint": "再試行間の待機時間（1×, 2×, 3× ...）。",
+    "historyRetentionDays": "履歴保持日数",
+    "historyRetentionDaysHint": "この日数を超えた履歴を自動削除（0=無期限）。",
+    "btnSave": "保存",
+    "btnReload": "再読込",
+    "saved": "保存しました",
+    "saveFail": "保存失敗",
+    "reloaded": "再読込しました",
+    "tipTitle": "ヒント",
+    "tipLine1": "設定はプラグインの _conf_schema に即時書き込まれます（AstrBot 設定 UI にも表示）。",
+    "tipLine2": "タイムアウトと再試行は「一括検出」の各モデルの所要時間と成功率に影響します。",
+    "tipLine3": "将来的に定时検出・アラート閾値などを追加予定。"
   }
 }

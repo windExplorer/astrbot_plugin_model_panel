@@ -1,15 +1,18 @@
+# Package the model-panel plugin into an AstrBot-installable zip.
+# Steps: bump version -> rebuild vite bundle -> pack zip.
+# Only ASCII text on purpose: PS 5.1 on non-UTF8 codepages may mis-parse
+# UTF-8 no-BOM files containing CJK comments, so keep this file pure ASCII.
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-# 直接用 [System.IO.Path]::PathSeparator 与 .Path.Combine 代替字符串拼接，
-# 避免 PowerShell 5 中 "\metadata.yaml" 被识别为转义序列或拼接被截断的诡异问题。
-
-# 解析脚本所在目录（用 PSScriptRoot，缺省回退 MyInvocation）
-$_scriptDir = $PSScriptRoot
-if (-not $_scriptDir -and $MyInvocation.MyCommand.Path) {
+# resolve script dir (works when $PSScriptRoot is empty under some hosts)
+if ($PSScriptRoot) {
+    $_scriptDir = $PSScriptRoot
+}
+elseif ($MyInvocation.MyCommand.Path) {
     $_scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
-if (-not $_scriptDir) {
+else {
     $_scriptDir = (Get-Location).Path
 }
 
@@ -19,7 +22,30 @@ if (-not (Test-Path $distDir)) {
     New-Item -ItemType Directory -Path $distDir | Out-Null
 }
 
-# 1. bump version 函数
+# Step 1: rebuild vite bundle so bundle PLUGIN_VERSION matches the zip name
+$webui = [System.IO.Path]::Combine($_scriptDir, "webui-src")
+$packageJson = [System.IO.Path]::Combine($webui, "package.json")
+$nodeModules = [System.IO.Path]::Combine($webui, "node_modules")
+if (Test-Path $packageJson) {
+    Push-Location $webui
+    if (-not (Test-Path $nodeModules)) {
+        Write-Host "build_zip: node_modules missing, running npm install..."
+        npm install 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
+    }
+    Write-Host "build_zip: rebuilding vite bundle..."
+    npm run build 2>&1 | Select-Object -Last 8 | ForEach-Object { Write-Host $_ }
+    $npmExit = $LASTEXITCODE
+    Pop-Location
+    if ($npmExit -ne 0) {
+        Write-Host "build_zip: ERROR vite build failed ($npmExit)" -ForegroundColor Red
+        exit 1
+    }
+}
+else {
+    Write-Host "build_zip: WARNING webui-src/package.json missing, skip vite build"
+}
+
+# Step 2: bump version so the zip file name is unique
 $bumpScript = [System.IO.Path]::Combine($_scriptDir, "_bump_version.ps1")
 function Invoke-BumpVersion {
     if (Test-Path $bumpScript) {
@@ -27,7 +53,7 @@ function Invoke-BumpVersion {
     }
 }
 
-# 2. 把读 version 的逻辑 inline（不嵌进 function 定义，避免 PowerShell 解析变量时丢上下文）
+$metaPath = [System.IO.Path]::Combine($_scriptDir, "metadata.yaml")
 function Get-VersionFromMeta {
     param([string]$Path)
     $ver = "v0.1.0"
@@ -36,29 +62,26 @@ function Get-VersionFromMeta {
             $content = [System.IO.File]::ReadAllText($Path)
             $m = [regex]::Match($content, "(?m)^version:\s*(v?[0-9]+\.[0-9]+\.[0-9]+)")
             if ($m.Success) { $ver = $m.Groups[1].Value }
-        } catch {
+        }
+        catch {
             # ignore
         }
     }
     return $ver
 }
 
-# 先 bump 一次拿到 version
 Invoke-BumpVersion
-$metaPath = [System.IO.Path]::Combine($_scriptDir, "metadata.yaml")
-Write-Host ("[build_zip] scriptDir=[" + $_scriptDir + "]")
-Write-Host ("[build_zip] metaPath=[" + $metaPath + "] exists=" + (Test-Path $metaPath))
-
 $version = Get-VersionFromMeta -Path $metaPath
 $zipName = "${pluginName}_${version}.zip"
 $zipPath = [System.IO.Path]::Combine($distDir, $zipName)
 
-# 同名 zip 已存在 → 再次 bump 拿新 version。历史 zip 全部保留不删除。
+# if the same-name zip already exists, bump again until we get a fresh one;
+# historical zips are always kept
 $guard = 0
 while (Test-Path $zipPath) {
     $guard++
     if ($guard -gt 50) {
-        Write-Host "ERROR: 同名 zip 连续 $guard 次仍存在，bump 失败" -ForegroundColor Red
+        Write-Host "ERROR: same-name zip still exists after $guard bumps" -ForegroundColor Red
         exit 1
     }
     Invoke-BumpVersion
@@ -66,9 +89,9 @@ while (Test-Path $zipPath) {
     $zipName = "${pluginName}_${version}.zip"
     $zipPath = [System.IO.Path]::Combine($distDir, $zipName)
 }
-Write-Host ("[build_zip] target zip: " + $zipName)
+Write-Host "build_zip: target zip $zipName"
 
-# 3. 打包
+# Step 3: pack zip (excluding build artifacts / agent scratch dirs)
 $excludeDirs  = @("dist", "webui-src", ".git", "__pycache__", ".codegraph", ".codebuddy", "node_modules", "tests", "docs", "_References", ".reasonix")
 $excludeExts  = @(".pyc", ".pyo")
 $excludeFiles = @("build_zip.ps1", "build_webui.ps1", "_inspect_zip.ps1", ".gitignore", "_repack.ps1", "_bump_version.ps1")
@@ -92,4 +115,4 @@ foreach ($file in $files) {
     $count++
 }
 $zip.Dispose()
-Write-Host ("[build_zip] Packaged: " + $zipPath + " files=" + $count)
+Write-Host "build_zip: Packaged $zipPath files=$count"

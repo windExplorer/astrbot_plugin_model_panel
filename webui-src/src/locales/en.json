@@ -177,5 +177,28 @@
       "usageKeys": "Scenarios where this model is used",
       "allModels": "Full list of models in use"
     }
+  },
+  "settings": {
+    "title": "Detection Settings",
+    "testTimeout": "Per-attempt timeout (sec)",
+    "testTimeoutHint": "Max wait time for a single model check.",
+    "testRetryCount": "Retry count on failure",
+    "testRetryCountHint": "Auto-retries on failure (0 = no retry).",
+    "testRetryBackoff": "Retry backoff (sec)",
+    "testRetryBackoffHint": "Wait between retries, growing 1x, 2x, 3x...",
+    "historyRetentionDays": "History retention (days)",
+    "historyRetentionDaysHint": "Auto-cleanup history older than this (0 = forever).",
+    "btnSave": "Save",
+    "btnReload": "Reload",
+    "saved": "Saved",
+    "saveFail": "Save failed",
+    "reloaded": "Reloaded",
+    "tipTitle": "Tips",
+    "tipLine1": "Settings are written to the plugin _conf_schema immediately (also visible in AstrBot config UI).",
+    "tipLine2": "Timeout and retry affect each model's latency and success rate in Test All.",
+    "tipLine3": "Scheduled checks and alert thresholds will be added here later."
+  },
+  "nav": {
+    "settings": "Settings"
   }
 }

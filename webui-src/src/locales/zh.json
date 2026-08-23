@@ -24,7 +24,8 @@
     "dashboard": "控制台",
     "detect": "模型检测",
     "defaultModel": "默认模型",
-    "companion": "陪伴插件"
+    "companion": "陪伴插件",
+    "settings": "设置"
   },
   "dashboard": {
     "statTotal": "LLM 模型数",
@@ -177,5 +178,25 @@
       "usageKeys": "该模型在哪些场景使用",
       "allModels": "完整已使用模型清单"
     }
+  },
+  "settings": {
+    "title": "检测配置",
+    "testTimeout": "单次超时（秒）",
+    "testTimeoutHint": "单个模型检测的最长等待时间。",
+    "testRetryCount": "失败重试次数",
+    "testRetryCountHint": "检测失败后自动重试的次数（0=不重试）。",
+    "testRetryBackoff": "重试退避（秒）",
+    "testRetryBackoffHint": "每次重试之间的等待时间，按 1×、2×、3×... 线性增长。",
+    "historyRetentionDays": "历史保留天数",
+    "historyRetentionDaysHint": "超过该天数的检测历史自动清理（0=永久保留）。",
+    "btnSave": "保存",
+    "btnReload": "重新加载",
+    "saved": "已保存",
+    "saveFail": "保存失败",
+    "reloaded": "已重新加载",
+    "tipTitle": "提示",
+    "tipLine1": "配置修改后会立即写入插件的 _conf_schema（AstrBot 配置 UI 中也会显示）。",
+    "tipLine2": "检测超时与重试影响“一键检测”时每个模型的耗时与成功率。",
+    "tipLine3": "未来这里会加入定时检测、告警阈值等功能。"
   }
 }

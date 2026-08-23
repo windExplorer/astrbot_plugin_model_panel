@@ -24,7 +24,8 @@
     "dashboard": "대시보드",
     "detect": "모델 감지",
     "defaultModel": "기본 모델",
-    "companion": "반려 플러그인"
+    "companion": "반려 플러그인",
+    "settings": "설정"
   },
   "dashboard": {
     "statTotal": "LLM 모델 수",
@@ -177,5 +178,25 @@
       "usageKeys": "이 모델이 사용되는 시나리오",
       "allModels": "사용 중 모델 전체 목록"
     }
+  },
+  "settings": {
+    "title": "감지 설정",
+    "testTimeout": "단일 시도 타임아웃(초)",
+    "testTimeoutHint": "단일 모델 감지의 최대 대기 시간.",
+    "testRetryCount": "실패 시 재시도 횟수",
+    "testRetryCountHint": "감지 실패 시 자동 재시도 횟수 (0 = 재시도 없음).",
+    "testRetryBackoff": "재시도 백오프(초)",
+    "testRetryBackoffHint": "재시도 간 대기 시간 (1×, 2×, 3× ...).",
+    "historyRetentionDays": "기록 보존 일수",
+    "historyRetentionDaysHint": "이 일수를 초과한 기록 자동 삭제 (0 = 무기한).",
+    "btnSave": "저장",
+    "btnReload": "다시 불러오기",
+    "saved": "저장 완료",
+    "saveFail": "저장 실패",
+    "reloaded": "다시 불러옴",
+    "tipTitle": "팁",
+    "tipLine1": "설정은 플러그인의 _conf_schema 에 즉시 기록됩니다 (AstrBot 설정 UI 에도 표시).",
+    "tipLine2": "타임아웃과 재시도는 '일괄 감지'의 각 모델 소요 시간과 성공률에 영향을 줍니다.",
+    "tipLine3": "미래에 정기 감지, 알림 임계값 등을 추가 예정."
   }
 }

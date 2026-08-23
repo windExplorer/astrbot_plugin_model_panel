@@ -1,9 +1,11 @@
 # Build Vue3 WebUI for the model-panel plugin.
-# 默认会先调用 _bump_version.ps1 递增版本号，再注入 version.ts 并执行 vite build。
+# 默认不 bump 版本号（让 build_zip.ps1 独占 bump，避免重复）。
+# 如需单独 bump，可显式指定 -BumpVersion。
+# 读取 metadata.yaml 当前版本注入前端，再运行 vite build。
 # 输出到 pages/model-panel/。
 [CmdletBinding()]
 param(
-    [switch]$SkipBumpVersion
+    [switch]$BumpVersion
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +19,7 @@ if ($PSScriptRoot) {
 }
 $webui = Join-Path $root "webui-src"
 
-if (-not $SkipBumpVersion) {
+if ($BumpVersion) {
     $bumpScript = Join-Path $root "_bump_version.ps1"
     if (Test-Path $bumpScript) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File $bumpScript -Root $root

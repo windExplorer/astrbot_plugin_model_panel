@@ -338,12 +338,18 @@ const columns = computed<
   {
     title: t("common.save"),
     key: "new",
-    minWidth: 240,
+    minWidth: 280,
     render(row) {
+      // 用 NSelect 配合 filterable=true 实现搜索下拉：
+      // 模型多时易找，且 Naive UI 自带菜单高度自适应。
       return h(NSelect, {
         value: replacements[row.value] ?? "",
         options: availableOptions(row.value),
-        size: "small",
+        size: "medium",
+        filterable: true,
+        clearable: true,
+        // 让下拉菜单更大，选项更高（避免紧凑看不清）
+        "menu-size": "large",
         onUpdateValue: (v: string) => {
           replacements[row.value] = v;
           // 持久化用户的替换选择（localStorage，避免误刷新丢失）

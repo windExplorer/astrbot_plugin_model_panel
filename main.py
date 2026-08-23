@@ -203,6 +203,8 @@ class ModelPanelPlugin(Star):
             ("/panel/providers/history", self.api_test_history, ["GET"]),
             ("/panel/preferences", self.api_get_preferences, ["GET"]),
             ("/panel/preferences", self.api_set_preferences, ["POST"]),
+            ("/panel/config", self.api_get_config, ["GET"]),
+            ("/panel/config", self.api_set_config, ["POST"]),
             ("/panel/default_model", self.api_default_model, ["GET"]),
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
@@ -384,6 +386,66 @@ class ModelPanelPlugin(Star):
             "provider_models": provider_models,
             "default_provider_id": default_id,
         }
+
+    # ---------- 插件配置（检测参数） ----------
+    async def api_get_config(self) -> dict:
+        """读取插件 _conf_schema 暴露的字段（含默认值），返回当前生效值。"""
+        cfg = getattr(self, "config", None)
+        defaults = {
+            "test_timeout": 45,
+            "test_retry_count": 1,
+            "test_retry_backoff": 2.0,
+            "history_retention_days": 30,
+        }
+        values = dict(defaults)
+        if cfg is not None and hasattr(cfg, "get"):
+            for k in defaults:
+                v = cfg.get(k)
+                if v is None:
+                    continue
+                if k == "test_retry_backoff":
+                    values[k] = float(v)
+                else:
+                    values[k] = int(v)
+        return {"items": values}
+
+    async def api_set_config(self) -> dict:
+        """批量设置插件配置字段。仅更新传入的 key，缺省保留原值。"""
+        payload = await self._json_payload()
+        raw = payload.get("items")
+        if not isinstance(raw, dict):
+            return {"ok": False, "error": "items 必须是对象 {key: value}"}
+        cfg = getattr(self, "config", None)
+        if cfg is None or not hasattr(cfg, "__setitem__"):
+            return {"ok": False, "error": "插件配置不可写（self.config 缺失）"}
+        type_map = {
+            "test_timeout": int,
+            "test_retry_count": int,
+            "test_retry_backoff": float,
+            "history_retention_days": int,
+        }
+        try:
+            for k, v in raw.items():
+                if k not in type_map:
+                    continue
+                casted = type_map[k](v)
+                if k == "test_timeout":
+                    casted = max(1, casted)
+                elif k == "test_retry_count":
+                    casted = max(0, casted)
+                elif k == "test_retry_backoff":
+                    casted = max(0.0, casted)
+                elif k == "history_retention_days":
+                    casted = max(0, casted)
+                cfg[k] = casted
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                save()
+            logger.info(f"[ModelPanel] 写入插件配置: {raw}")
+            return {"ok": True}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 写入插件配置失败: {e}")
+            return {"ok": False, "error": str(e)}
 
     # ---------- 检测勾选偏好 ----------
     async def api_get_preferences(self) -> dict:
