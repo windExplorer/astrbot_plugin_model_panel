@@ -228,6 +228,19 @@ export interface CompanionProvidersResponse {
   config_mode?: string;
   configured_count?: number;
   total_keys?: number;
+  /** 陪伴插件运行时（实例属性）的备用模型是否与配置一致 */
+  runtime_in_sync?: boolean;
+}
+
+export interface CompanionReplaceResponse {
+  ok: boolean;
+  changed_count?: number;
+  /** 主模型位置替换数 */
+  main_count?: number;
+  /** 备用模型位置替换数 */
+  fallback_count?: number;
+  changed?: { key: string; kind: string; old: string; new: string }[];
+  error?: string;
 }
 
 export interface TestAllStreamItemEvent {

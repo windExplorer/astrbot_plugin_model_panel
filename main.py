@@ -61,10 +61,14 @@ COMPANION_PROVIDER_KEYS = [
     "FORWARD_MESSAGE_PROVIDER_ID",
     "PLUGIN_VISION_PROVIDER_ID",
     "PRIVATE_READING_VISION_PROVIDER_ID",
+    "REACTION_EXPRESSION_EMBEDDING_PROVIDER_ID",
     "NEWS_PROVIDER_ID",
     "WEB_EXPLORATION_PROVIDER_ID",
     "EMOTION_JUDGEMENT_PROVIDER_ID",
 ]
+
+# 陪伴插件 constants.MODEL_PROVIDER_KEYS 之外的 key 也要保留：
+# 写回 model_fallback_overrides 时不能因为"不认识"就把用户已有配置抹掉。
 
 # 伴侣插件 provider key 的中文标签（在伴侣插件 command_handlers.py 中整理）。
 # 这里只内置我们关心的部分；找不到时前端显示 key 原名。
@@ -102,6 +106,7 @@ COMPANION_KEY_LABELS: dict[str, str] = {
     "FORWARD_MESSAGE_PROVIDER_ID": "转发消息模型",
     "PLUGIN_VISION_PROVIDER_ID": "插件视觉模型",
     "PRIVATE_READING_VISION_PROVIDER_ID": "私读视觉模型",
+    "REACTION_EXPRESSION_EMBEDDING_PROVIDER_ID": "表情反应向量模型",
     "NEWS_PROVIDER_ID": "新闻模型",
     "WEB_EXPLORATION_PROVIDER_ID": "联网探索模型",
     "EMOTION_JUDGEMENT_PROVIDER_ID": "情绪判定模型",
@@ -204,6 +209,36 @@ def _flat_set(cfg: Any, key: str, value: Any) -> None:
     group = cfg.get(COMPANION_PROVIDER_GROUP)
     if isinstance(group, dict):
         group[key] = value
+
+
+def _flat_set_existing(cfg: Any, key: str, value: Any) -> None:
+    """只更新 config 中已存在该 key 的位置（含嵌套分组），都不存在时写顶层。
+
+    用于 legacy flat 配置（如 model_fallback_overrides）：它能被 _flat_get 读到，
+    但不属于 provider key，不能往 model_assignment_config 分组里补写，
+    否则会把非 provider 字段塞进"模型分流"分组。
+    """
+    if not isinstance(cfg, dict):
+        for attr in ("data", "config"):
+            t = getattr(cfg, attr, None)
+            if isinstance(t, dict):
+                cfg = t
+                break
+    if not isinstance(cfg, dict):
+        return
+
+    def update(target: dict) -> bool:
+        changed = False
+        for child in target.values():
+            if isinstance(child, dict):
+                changed = update(child) or changed
+        if key in target:
+            target[key] = value
+            changed = True
+        return changed
+
+    if not update(cfg):
+        cfg[key] = value
 
 
 @register("astrbot_plugin_model_panel", "local", "模型管理与检测面板", "0.1.0")
@@ -441,8 +476,13 @@ class ModelPanelPlugin(Star):
     # 的 JSON 字符串（顶层 legacy flat key）。用与陪伴插件一致的 _normalize 语义解析。
     FALLBACK_CONFIG_KEY = "model_fallback_overrides"
 
-    def _companion_fallback_values(self) -> dict[str, str]:
-        """返回 {provider_key: 备用 provider_id}。解析 config 里 model_fallback_overrides。"""
+    def _companion_fallback_raw(self) -> dict[str, str]:
+        """解析 model_fallback_overrides 的全部内容。
+
+        保留未收录在 COMPANION_PROVIDER_KEYS 里的 key：陪伴插件每次升级都可能
+        新增 provider key，若这里按白名单过滤，写回时会把用户已有（我们还不认识的）
+        备用配置静默抹掉。
+        """
         cfg = self._companion_config()
         if cfg is None:
             return {}
@@ -451,9 +491,6 @@ class ModelPanelPlugin(Star):
             raw = _flat_get(cfg, self.FALLBACK_CONFIG_KEY)
         except Exception:
             raw = None
-        if raw is None:
-            return {}
-        # config 里可能是 JSON 字符串，也可能是已解析的 dict
         if isinstance(raw, str):
             text = raw.strip()
             if not text:
@@ -465,26 +502,114 @@ class ModelPanelPlugin(Star):
         if not isinstance(raw, dict):
             return {}
         out: dict[str, str] = {}
-        for key, provider_id in raw.items():
-            k = str(key).strip()
-            pid = str(provider_id or "").strip()
-            if k in COMPANION_PROVIDER_KEYS and pid:
-                out[k] = pid
+        for raw_key, raw_provider_id in raw.items():
+            key = str(raw_key or "").strip()
+            pid = str(raw_provider_id or "").strip()
+            if key and pid:
+                out[key] = pid
         return out
 
+    def _companion_fallback_values(self) -> dict[str, str]:
+        """返回 {provider_key: 备用 provider_id}，只含我们认识的 provider key。"""
+        raw = self._companion_fallback_raw()
+        return {k: v for k, v in raw.items() if k in COMPANION_PROVIDER_KEYS}
+
     def _set_companion_fallback(self, key: str, provider_id: str) -> None:
-        """把某 key 的备用 provider 写入 model_fallback_overrides（扁平 + 分组同步）。"""
+        """把某 key 的备用 provider 写入 model_fallback_overrides。
+
+        model_fallback_overrides 是顶层 legacy flat 配置（不是 provider key），
+        用 _flat_set_existing 写，避免被补进 model_assignment_config 分组。
+        """
         cfg = self._companion_config()
         if cfg is None:
             return
-        current = self._companion_fallback_values()
+        current = self._companion_fallback_raw()
         if provider_id:
             current[key] = provider_id
         else:
             current.pop(key, None)
         encoded = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
-        # 写扁平副本 + 可能存在的 schema 分组嵌套（_flat_set 递归同步所有位置）
-        _flat_set(cfg, self.FALLBACK_CONFIG_KEY, encoded)
+        _flat_set_existing(cfg, self.FALLBACK_CONFIG_KEY, encoded)
+
+    def _companion_runtime_fallback(self) -> dict[str, str]:
+        """陪伴插件实例属性里的 model_fallback_overrides（运行时真正生效的值）。
+
+        陪伴插件 WebUI 的 settings 快照优先取实例属性，所以我们改完配置后
+        必须把这个属性也同步，否则"配置已改、页面还显示旧的"。
+        """
+        star = self._companion_star()
+        if star is None:
+            return {}
+        plugin_obj = getattr(star, "star_cls", None) or getattr(star, "instance", None) or star
+        raw = getattr(plugin_obj, "model_fallback_overrides", None)
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw or "{}")
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for raw_key, raw_provider_id in raw.items():
+            key = str(raw_key or "").strip()
+            pid = str(raw_provider_id or "").strip()
+            if key and pid:
+                out[key] = pid
+        return out
+
+    def _sync_companion_runtime(self) -> None:
+        """把刚写进 config 的值同步到陪伴插件的运行时实例属性。
+
+        陪伴插件在 bootstrap 时把 model_fallback_overrides、fast_response_provider_id
+        等一次性读到实例属性，之后：
+        - 主模型：其 WebUI 直接 _config_get(key) 读配置，所以我们改 config 即刻可见；
+        - 备用模型：走 _runtime_settings 的
+          getattr(self.plugin, "model_fallback_overrides", self._config_get(key))，
+          实例属性存在就优先返回它 —— 只 save_config() 写文件不会刷新实例属性，
+          陪伴插件面板/运行逻辑会继续用旧值（就是"备用模型没替换"的根因）。
+        所以这里必须显式同步：备用模型 setattr 归一化后的 dict，主模型调其
+        _apply_quick_provider_defaults()。
+        """
+        star = self._companion_star()
+        if star is None:
+            return
+        plugin_obj = getattr(star, "star_cls", None) or getattr(star, "instance", None) or star
+        cfg = self._companion_config()
+        if cfg is None:
+            return
+
+        # ---- 备用模型：model_fallback_overrides（实例属性必须是 dict）----
+        try:
+            raw = _flat_get(cfg, self.FALLBACK_CONFIG_KEY, "")
+        except Exception:
+            raw = ""
+        normalized: dict[str, str] = {}
+        normalizer = getattr(plugin_obj, "_normalize_model_fallback_overrides", None)
+        if callable(normalizer):
+            try:
+                result = normalizer(raw)
+                if isinstance(result, dict):
+                    normalized = result
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 归一化 model_fallback_overrides 失败: {e}")
+        if not normalized:
+            normalized = self._companion_fallback_raw()
+        try:
+            setattr(plugin_obj, "model_fallback_overrides", normalized)
+            logger.info(f"[ModelPanel] 已同步陪伴插件实例属性 model_fallback_overrides: {normalized}")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 同步 model_fallback_overrides 失败: {e}")
+
+        # ---- 主模型：fast_response_provider_id 等实例属性 ----
+        apply = getattr(plugin_obj, "_apply_quick_provider_defaults", None)
+        if callable(apply):
+            try:
+                apply()
+                logger.info("[ModelPanel] 已调 _apply_quick_provider_defaults 同步实例属性")
+            except Exception as e:
+                logger.warning(f"[ModelPanel] _apply_quick_provider_defaults 调用失败: {e}")
+        else:
+            logger.warning("[ModelPanel] 陪伴插件未找到 _apply_quick_provider_defaults 方法，可能需要重启插件才能生效")
 
     def _default_provider_id_sync(self) -> str:
         """同步兜底：读配置里的 default_provider_id。"""
@@ -981,9 +1106,23 @@ class ModelPanelPlugin(Star):
             config_mode = str(_flat_get(cfg, "provider_config_mode") or "")
         except Exception:
             config_mode = ""
+        # 陪伴插件运行时（实例属性）实际生效的备用模型。与配置不一致说明
+        # 陪伴插件内存里还是旧值（例如用旧版本替换过、或用户直接改了配置文件）。
+        # 自愈：把 config 的真实值推给运行时实例属性（不写配置，只刷新缓存），
+        # 这样打开本页就能纠正它的 WebUI 与运行逻辑，不必等重启/重载。
+        config_fallback = self._companion_fallback_raw()
+        runtime_in_sync = self._companion_runtime_fallback() == config_fallback
+        if not runtime_in_sync:
+            logger.warning(
+                "[ModelPanel] 陪伴插件运行时备用模型与配置不一致，自动同步: "
+                f"运行时={self._companion_runtime_fallback()}, 配置={config_fallback}"
+            )
+            self._sync_companion_runtime()
+            runtime_in_sync = self._companion_runtime_fallback() == config_fallback
         logger.info(
             f"[ModelPanel] /panel/companion/providers: 共 {len(items)} 项, "
-            f"已配置 {configured} 项, 模式={config_mode or '无'}"
+            f"已配置 {configured} 项, 模式={config_mode or '无'}, "
+            f"备用模型运行时一致={runtime_in_sync}"
         )
         return {
             "loaded": True,
@@ -991,6 +1130,7 @@ class ModelPanelPlugin(Star):
             "config_mode": config_mode,
             "configured_count": configured,
             "total_keys": len(COMPANION_PROVIDER_KEYS),
+            "runtime_in_sync": runtime_in_sync,
         }
 
     async def api_companion_replace(self) -> dict:
@@ -1072,25 +1212,22 @@ class ModelPanelPlugin(Star):
         except Exception as e:
             logger.warning(f"[ModelPanel] 保存陪伴插件配置失败: {e}")
             return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
-        # 陪伴插件在 bootstrap 时把 config 值一次性读到实例属性
-        # （如 self.fast_response_provider_id），只 save_config() 写了文件但
-        # 实例属性不会自动更新。需要调陪伴插件的 _apply_quick_provider_defaults()
-        # 把新 config 值同步到运行时实例属性，否则陪伴插件的 WebUI / 运行逻辑
-        # 仍然用旧值。
-        star = self._companion_star()
-        if star is not None:
-            plugin_obj = getattr(star, "star_cls", None) or getattr(star, "instance", None) or star
-            apply = getattr(plugin_obj, "_apply_quick_provider_defaults", None)
-            if callable(apply):
-                try:
-                    apply()
-                    logger.info("[ModelPanel] 已调 _apply_quick_provider_defaults 同步实例属性")
-                except Exception as e:
-                    logger.warning(f"[ModelPanel] _apply_quick_provider_defaults 调用失败: {e}")
-            else:
-                logger.warning("[ModelPanel] 陪伴插件未找到 _apply_quick_provider_defaults 方法，可能需要重启插件才能生效")
-        logger.info(f"[ModelPanel] /panel/companion/replace: 替换 {len(changed)} 处")
-        return {"ok": True, "changed_count": len(changed), "changed": changed}
+        # 把新 config 值同步到陪伴插件的运行时实例属性（关键：备用模型若不在这里
+        # 同步，陪伴插件 WebUI/运行逻辑会继续用 bootstrap 时的旧值）。
+        self._sync_companion_runtime()
+        main_count = sum(1 for c in changed if c.get("kind") != "fallback")
+        fb_count = sum(1 for c in changed if c.get("kind") == "fallback")
+        logger.info(
+            f"[ModelPanel] /panel/companion/replace: 替换 {len(changed)} 处"
+            f"（主模型 {main_count} / 备用 {fb_count}）"
+        )
+        return {
+            "ok": True,
+            "changed_count": len(changed),
+            "changed": changed,
+            "main_count": main_count,
+            "fallback_count": fb_count,
+        }
 
     # ---------------- 内部 ----------------
     async def _json_payload(self) -> dict:

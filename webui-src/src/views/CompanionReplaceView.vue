@@ -175,6 +175,7 @@ import {
   apiPost,
   type CompanionProviderItem,
   type CompanionProvidersResponse,
+  type CompanionReplaceResponse,
 } from "../api";
 
 const { t } = useI18n();
@@ -192,6 +193,8 @@ const refreshing = ref(false);
 const configMode = ref("");
 const configuredCount = ref(0);
 const totalKeys = ref(0);
+// 陪伴插件运行时实例属性是否与配置一致（false 表示它内存里还是旧值）
+const runtimeInSync = ref<boolean | null>(null);
 
 const detailVisible = ref(false);
 const detailModel = ref<{
@@ -332,16 +335,25 @@ async function save() {
   }
   saving.value = true;
   try {
-    const res = await apiPost<{ ok: boolean; changed_count: number; error?: string }>(
+    const res = await apiPost<CompanionReplaceResponse>(
       "/panel/companion/replace",
       { replacements: replacementsList },
     );
     if (res.ok) {
-      message.success(t("companion.saveSuccess", { n: res.changed_count }));
+      message.success(
+        t("companion.saveSuccess", {
+          n: res.changed_count ?? 0,
+          m: res.main_count ?? 0,
+          f: res.fallback_count ?? 0,
+        }),
+      );
       simpleReplacements.length = 0;
       advReplacements.length = 0;
       persistReplacements();
       await reload();
+      if (runtimeInSync.value === false) {
+        message.warning(t("companion.runtimeOutOfSync"));
+      }
     } else {
       message.error(t("companion.saveFail", { msg: res.error || "" }));
     }
@@ -360,6 +372,8 @@ async function reload() {
     configMode.value = data.config_mode || "";
     configuredCount.value = data.configured_count || 0;
     totalKeys.value = data.total_keys || 0;
+    runtimeInSync.value =
+      typeof data.runtime_in_sync === "boolean" ? data.runtime_in_sync : null;
   } catch (e) {
     loaded.value = false;
     console.error("加载陪伴插件配置失败", e);
