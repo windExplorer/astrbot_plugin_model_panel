@@ -322,6 +322,7 @@ class ModelPanelPlugin(Star):
             ("/panel/default_model", self.api_default_model, ["GET"]),
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
+            ("/panel/companion/set", self.api_companion_set, ["POST"]),
         ]
         for path, handler, methods in routes:
             self.context.register_web_api(
@@ -1127,9 +1128,28 @@ class ModelPanelPlugin(Star):
             f"已配置 {configured} 项, 模式={config_mode or '无'}, "
             f"备用模型运行时一致={runtime_in_sync}"
         )
+        # 总览：每个 key 一行，含主模型 + 备用模型的 provider id 与展示名，
+        # 供前端"总览"页直接罗列所有用途与当前模型，并支持未配置项直接下拉配置。
+        summary = []
+        for key, value in values.items():
+            main_id = str(value).strip()
+            main_model = model_map.get(main_id, main_id) if main_id else ""
+            fb_id = fallback_values.get(key, "")
+            fb_model = model_map.get(fb_id, fb_id) if fb_id else ""
+            summary.append({
+                "key": key,
+                "label": COMPANION_KEY_LABELS.get(key, key),
+                "main_provider_id": main_id,
+                "main_model": main_model,
+                "fallback_provider_id": fb_id,
+                "fallback_model": fb_model,
+                "configured": bool(main_id),
+            })
+
         return {
             "loaded": True,
             "items": items,
+            "summary": summary,
             "config_mode": config_mode,
             "configured_count": configured,
             "total_keys": len(COMPANION_PROVIDER_KEYS),
@@ -1222,6 +1242,59 @@ class ModelPanelPlugin(Star):
         fb_count = sum(1 for c in changed if c.get("kind") == "fallback")
         logger.info(
             f"[ModelPanel] /panel/companion/replace: 替换 {len(changed)} 处"
+            f"（主模型 {main_count} / 备用 {fb_count}）"
+        )
+        return {
+            "ok": True,
+            "changed_count": len(changed),
+            "changed": changed,
+            "main_count": main_count,
+            "fallback_count": fb_count,
+        }
+
+    async def api_companion_set(self) -> dict:
+        """直接设置某个 provider key 的模型（主模型 / 备用模型），无需按模型名匹配。
+
+        用于"总览"页：未配置项也能直接在下拉里选模型并保存。
+        - kind="main"：写回主模型位置（扁平 + model_assignment_config 分组同步）；
+        - kind="fallback"：写回 model_fallback_overrides（顶层 legacy flat key）；
+        - provider_id 为空字符串表示清除（置为未配置）。
+        """
+        payload = await self._json_payload()
+        items = payload.get("items") or []
+        if not isinstance(items, list):
+            return {"ok": False, "error": "items 必须为数组"}
+        cfg = self._companion_config()
+        if cfg is None:
+            return {"ok": False, "error": f"未找到插件 {COMPANION_PLUGIN_NAME}"}
+        changed = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = str(it.get("key") or "").strip()
+            if key not in COMPANION_PROVIDER_KEYS:
+                continue
+            pid = str(it.get("provider_id") or "").strip()
+            kind = str(it.get("kind") or "main").strip().lower()
+            if kind == "fallback":
+                self._set_companion_fallback(key, pid)
+                changed.append({"key": key, "kind": "fallback", "provider_id": pid})
+            else:
+                _flat_set(cfg, key, pid)
+                changed.append({"key": key, "kind": "main", "provider_id": pid})
+        try:
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 保存陪伴插件配置失败: {e}")
+            return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
+        # 同步运行时实例属性，保证陪伴插件页面/运行逻辑立刻生效
+        self._sync_companion_runtime()
+        main_count = sum(1 for c in changed if c.get("kind") != "fallback")
+        fb_count = sum(1 for c in changed if c.get("kind") == "fallback")
+        logger.info(
+            f"[ModelPanel] /panel/companion/set: 设置 {len(changed)} 处"
             f"（主模型 {main_count} / 备用 {fb_count}）"
         )
         return {

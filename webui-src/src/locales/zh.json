@@ -194,7 +194,17 @@
       "usageCount": "被引用次数",
       "usageKeys": "该模型在哪些场景使用",
       "allModels": "完整已使用模型清单"
-    }
+    },
+    "tabOverview": "总览",
+    "overviewExplain": "展示陪伴插件所有用途与当前模型；未配置的项可直接在主模型 / 备用模型下拉里选择并即时保存。",
+    "colUse": "用途",
+    "colMain": "主模型",
+    "colFallback": "备用模型",
+    "colStatus": "状态",
+    "configured": "已配置",
+    "unconfigured": "未配置",
+    "setSuccess": "已更新 {key} 的{type}",
+    "setFail": "更新失败：{msg}"
   },
   "settings": {
     "title": "检测配置",

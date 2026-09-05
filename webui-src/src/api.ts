@@ -222,14 +222,41 @@ export interface Overview {
   latest_results?: Record<string, TestResult>;
 }
 
+export interface CompanionSummaryItem {
+  key: string;
+  /** 中文标签（用途） */
+  label: string;
+  /** 主模型 provider id */
+  main_provider_id: string;
+  /** 主模型展示名（model 名） */
+  main_model: string;
+  /** 备用模型 provider id */
+  fallback_provider_id: string;
+  /** 备用模型展示名 */
+  fallback_model: string;
+  configured: boolean;
+}
+
 export interface CompanionProvidersResponse {
   loaded: boolean;
   items: CompanionProviderItem[];
+  /** 总览：每个用途一行，含主/备模型 */
+  summary?: CompanionSummaryItem[];
   config_mode?: string;
   configured_count?: number;
   total_keys?: number;
   /** 陪伴插件运行时（实例属性）的备用模型是否与配置一致 */
   runtime_in_sync?: boolean;
+}
+
+/** 直接设置陪伴插件某个 provider key 的模型（主/备），支持清除（provider_id 为空）。 */
+export async function apiCompanionSet(
+  items: { key: string; provider_id: string; kind?: string }[],
+) {
+  return apiPost<{ ok: boolean; changed_count: number; changed: any[] }>(
+    "/panel/companion/set",
+    { items },
+  );
 }
 
 export interface CompanionReplaceResponse {

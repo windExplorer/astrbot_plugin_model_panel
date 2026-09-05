@@ -194,7 +194,17 @@
       "usageCount": "参照回数",
       "usageKeys": "このモデルが使われているシナリオ",
       "allModels": "使用中モデルの全リスト"
-    }
+    },
+    "tabOverview": "概要",
+    "overviewExplain": "コンパニオンプラグインの全用途と現在のモデルを一覧表示します。未設定の項目もメイン/予備モデルのドロップダウンから直接選択して即時保存できます。",
+    "colUse": "用途",
+    "colMain": "メインモデル",
+    "colFallback": "予備モデル",
+    "colStatus": "状態",
+    "configured": "設定済み",
+    "unconfigured": "未設定",
+    "setSuccess": "{key} の{type}を更新しました",
+    "setFail": "更新失敗：{msg}"
   },
   "settings": {
     "title": "検出設定",

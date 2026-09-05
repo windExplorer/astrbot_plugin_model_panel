@@ -193,7 +193,17 @@
       "usageCount": "Reference count",
       "usageKeys": "Scenarios where this model is used",
       "allModels": "Full list of models in use"
-    }
+    },
+    "tabOverview": "Overview",
+    "overviewExplain": "Lists every companion-plugin purpose and its current model. Unconfigured entries can be set directly from the primary/fallback dropdown and saved instantly.",
+    "colUse": "Purpose",
+    "colMain": "Primary model",
+    "colFallback": "Fallback model",
+    "colStatus": "Status",
+    "configured": "Configured",
+    "unconfigured": "Not set",
+    "setSuccess": "Updated {key} ({type})",
+    "setFail": "Update failed: {msg}"
   },
   "settings": {
     "title": "Detection Settings",

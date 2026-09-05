@@ -22,6 +22,24 @@
         </n-space>
 
         <n-tabs type="line" class="mt-2">
+          <!-- Tab0：总览 —— 所有用途与模型一目了然，未配置项直接下拉配置 -->
+          <n-tab-pane name="overview" :tab="t('companion.tabOverview')">
+            <n-text depth="3" class="block">
+              {{ t("companion.overviewExplain") }}
+            </n-text>
+            <n-data-table
+              :columns="overviewColumns"
+              :data="summaryItems"
+              :pagination="false"
+              size="small"
+              :bordered="true"
+              :single-line="false"
+              :row-key="(row) => row.key"
+              :scroll-x="900"
+              class="mt-2"
+            />
+          </n-tab-pane>
+
           <!-- Tab1：精简配置（初心）—— 按模型名替换，不管主备位置 -->
           <n-tab-pane name="simple" :tab="t('companion.tabSimple')">
             <n-text depth="3" class="block">
@@ -173,9 +191,11 @@ import {
 import {
   apiGet,
   apiPost,
+  apiCompanionSet,
   type CompanionProviderItem,
   type CompanionProvidersResponse,
   type CompanionReplaceResponse,
+  type CompanionSummaryItem,
 } from "../api";
 
 const { t } = useI18n();
@@ -195,6 +215,8 @@ const configuredCount = ref(0);
 const totalKeys = ref(0);
 // 陪伴插件运行时实例属性是否与配置一致（false 表示它内存里还是旧值）
 const runtimeInSync = ref<boolean | null>(null);
+// 总览：每个用途一行（含主/备模型），支持未配置项直接下拉配置
+const summaryItems = ref<CompanionSummaryItem[]>([]);
 
 const detailVisible = ref(false);
 const detailModel = ref<{
@@ -374,6 +396,7 @@ async function reload() {
     totalKeys.value = data.total_keys || 0;
     runtimeInSync.value =
       typeof data.runtime_in_sync === "boolean" ? data.runtime_in_sync : null;
+    summaryItems.value = data.summary || [];
   } catch (e) {
     loaded.value = false;
     console.error("加载陪伴插件配置失败", e);
@@ -390,6 +413,28 @@ async function manualRefresh() {
     console.error(e);
   } finally {
     refreshing.value = false;
+  }
+}
+
+// 总览：直接设置某用途的主模型 / 备用模型（支持清除），即时保存。
+async function setOne(key: string, kind: "main" | "fallback", value: string) {
+  try {
+    const res = await apiCompanionSet([{ key, provider_id: value, kind }]);
+    if (res.ok) {
+      const typeLabel =
+        kind === "fallback" ? t("companion.kindFallback") : t("companion.kindMain");
+      message.success(t("companion.setSuccess", { key, type: typeLabel }));
+      await reload();
+      if (runtimeInSync.value === false) {
+        message.warning(t("companion.runtimeOutOfSync"));
+      }
+    } else {
+      message.error(t("companion.setFail", { msg: res.error || "" }));
+      await reload();
+    }
+  } catch (e: any) {
+    message.error(t("companion.setFail", { msg: e?.message || String(e) }));
+    await reload();
   }
 }
 
@@ -527,6 +572,52 @@ const unconfiguredColumns = computed<DataTableColumn<{ key: string; label: strin
     title: t("companion.colLabel"),
     key: "label",
     render: (row) => h(NText, { depth: 3 }, () => row.label),
+  },
+]);
+
+const overviewColumns = computed<DataTableColumn<CompanionSummaryItem>[]>(() => [
+  {
+    title: t("companion.colUse"),
+    key: "label",
+    minWidth: 200,
+    render: (row) => h(NText, { depth: 3 }, () => row.label),
+  },
+  {
+    title: t("companion.colMain"),
+    key: "main",
+    minWidth: 300,
+    render: (row) =>
+      h(NSelect, {
+        size: "small",
+        value: row.main_provider_id,
+        options: availableOptions(row.main_provider_id),
+        clearable: true,
+        placeholder: t("companion.selectNone"),
+        onUpdateValue: (v: string | null) => setOne(row.key, "main", v ?? ""),
+      }),
+  },
+  {
+    title: t("companion.colFallback"),
+    key: "fallback",
+    minWidth: 300,
+    render: (row) =>
+      h(NSelect, {
+        size: "small",
+        value: row.fallback_provider_id,
+        options: availableOptions(row.fallback_provider_id),
+        clearable: true,
+        placeholder: t("companion.selectNone"),
+        onUpdateValue: (v: string | null) => setOne(row.key, "fallback", v ?? ""),
+      }),
+  },
+  {
+    title: t("companion.colStatus"),
+    key: "configured",
+    minWidth: 110,
+    render: (row) =>
+      row.configured
+        ? h(NTag, { size: "small", type: "success", round: true, bordered: false }, () => t("companion.configured"))
+        : h(NTag, { size: "small", type: "warning", round: true, bordered: false }, () => t("companion.unconfigured")),
   },
 ]);
 
