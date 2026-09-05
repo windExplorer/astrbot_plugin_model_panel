@@ -1,7 +1,7 @@
 ﻿name: astrbot_plugin_model_panel
 display_name: 萌萌模型控制台
 author: local
-version: v1.2.0
+version: v1.2.1
 description: 自用的萌系模型管理与检测面板：全局 LLM 模型延迟/存活检测、分组一键测试、AstrBot 默认模型查看、伴侣插件（我会永远陪着你）精准模型一键替换。
 desc: 用最可爱的方式，快速更换“我会永远陪着你”的模型并检测可用性。
 short_desc: 萌系模型管理面板：模型检测与陪伴插件模型一键替换。
