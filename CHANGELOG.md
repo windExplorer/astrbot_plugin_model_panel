@@ -1,5 +1,13 @@
 # 更新日志
 
+## v1.2.2
+
+- metadata 信息修正：
+  - `author` 改为 GitHub 用户名 `windExplorer`（原 `local`）
+  - `category` 改为 `utilities`（工具类）。AstrBot 市场分类使用英文 key 枚举
+    （ai_tools / utilities / productivity / integrations / entertainment / other），
+    中文标签由 Dashboard 映射；原先填写的中文「AI 增强」无法被市场分类筛选正确归并
+
 ## v1.2.1
 
 - 回退对话模型列表视觉与交互重做（改为卡片化，解决"不够醒目、小家子气"）：
