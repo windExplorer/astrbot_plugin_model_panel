@@ -28,17 +28,7 @@
 
         <div class="field">
           <div class="label">{{ t("defaultModel.fallback") }}</div>
-          <n-select
-            v-model:value="fallbackIds"
-            :options="options"
-            multiple
-            filterable
-            clearable
-            :placeholder="t('defaultModel.fallbackPlaceholder')"
-          />
-          <div class="hint">
-            <n-text depth="3">{{ t("defaultModel.fallbackHint") }}</n-text>
-          </div>
+          <FallbackSortList v-model="fallbackIds" :options="items" />
         </div>
 
         <div class="field">
@@ -78,6 +68,7 @@ import {
   apiSetDefaultModel,
   type DefaultModelOption,
 } from "../api";
+import FallbackSortList from "../components/FallbackSortList.vue";
 
 const { t } = useI18n();
 const message = useMessage();
