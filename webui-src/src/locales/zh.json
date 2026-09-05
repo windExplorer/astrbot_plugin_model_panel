@@ -49,7 +49,19 @@
     "totalChecks": "累计检测条数",
     "totalSessions": "累计会话",
     "lastCheckAt": "最近检测时间",
-    "goDetect": "前往检测"
+    "goDetect": "前往检测",
+    "statTokens": "今日 Token",
+    "usageTitle": "Token 用量",
+    "usageToday": "今日用量",
+    "usageTotal": "累计用量",
+    "usageRequests": "今日请求次数",
+    "usageInput": "输入",
+    "usageOutput": "输出",
+    "usageCached": "缓存",
+    "usageTrend": "近 7 天用量",
+    "usageTopModels": "今日模型用量",
+    "usageNoData": "暂无用量数据",
+    "usageHint": "由插件在每次 LLM 调用后记录用量，仅统计启用本功能之后的数据"
   },
   "detect": {
     "title": "检测操作",

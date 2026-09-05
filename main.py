@@ -8,8 +8,9 @@ import time
 from typing import Any, Optional
 
 from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter as astr_filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.provider.entities import ProviderType
+from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
 from .storage import Storage
@@ -250,6 +251,8 @@ class ModelPanelPlugin(Star):
         self.config: Optional[Any] = config
         self.storage: Optional[Storage] = None
         self.sessions = SessionManager()
+        # 模型名 -> provider id 的缓存，避免每次 LLM 调用都枚举全部 provider
+        self._model_provider_cache: dict[str, str] = {}
         # 全局并发去重：同时只允许一个一键检测任务在跑
         self._test_all_lock = asyncio.Lock()
 
@@ -272,8 +275,85 @@ class ModelPanelPlugin(Star):
                 logger.info(f"[ModelPanel] 清理历史会话 {deleted} 条（> {retention} 天）")
         except Exception as e:
             logger.warning(f"[ModelPanel] 清理历史失败: {e}")
+        # 用量记录单独保留 90 天（趋势图需要按天数据，比检测历史保留更久）
+        try:
+            deleted_usage = await self.storage.cleanup_usage_older_than(90)
+            if deleted_usage:
+                logger.info(f"[ModelPanel] 清理用量记录 {deleted_usage} 条（> 90 天）")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 清理用量记录失败: {e}")
         self._register_routes()
         logger.info(f"[ModelPanel] 模型控制台插件已初始化（db={db_path}）")
+
+    # ---------------- LLM 用量采集 ----------------
+    @astr_filter.on_llm_response()
+    async def on_llm_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """统计每次 LLM 调用的 token 用量，写入本插件数据库供首页展示。
+
+        AstrBot 在每次 LLM 调用结束后触发。usage 为空（部分 provider 不上报用量）
+        或流式分片时跳过，避免重复计数。
+        """
+        try:
+            if self.storage is None:
+                return
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                return
+            if getattr(response, "is_chunk", False):
+                return
+            inp = int(getattr(usage, "input_other", 0) or 0)
+            cached = int(getattr(usage, "input_cached", 0) or 0)
+            out = int(getattr(usage, "output", 0) or 0)
+            total = int(getattr(usage, "total", 0) or (inp + cached + out))
+            if total <= 0:
+                return
+            model = self._usage_model_name(response)
+            await self.storage.record_usage(
+                model=model,
+                provider_id=self._provider_id_by_model(model),
+                input_tokens=inp,
+                cached_tokens=cached,
+                output_tokens=out,
+            )
+        except Exception as e:
+            # 统计失败绝不能影响正常对话
+            logger.debug(f"[ModelPanel] 记录 LLM 用量失败: {e}")
+
+    def _usage_model_name(self, response: Any) -> str:
+        """从响应的原始对象里尽量取出模型名（不同 provider 字段名不同）。"""
+        raw = getattr(response, "raw_completion", None)
+        if raw is None:
+            return ""
+        for attr in ("model", "model_name", "model_version"):
+            v = getattr(raw, attr, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        if isinstance(raw, dict):
+            for k in ("model", "model_name", "model_version"):
+                v = raw.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return ""
+
+    def _provider_id_by_model(self, model: str) -> str:
+        """按模型名反查 provider id（同名模型取第一个匹配，结果缓存）。"""
+        if not model:
+            return ""
+        if model in self._model_provider_cache:
+            return self._model_provider_cache[model]
+        pid = ""
+        try:
+            for p in self._chat_providers():
+                d = self._provider_display(p)
+                if str(d.get("model") or "").strip() == model:
+                    pid = str(d.get("id") or "")
+                    break
+        except Exception:
+            pid = ""
+        self._model_provider_cache[model] = pid
+        return pid
 
     # ---------------- 配置读取 ----------------
     def _test_config(self) -> dict[str, Any]:
@@ -795,8 +875,17 @@ class ModelPanelPlugin(Star):
     # ---------------- API ----------------
     async def api_overview(self) -> dict:
         providers = self._chat_providers()
-        ids = {p["id"] for p in (self._provider_display(p) for p in providers)}
+        displays = [self._provider_display(p) for p in providers]
+        ids = {d["id"] for d in displays}
         default_id = await self._default_provider_id()
+        # 默认模型的友好展示名（供应商 · 模型），避免前端只显示裸 provider id
+        default_label = ""
+        for d in displays:
+            if d.get("id") == default_id:
+                default_label = " · ".join(
+                    [x for x in (d.get("name") or "", d.get("model") or "") if x]
+                )
+                break
         stats: dict = {}
         latest_results: dict = {}
         try:
@@ -805,14 +894,22 @@ class ModelPanelPlugin(Star):
                 latest_results = await self.storage.latest_per_provider()
         except Exception as e:
             logger.warning(f"[ModelPanel] overview 统计失败: {e}")
+        usage = None
+        try:
+            if self.storage:
+                usage = await self.storage.usage_stats(days=7, top_models=5)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 用量统计失败: {e}")
         return {
             "total": len(providers),
             "default_provider_id": default_id,
+            "default_label": default_label,
             "default_set": bool(default_id and default_id in ids),
             "companion_loaded": self._companion_star() is not None,
             "companion_provider_count": sum(1 for v in self._companion_provider_values().values() if v),
             "history": stats,
             "latest_results": latest_results,
+            "usage": usage,
         }
 
     async def api_list_providers(self) -> dict:

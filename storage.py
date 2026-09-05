@@ -38,6 +38,7 @@ import asyncio
 import os
 import time
 import uuid
+from datetime import date, timedelta
 from typing import Any, Optional
 
 try:
@@ -87,6 +88,23 @@ CREATE TABLE IF NOT EXISTS detection_preferences (
     enabled         INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
+
+-- LLM 调用用量统计：由 on_llm_response 钩子写入，每行一次调用。
+-- day 为本地日期（YYYY-MM-DD），便于按天聚合。
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             INTEGER NOT NULL,
+    day            TEXT    NOT NULL,
+    provider_id    TEXT    NOT NULL DEFAULT '',
+    model          TEXT    NOT NULL DEFAULT '',
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    cached_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_tokens   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_day   ON llm_usage(day);
+CREATE INDEX IF NOT EXISTS idx_usage_model ON llm_usage(model);
 """
 
 
@@ -265,6 +283,135 @@ class Storage:
                 cur = await db.execute(
                     """DELETE FROM test_sessions WHERE finished_at IS NOT NULL AND finished_at < ?""",
                     (cutoff,),
+                )
+                await db.commit()
+                return cur.rowcount or 0
+
+    # ---------- LLM 用量统计 ----------
+    async def record_usage(
+        self,
+        model: str,
+        provider_id: str = "",
+        input_tokens: int = 0,
+        cached_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        """记录一次 LLM 调用的 token 用量。"""
+        await self.init()
+        now = int(time.time())
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        total = (
+            int(input_tokens or 0) + int(cached_tokens or 0) + int(output_tokens or 0)
+        )
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO llm_usage
+                       (ts, day, provider_id, model,
+                        input_tokens, cached_tokens, output_tokens, total_tokens)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        now,
+                        day,
+                        str(provider_id or ""),
+                        str(model or ""),
+                        int(input_tokens or 0),
+                        int(cached_tokens or 0),
+                        int(output_tokens or 0),
+                        total,
+                    ),
+                )
+                await db.commit()
+
+    async def usage_stats(self, days: int = 7, top_models: int = 5) -> dict:
+        """用量统计：今日 / 累计 / 近 N 天趋势 / 今日模型 TopN。"""
+        await self.init()
+        days = max(1, int(days or 7))
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        since = (date.fromisoformat(today) - timedelta(days=days - 1)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT COALESCE(SUM(total_tokens), 0) AS total,
+                          COALESCE(SUM(input_tokens), 0) AS inp,
+                          COALESCE(SUM(cached_tokens), 0) AS cached,
+                          COALESCE(SUM(output_tokens), 0) AS outp,
+                          COUNT(*) AS reqs
+                   FROM llm_usage WHERE day = ?""",
+                (today,),
+            )
+            t = await cur.fetchone()
+            cur = await db.execute(
+                """SELECT COALESCE(SUM(total_tokens), 0) AS total, COUNT(*) AS reqs
+                   FROM llm_usage"""
+            )
+            a = await cur.fetchone()
+            cur = await db.execute(
+                """SELECT day,
+                          COALESCE(SUM(total_tokens), 0) AS total,
+                          COUNT(*) AS reqs
+                   FROM llm_usage
+                   WHERE day >= ?
+                   GROUP BY day ORDER BY day ASC""",
+                (since,),
+            )
+            day_rows = await cur.fetchall()
+            cur = await db.execute(
+                """SELECT model, provider_id,
+                          COALESCE(SUM(total_tokens), 0) AS total,
+                          COUNT(*) AS reqs
+                   FROM llm_usage WHERE day = ?
+                   GROUP BY model, provider_id
+                   ORDER BY total DESC LIMIT ?""",
+                (today, int(top_models or 5)),
+            )
+            model_rows = await cur.fetchall()
+        by_day = {r["day"]: r for r in day_rows}
+        series: list[dict] = []
+        for i in range(days - 1, -1, -1):
+            d = (date.fromisoformat(today) - timedelta(days=i)).isoformat()
+            r = by_day.get(d)
+            series.append(
+                {
+                    "day": d,
+                    "total": int(r["total"] or 0) if r else 0,
+                    "requests": int(r["reqs"] or 0) if r else 0,
+                }
+            )
+        return {
+            "today": {
+                "total": int(t["total"] or 0),
+                "input": int(t["inp"] or 0),
+                "cached": int(t["cached"] or 0),
+                "output": int(t["outp"] or 0),
+                "requests": int(t["reqs"] or 0),
+            },
+            "total": {
+                "total": int(a["total"] or 0),
+                "requests": int(a["reqs"] or 0),
+            },
+            "by_day": series,
+            "by_model": [
+                {
+                    "model": r["model"] or "",
+                    "provider_id": r["provider_id"] or "",
+                    "total": int(r["total"] or 0),
+                    "requests": int(r["reqs"] or 0),
+                }
+                for r in model_rows
+            ],
+        }
+
+    async def cleanup_usage_older_than(self, days: int) -> int:
+        """清理 days 天前的用量记录。返回受影响行数。"""
+        if days <= 0:
+            return 0
+        await self.init()
+        cutoff = (date.today() - timedelta(days=int(days))).isoformat()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    "DELETE FROM llm_usage WHERE day < ?", (cutoff,)
                 )
                 await db.commit()
                 return cur.rowcount or 0

@@ -48,7 +48,19 @@
     "totalChecks": "Total checks",
     "totalSessions": "Total sessions",
     "lastCheckAt": "Last checked at",
-    "goDetect": "Go to Detection"
+    "goDetect": "Go to Detection",
+    "statTokens": "Tokens Today",
+    "usageTitle": "Token Usage",
+    "usageToday": "Today",
+    "usageTotal": "All time",
+    "usageRequests": "Requests today",
+    "usageInput": "Input",
+    "usageOutput": "Output",
+    "usageCached": "Cached",
+    "usageTrend": "Last 7 days",
+    "usageTopModels": "Top models today",
+    "usageNoData": "No usage data yet",
+    "usageHint": "Recorded by the plugin after each LLM call; only data since this feature was enabled"
   },
   "detect": {
     "title": "Detection",

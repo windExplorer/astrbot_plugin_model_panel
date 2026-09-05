@@ -49,7 +49,19 @@
     "totalChecks": "累計検出",
     "totalSessions": "累計セッション",
     "lastCheckAt": "最終検出時刻",
-    "goDetect": "検出ページへ"
+    "goDetect": "検出ページへ",
+    "statTokens": "本日のトークン",
+    "usageTitle": "トークン使用量",
+    "usageToday": "本日",
+    "usageTotal": "累計",
+    "usageRequests": "本日のリクエスト",
+    "usageInput": "入力",
+    "usageOutput": "出力",
+    "usageCached": "キャッシュ",
+    "usageTrend": "直近 7 日間",
+    "usageTopModels": "本日のモデル別",
+    "usageNoData": "使用量データはありません",
+    "usageHint": "プラグインが LLM 呼び出しごとに記録します（有効化以降のデータのみ）"
   },
   "detect": {
     "title": "検出操作",

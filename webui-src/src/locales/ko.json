@@ -49,7 +49,19 @@
     "totalChecks": "누적 감지",
     "totalSessions": "누적 세션",
     "lastCheckAt": "최근 감지 시각",
-    "goDetect": "감지 페이지로"
+    "goDetect": "감지 페이지로",
+    "statTokens": "오늘 토큰",
+    "usageTitle": "토큰 사용량",
+    "usageToday": "오늘",
+    "usageTotal": "누적",
+    "usageRequests": "오늘 요청 수",
+    "usageInput": "입력",
+    "usageOutput": "출력",
+    "usageCached": "캐시",
+    "usageTrend": "최근 7일",
+    "usageTopModels": "오늘 모델별 사용량",
+    "usageNoData": "사용량 데이터 없음",
+    "usageHint": "플러그인이 LLM 호출마다 기록합니다(활성화 이후 데이터만 집계)"
   },
   "detect": {
     "title": "감지 작업",

@@ -212,14 +212,47 @@ export interface OverviewHistory {
   } | null;
 }
 
+export interface UsageToday {
+  total: number;
+  input: number;
+  cached: number;
+  output: number;
+  requests: number;
+}
+
+export interface UsageDayPoint {
+  /** 本地日期 YYYY-MM-DD */
+  day: string;
+  total: number;
+  requests: number;
+}
+
+export interface UsageModelRow {
+  model: string;
+  provider_id: string;
+  total: number;
+  requests: number;
+}
+
+export interface UsageStats {
+  today: UsageToday;
+  total: { total: number; requests: number };
+  by_day: UsageDayPoint[];
+  by_model: UsageModelRow[];
+}
+
 export interface Overview {
   total: number;
   default_provider_id: string;
+  /** 默认模型的友好展示名（供应商 · 模型） */
+  default_label?: string;
   default_set: boolean;
   companion_loaded: boolean;
   companion_provider_count: number;
   history?: OverviewHistory;
   latest_results?: Record<string, TestResult>;
+  /** LLM 用量统计（插件未记录到数据时为 null） */
+  usage?: UsageStats | null;
 }
 
 export interface CompanionSummaryItem {
