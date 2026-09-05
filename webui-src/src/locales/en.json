@@ -24,7 +24,8 @@
     "dashboard": "Dashboard",
     "detect": "Detection",
     "defaultModel": "Default Model",
-    "companion": "Companion"
+    "companion": "Companion",
+    "settings": "Settings"
   },
   "dashboard": {
     "statTotal": "LLM Models",
@@ -128,17 +129,19 @@
     "testingFail": "Test all failed: {msg}",
     "detailTitle": "Detection result details",
     "detailViewBtn": "View details",
-    "detail.openRaw": "Click error_code to view full JSON",
-    "detail.noResult": "This model has no detection result yet",
-    "detail.id": "Provider ID",
-    "detail.checked_at": "Checked at",
-    "detail.ok": "Result",
-    "detail.latency_ms": "Latency (ms)",
-    "detail.error_code": "Error code",
-    "detail.error": "Error message",
-    "detail.retry_count": "Retry count",
-    "detail.skipped": "Skipped",
-    "detail.rawJson": "Raw response (JSON)",
+    "detail": {
+      "openRaw": "Click error_code to view full JSON",
+      "noResult": "This model has no detection result yet",
+      "id": "Provider ID",
+      "checked_at": "Checked at",
+      "ok": "Result",
+      "latency_ms": "Latency (ms)",
+      "error_code": "Error code",
+      "error": "Error message",
+      "retry_count": "Retry count",
+      "skipped": "Skipped",
+      "rawJson": "Raw response (JSON)"
+    },
     "result": {
       "ok": "OK",
       "fail": "Failed",
@@ -260,8 +263,5 @@
     "tipLine1": "Settings are written to the plugin _conf_schema immediately (also visible in AstrBot config UI).",
     "tipLine2": "Timeout and retry affect each model's latency and success rate in Test All.",
     "tipLine3": "Scheduled checks and alert thresholds will be added here later."
-  },
-  "nav": {
-    "settings": "Settings"
   }
 }

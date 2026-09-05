@@ -706,69 +706,15 @@ function onVisibility() {
 }
 </script>
 
-<style scoped>
-.companion-view {
-  display: flex;
-  flex-direction: column;
-}
-.toolbar {
-  margin-bottom: 8px;
-}
-.empty {
-  padding: 20px 0;
-}
-.mt-2 {
-  margin-top: 8px;
-}
-.mt-3 {
-  margin-top: 12px;
-}
-.block {
-  display: block;
-  margin-bottom: 6px;
-}
-.raw-title {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 6px;
-}
-/* 弹窗尺寸控制：
-   n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
-   会让 modal 在内容较少时也撑满 viewport（关闭按钮被推到顶部之外）。
-   这里覆盖 .n-modal / .n-modal-scroll-content / .n-card 三个层级，
-   让 modal 自适应内容高度且上限为 viewport - 64px，
-   内容区溢出滚动，关闭按钮始终可见。 */
-.companion-view :deep(.n-modal-scroll-content) {
-  min-height: auto !important;
-}
-.companion-view :deep(.n-modal) {
-  max-height: calc(100vh - 64px);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.companion-view :deep(.n-card) {
-  max-height: calc(100vh - 64px);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-/* naive-ui .n-card 默认 .n-card__content 只有 flex: 1, min-width: 0,
-   缺少 min-height: 0 + overflow-y: auto，导致内容溢出时撑高整个 card。
-   这里补齐。 */
-.companion-view :deep(.n-card__content) {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-</style>
-
 <style>
-/* 全局弹窗尺寸控制：n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
+/* 弹窗尺寸控制（注意：n-modal 会 teleport 到 body，不在 .companion-view 内，
+   scoped + :deep 管不到弹窗，只能用全局样式）：
+   n-modal 默认 .n-modal-scroll-content 有 min-height: 100%，
    会让 modal 在内容较少时也撑满 viewport。这里覆盖 .n-modal / .n-card /
    .n-card__content 三个层级，让 modal 自适应内容高度且上限为 viewport-64px，
-   内容区溢出滚动，关闭按钮始终可见。 */
+   内容区溢出滚动，关闭按钮始终可见。
+   注意不要给页面主体的 .n-card 加类似规则——主体卡片应随内容自然增高，
+   由 .content-body 统一滚动。 */
 .n-modal-scroll-content {
   min-height: auto !important;
 }
