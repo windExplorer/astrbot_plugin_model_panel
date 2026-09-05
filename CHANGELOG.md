@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.0.0
+
+- 默认模型页升级为**可配置**（此前只是只读展示），支持三项：
+  1. 默认对话模型：下拉选择，留空则由 AstrBot 使用第一个可用模型
+  2. 回退对话模型列表：多选并按顺序保存，主模型请求失败时依次切换
+  3. 默认图片转述模型：下拉选择，留空表示不使用图片转述
+- 兼容新旧两套 AstrBot 配置结构：新版写入
+  `agent_runner.config.model.provider_id` / `fallback_provider_ids`，
+  同时镜像旧键 `provider_settings.default_provider_id` / `fallback_chat_models`，
+  旧版 AstrBot 也能正常生效；读取时同样新旧择优
+- 保存后同步 provider_manager 的 `default_chat_provider_id` 运行时快照
+  （该属性是加载时快照，不随配置改动刷新），改完即时生效
+- 页面展示「当前实际生效」的对话模型，便于核对配置是否真的落到了运行时
+- 版本进入 1.0.0
+
 ## v0.6.12
 
 - 陪伴插件新增「总览」页：列出所有用途（key）与当前主模型 / 备用模型，一眼看清每个场景配了什么模型

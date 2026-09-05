@@ -320,6 +320,8 @@ class ModelPanelPlugin(Star):
             ("/panel/config", self.api_get_config, ["GET"]),
             ("/panel/config", self.api_set_config, ["POST"]),
             ("/panel/default_model", self.api_default_model, ["GET"]),
+            ("/panel/default_model/config", self.api_default_model_config, ["GET"]),
+            ("/panel/default_model/set", self.api_default_model_set, ["POST"]),
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
             ("/panel/companion/set", self.api_companion_set, ["POST"]),
@@ -644,6 +646,151 @@ class ModelPanelPlugin(Star):
         except Exception:
             pass
         return self._default_provider_id_sync()
+
+    # ---------------- 默认模型配置（对话 / 回退 / 图片转述） ----------------
+    def _astrbot_config(self):
+        """返回 AstrBot 主配置（AstrBotConfig，dict 子类，含 save_config()）。"""
+        try:
+            return self.context.get_config()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 读取 AstrBot 主配置失败: {e}")
+            return None
+
+    def _provider_ids(self) -> list:
+        """所有已加载 provider 的 id，用于校验写入值是否真实存在。"""
+        ids = []
+        for p in self._chat_providers():
+            try:
+                pid = str(self._provider_display(p).get("id") or "").strip()
+            except Exception:
+                pid = ""
+            if pid and pid not in ids:
+                ids.append(pid)
+        return ids
+
+    def _ids_from_legacy_fallback(self, raw: list, known) -> list:
+        """把旧配置 fallback_chat_models（model 名或 provider id）映射成 provider id。"""
+        model_map = {}
+        for p in self._chat_providers():
+            try:
+                d = self._provider_display(p)
+            except Exception:
+                continue
+            pid = str(d.get("id") or "").strip()
+            model = str(d.get("model") or "").strip()
+            if pid and model:
+                model_map.setdefault(model, pid)
+        ids = []
+        for v in raw:
+            s = str(v).strip()
+            if not s:
+                continue
+            pid = s if s in known else model_map.get(s, "")
+            if pid and pid not in ids:
+                ids.append(pid)
+        return ids
+
+    def _default_model_state(self, known=None) -> dict:
+        """读取 默认对话模型 / 回退对话模型列表 / 默认图片转述模型。
+
+        新版（Agent Runner，config_version>=3）：
+            agent_runner.config.model.provider_id
+            agent_runner.config.model.fallback_provider_ids
+        旧版（legacy）：
+            provider_settings.default_provider_id
+            provider_settings.fallback_chat_models
+        图片转述两版一致：provider_settings.default_image_caption_provider_id
+        """
+        if known is None:
+            known = set(self._provider_ids())
+        chat_id = ""
+        fallback_ids: list = []
+        vision_id = ""
+        runner_type = ""
+        new_style = False
+        cfg = self._astrbot_config()
+        if isinstance(cfg, dict):
+            ps = cfg.get("provider_settings")
+            ps = ps if isinstance(ps, dict) else {}
+            ar = cfg.get("agent_runner")
+            if isinstance(ar, dict) and isinstance(ar.get("config"), dict):
+                runner_type = str(ar.get("runner_type") or "")
+                mc = ar["config"].get("model")
+                if isinstance(mc, dict):
+                    new_style = True
+                    chat_id = str(mc.get("provider_id") or "").strip()
+                    raw = mc.get("fallback_provider_ids")
+                    if isinstance(raw, list):
+                        fallback_ids = [str(x).strip() for x in raw if str(x).strip()]
+            if not chat_id:
+                chat_id = str(ps.get("default_provider_id") or "").strip()
+            if not fallback_ids:
+                raw = ps.get("fallback_chat_models")
+                if isinstance(raw, list):
+                    fallback_ids = self._ids_from_legacy_fallback(raw, known)
+            vision_id = str(ps.get("default_image_caption_provider_id") or "").strip()
+        return {
+            "chat_provider_id": chat_id,
+            "fallback_provider_ids": fallback_ids,
+            "vision_provider_id": vision_id,
+            "runner_type": runner_type,
+            "new_style": new_style,
+        }
+
+    def _set_chat_provider_id(self, cfg, pid: str) -> bool:
+        """写入默认对话模型：新版 agent_runner 与旧键同时写，保证两个版本都生效。"""
+        changed = False
+        ps = cfg.get("provider_settings")
+        if not isinstance(ps, dict):
+            ps = {}
+            cfg["provider_settings"] = ps
+        ar = cfg.get("agent_runner")
+        if isinstance(ar, dict) and isinstance(ar.get("config"), dict):
+            mc = ar["config"].get("model")
+            if not isinstance(mc, dict):
+                mc = {}
+                ar["config"]["model"] = mc
+            if str(mc.get("provider_id") or "") != pid:
+                mc["provider_id"] = pid
+                changed = True
+        if str(ps.get("default_provider_id") or "") != pid:
+            ps["default_provider_id"] = pid
+            changed = True
+        return changed
+
+    def _set_fallback_ids(self, cfg, ids: list) -> bool:
+        """写入回退对话模型列表（有序 provider id），新旧键同时写。"""
+        changed = False
+        ps = cfg.get("provider_settings")
+        if not isinstance(ps, dict):
+            ps = {}
+            cfg["provider_settings"] = ps
+        ar = cfg.get("agent_runner")
+        if isinstance(ar, dict) and isinstance(ar.get("config"), dict):
+            mc = ar["config"].get("model")
+            if not isinstance(mc, dict):
+                mc = {}
+                ar["config"]["model"] = mc
+            if [str(x) for x in (mc.get("fallback_provider_ids") or [])] != ids:
+                mc["fallback_provider_ids"] = list(ids)
+                changed = True
+        if [str(x) for x in (ps.get("fallback_chat_models") or [])] != ids:
+            ps["fallback_chat_models"] = list(ids)
+            changed = True
+        return changed
+
+    def _sync_default_chat_runtime(self, chat_id: str) -> None:
+        """同步 provider_manager 的 default_chat_provider_id。
+
+        该属性在 provider 加载时快照一次，改配置不会自动刷新；虽然每次请求
+        会重新解析配置，但显式同步可让依赖该属性的逻辑立刻生效。
+        """
+        try:
+            pm = self.context.provider_manager
+            if pm is not None and hasattr(pm, "default_chat_provider_id"):
+                pm.default_chat_provider_id = chat_id
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 同步默认对话模型运行时失败: {e}")
 
     # ---------------- API ----------------
     async def api_overview(self) -> dict:
@@ -1058,6 +1205,109 @@ class ModelPanelPlugin(Star):
 
     async def api_default_model(self) -> dict:
         return {"default_provider_id": await self._default_provider_id()}
+
+    async def api_default_model_config(self) -> dict:
+        """默认模型配置：对话模型 / 回退列表 / 图片转述模型 + 可选模型列表。"""
+        known = set(self._provider_ids())
+        state = self._default_model_state(known)
+        items = []
+        for p in self._chat_providers():
+            try:
+                d = self._provider_display(p)
+            except Exception:
+                continue
+            pid = str(d.get("id") or "").strip()
+            if not pid:
+                continue
+            items.append(
+                {
+                    "id": pid,
+                    "name": str(d.get("name") or ""),
+                    "model": str(d.get("model") or ""),
+                    "type": str(d.get("type") or ""),
+                }
+            )
+        effective_id = await self._default_provider_id()
+        logger.info(
+            f"[ModelPanel] /panel/default_model/config: 对话={state['chat_provider_id'] or '无'}, "
+            f"回退={len(state['fallback_provider_ids'])} 个, "
+            f"图片转述={state['vision_provider_id'] or '无'}, 可选模型 {len(items)} 个"
+        )
+        return {
+            "ok": True,
+            "items": items,
+            "effective_chat_provider_id": effective_id,
+            **state,
+        }
+
+    async def api_default_model_set(self) -> dict:
+        """保存默认模型配置。只处理传入的字段，缺省字段保持原值。
+
+        body: {
+          "chat_provider_id": str,        # 空字符串 = 清除（由 AstrBot 选第一个）
+          "fallback_provider_ids": [str], # 有序，空数组 = 清空
+          "vision_provider_id": str,      # 空字符串 = 不使用图片转述
+        }
+        """
+        payload = await self._json_payload()
+        cfg = self._astrbot_config()
+        if not isinstance(cfg, dict):
+            return {"ok": False, "error": "无法读取 AstrBot 主配置"}
+        known = set(self._provider_ids())
+        changed: list = []
+
+        def _pid(v) -> str:
+            return str(v or "").strip()
+
+        if "chat_provider_id" in payload:
+            pid = _pid(payload.get("chat_provider_id"))
+            if pid and known and pid not in known:
+                return {"ok": False, "error": f"未知的对话模型: {pid}"}
+            if self._set_chat_provider_id(cfg, pid):
+                changed.append("chat_provider_id")
+
+        if "fallback_provider_ids" in payload:
+            raw = payload.get("fallback_provider_ids")
+            if raw is not None and not isinstance(raw, list):
+                return {"ok": False, "error": "fallback_provider_ids 必须为数组"}
+            ids: list = []
+            for x in raw or []:
+                pid = _pid(x)
+                if not pid:
+                    continue
+                if known and pid not in known:
+                    return {"ok": False, "error": f"未知的回退模型: {pid}"}
+                if pid not in ids:
+                    ids.append(pid)
+            if self._set_fallback_ids(cfg, ids):
+                changed.append("fallback_provider_ids")
+
+        if "vision_provider_id" in payload:
+            pid = _pid(payload.get("vision_provider_id"))
+            if pid and known and pid not in known:
+                return {"ok": False, "error": f"未知的图片转述模型: {pid}"}
+            ps = cfg.get("provider_settings")
+            if not isinstance(ps, dict):
+                ps = {}
+                cfg["provider_settings"] = ps
+            if str(ps.get("default_image_caption_provider_id") or "").strip() != pid:
+                ps["default_image_caption_provider_id"] = pid
+                changed.append("vision_provider_id")
+
+        state = self._default_model_state(known)
+        if not changed:
+            return {"ok": True, "changed": [], "no_change": True, **state}
+        try:
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 保存默认模型配置失败: {e}")
+            return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
+        # provider_manager 的 default_chat_provider_id 是加载时快照，显式同步让改动立刻可见
+        self._sync_default_chat_runtime(state.get("chat_provider_id", ""))
+        logger.info(f"[ModelPanel] /panel/default_model/set: 已更新 {changed}")
+        return {"ok": True, "changed": changed, **state}
 
     async def api_companion_providers(self) -> dict:
         cfg = self._companion_config()

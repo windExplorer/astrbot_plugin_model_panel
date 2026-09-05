@@ -148,9 +148,23 @@
     }
   },
   "defaultModel": {
-    "title": "AstrBot Current Default Model",
-    "notSet": "Default model not set",
-    "note": "Read-only display. Switching the default model will be added in a future version."
+    "title": "Default Model Config",
+    "chat": "Default Chat Model",
+    "chatPlaceholder": "Leave empty to use the first available model",
+    "chatHint": "The chat model used by default for user messages.",
+    "fallback": "Fallback Chat Models",
+    "fallbackPlaceholder": "Select fallback models (multi-select)",
+    "fallbackHint": "Tried in this order when the primary model request fails.",
+    "vision": "Default Image Caption Model",
+    "visionPlaceholder": "Leave empty to disable image captioning",
+    "visionHint": "Converts images to text when the chat model is not multimodal.",
+    "save": "Save",
+    "saved": "Saved",
+    "noChange": "No changes",
+    "saveFail": "Save failed{msg}",
+    "refreshed": "Refreshed",
+    "loadFail": "Failed to load default model config",
+    "effective": "Currently active"
   },
   "companion": {
     "title": "Companion Plugin Precision Model Config",

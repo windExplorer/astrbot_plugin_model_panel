@@ -259,6 +259,54 @@ export async function apiCompanionSet(
   );
 }
 
+// ---------- 默认模型配置（对话 / 回退 / 图片转述） ----------
+export interface DefaultModelOption {
+  id: string;
+  name: string;
+  model: string;
+  type: string;
+}
+
+export interface DefaultModelConfig {
+  ok?: boolean;
+  /** 默认对话模型 provider id */
+  chat_provider_id: string;
+  /** 回退对话模型 provider id 列表（有序，按顺序切换） */
+  fallback_provider_ids: string[];
+  /** 默认图片转述模型 provider id，空表示不使用 */
+  vision_provider_id: string;
+  /** 新版 Agent Runner 类型（runner_type） */
+  runner_type?: string;
+  /** 是否为新版 Agent Runner 配置结构 */
+  new_style?: boolean;
+  /** 可选模型列表 */
+  items: DefaultModelOption[];
+  /** 运行时实际生效的对话模型（配置失效时可能回退到第一个） */
+  effective_chat_provider_id?: string;
+}
+
+export async function apiGetDefaultModelConfig() {
+  return apiGet<DefaultModelConfig>("/panel/default_model/config");
+}
+
+export interface DefaultModelSetResult {
+  ok: boolean;
+  error?: string;
+  changed?: string[];
+  no_change?: boolean;
+  chat_provider_id: string;
+  fallback_provider_ids: string[];
+  vision_provider_id: string;
+}
+
+export async function apiSetDefaultModel(payload: {
+  chat_provider_id?: string | null;
+  fallback_provider_ids?: string[];
+  vision_provider_id?: string | null;
+}) {
+  return apiPost<DefaultModelSetResult>("/panel/default_model/set", payload);
+}
+
 export interface CompanionReplaceResponse {
   ok: boolean;
   changed_count?: number;
