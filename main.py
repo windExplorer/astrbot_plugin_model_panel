@@ -462,14 +462,17 @@ class ModelPanelPlugin(Star):
             return {}
         values: dict[str, str] = {}
         for key in COMPANION_PROVIDER_KEYS:
-            raw = None
+            raw = _MISSING
             try:
                 # 用与陪伴插件一致的 _flat_get：优先 schema 分组嵌套值，
                 # 避免读到顶层 legacy 扁平副本与真实值不一致。
+                # 注意 _flat_get 找不到配置项时会返回哨兵 _MISSING（一个
+                # object 实例），不能用 `if raw` 判空，否则会被当成真值而
+                # str() 出 "<object object at 0x...>"。必须显式排除 _MISSING。
                 raw = _flat_get(cfg, key)
             except Exception:
-                raw = None
-            values[key] = str(raw).strip() if raw else ""
+                raw = _MISSING
+            values[key] = str(raw).strip() if (raw is not _MISSING and raw) else ""
         return values
 
     # 陪伴插件"备用模型"配置：model_fallback_overrides，值为 {provider_key: 备用 provider_id}
