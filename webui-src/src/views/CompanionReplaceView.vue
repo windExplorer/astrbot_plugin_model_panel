@@ -311,13 +311,21 @@ function availableOptions(value: string): { label: string; value: string }[] {
     label: modelLabel(p),
     value: p.id,
   }));
+  // 不同 provider 渠道可能配置同一个模型（同名模型）：label（vendor · model）会重复，
+  // 给重复的 label 附加 provider id，让每个渠道都可区分。
+  const labelCount = new Map<string, number>();
+  for (const o of opts) labelCount.set(o.label, (labelCount.get(o.label) || 0) + 1);
   // 去重（按 provider id）
   const seen = new Set<string>();
-  const dedup = opts.filter((o) => {
-    if (seen.has(o.value)) return false;
-    seen.add(o.value);
-    return true;
-  });
+  const dedup = opts
+    .filter((o) => {
+      if (seen.has(o.value)) return false;
+      seen.add(o.value);
+      return true;
+    })
+    .map((o) =>
+      (labelCount.get(o.label) || 0) > 1 ? { ...o, label: `${o.label} · ${o.value}` } : o,
+    );
   // 如果原值不在列表里（如旧版缓存），加在最前面
   if (value && !seen.has(value)) {
     dedup.unshift({ label: value, value });

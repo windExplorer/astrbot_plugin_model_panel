@@ -1,5 +1,16 @@
 # 更新日志
 
+## v1.2.5
+
+- 修复陪伴插件页模型选择在**同名模型**场景下只显示一个提供商的问题：
+  不同 provider 渠道配置同一个模型名（如两个 openai 中转都用 `gpt-4o`）时，
+  后端 `/panel/providers` 构建 `provider_models` 按 model 名去重，
+  只保留第一个渠道，其余渠道在下拉里消失（默认模型页不受影响，
+  它直接使用全量 provider 列表）
+  - 后端：`provider_models` 改为每个 provider 一条、全量返回（不按 model 去重）
+  - 前端：下拉对重复的 label（vendor · model 相同）附加 provider id 后缀，
+    保证每个渠道都可区分；写回值仍是 provider id，与陪伴插件配置直接匹配
+
 ## v1.2.4
 
 - 修复多语言缺 key 导致界面显示原始 key 的问题：

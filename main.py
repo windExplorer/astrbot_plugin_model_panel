@@ -926,16 +926,19 @@ class ModelPanelPlugin(Star):
                 seen_models[model] = {"id": d["id"], "name": d.get("name") or ""}
         # models: 去重后的纯 model 名列表（兼容旧前端）
         models = list(seen_models.keys())
-        # provider_models: 去重后的 {model, vendor, id} 列表。
+        # provider_models: 全量 {model, vendor, id} 列表，每个 provider 一条、不按 model 去重。
         # 新前端下拉用 vendor · model 作 label、provider id 作 value，
         # 因为陪伴插件 config 里存的是 provider id，必须写回 provider id 才能匹配上。
+        # 不同 provider 渠道可能配置同一个 model（同名模型）：
+        # 这里若按 model 去重，同名模型的其它渠道会在陪伴插件页下拉里消失。
         provider_models = [
-            {"model": m, "vendor": seen_models[m]["name"], "id": seen_models[m]["id"]}
-            for m in models
+            {"id": d["id"], "model": d.get("model") or "", "vendor": d.get("name") or ""}
+            for d in items
+            if d.get("model")
         ]
         logger.info(
             f"[ModelPanel] /panel/providers 返回 {len(items)} 个 provider, "
-            f"{len(models)} 个去重模型, 默认={default_id or '无'}"
+            f"{len(provider_models)} 个模型选项, 默认={default_id or '无'}"
         )
         return {
             "items": items,
