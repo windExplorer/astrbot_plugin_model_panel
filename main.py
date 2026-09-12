@@ -355,6 +355,109 @@ class ModelPanelPlugin(Star):
         self._model_provider_cache[model] = pid
         return pid
 
+    # ---------------- 隐藏指令：/陪伴分数 ----------------
+    # 只读查询陪伴插件用户记录里的好感度快照；不写陪伴插件任何状态。
+    _AFFINITY_STAGES: tuple[tuple[int, str], ...] = (
+        (900, "亲密"),
+        (600, "亲近"),
+        (200, "熟悉"),
+        (0, "初识"),
+        (-400, "疏离"),
+        (-800, "强烈疏离"),
+    )
+
+    @classmethod
+    def _affinity_stage_label(cls, score: int) -> str:
+        if score >= 1200:
+            return "深度联结"
+        for minimum, label in cls._AFFINITY_STAGES:
+            if score >= minimum:
+                return label
+        return "极度疏离"
+
+    @staticmethod
+    def _find_affinity_record(users: dict, sender: str) -> Optional[dict]:
+        direct = users.get(sender)
+        if isinstance(direct, dict):
+            return direct
+        for item in users.values():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("user_id") or "").strip() == sender:
+                return item
+            aliases = item.get("alias_user_ids")
+            if isinstance(aliases, list) and sender in {str(a).strip() for a in aliases}:
+                return item
+        # 兜底：按私聊 umo 结尾匹配（如 aiocqhttp:FriendMessage:12345）
+        suffix = ":" + sender
+        for item in users.values():
+            if not isinstance(item, dict):
+                continue
+            umo = str(item.get("umo") or item.get("last_inbound_umo") or "")
+            if umo.endswith(suffix):
+                return item
+        return None
+
+    async def _companion_affinity_record(self, sender_id: str) -> Optional[dict]:
+        star = self._companion_star()
+        if star is None:
+            return None
+        plugin_obj = getattr(star, "star_cls", None) or getattr(star, "instance", None) or star
+        data = getattr(plugin_obj, "data", None)
+        if not isinstance(data, dict):
+            return None
+        users = data.get("users")
+        if not isinstance(users, dict):
+            return None
+        sender = str(sender_id or "").strip()
+        if not sender:
+            return None
+        lock = getattr(plugin_obj, "_data_lock", None)
+        if isinstance(lock, asyncio.Lock):
+            async with lock:
+                return self._find_affinity_record(users, sender)
+        return self._find_affinity_record(users, sender)
+
+    @astr_filter.command("陪伴分数")
+    async def cmd_companion_affinity(self, event: AstrMessageEvent):
+        """隐藏指令：查询自己在陪伴插件中的好感度分数与更新时间（私聊群聊均可用）。"""
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            sender_id = ""
+        if not sender_id:
+            yield event.plain_result("暂时拿不到你的身份信息，稍后再试试吧～")
+            return
+        if self._companion_star() is None:
+            yield event.plain_result("陪伴插件还没加载，暂时查不到好感度哦～")
+            return
+        record = await self._companion_affinity_record(sender_id)
+        if record is None:
+            yield event.plain_result("还没有你的好感度记录，和 bot 聊聊天就会有啦～")
+            return
+        try:
+            score = int(record.get("relationship_score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        score = max(-1200, min(1200, score))
+        updated_text = "暂无互动记录"
+        try:
+            ts = float(record.get("relationship_last_effective_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts > 0:
+            updated_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        extra = ""
+        if str(record.get("relationship_mode") or "").strip().lower() == "owner_exclusive":
+            extra = "\n状态：专属联结（分数已冻结）"
+        elif str(record.get("relationship_role") or "").strip().lower() == "owner":
+            extra = "\n身份：主要用户"
+        yield event.plain_result(
+            f"💕 好感度查询\n"
+            f"当前分数：{score}（{self._affinity_stage_label(score)}）{extra}\n"
+            f"更新时间：{updated_text}"
+        )
+
     # ---------------- 配置读取 ----------------
     def _test_config(self) -> dict[str, Any]:
         """从插件 config 读取检测参数；字段不存在则用默认值。"""
