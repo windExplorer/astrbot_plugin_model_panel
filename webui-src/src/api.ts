@@ -292,6 +292,115 @@ export async function apiCompanionSet(
   );
 }
 
+// ---------- 全插件模型配置（扫描 / 改写） ----------
+/** provider 类型：chat=对话模型 tts=语音合成 stt=语音识别 embedding=向量 */
+export type ProviderKind = "chat" | "tts" | "stt" | "embedding" | "";
+
+/** 某个已加载 provider（"更换为"下拉的选项来源） */
+export interface PluginModelProvider {
+  id: string;
+  kind: ProviderKind;
+  type: string;
+  model: string;
+  vendor: string;
+  label: string;
+}
+
+/** 扫描到的一处模型配置 */
+export interface PluginModelEntry {
+  /** 配置路径（字符串键与整数下标混合） */
+  path: (string | number)[];
+  /** JSON 字符串映射的容器路径（如陪伴插件 model_fallback_overrides），无则 null */
+  container: (string | number)[] | null;
+  key: string;
+  /** 人类可读路径，如 model_assignment_config.LLM_PROVIDER_ID */
+  path_display: string;
+  /** 用途名（优先取 schema description） */
+  label: string;
+  /** schema hint */
+  hint?: string;
+  /** 配置里当前存的原始值 */
+  value: string;
+  /** 值对应的 provider id（命中时非空） */
+  provider_id: string;
+  /** 值是否命中了已加载的 provider / 模型名 */
+  resolved: boolean;
+  /** 识别来源：schema_special / provider_id / model / key_hint */
+  match: string;
+  /** 可信度：high / medium / low */
+  confidence: "high" | "medium" | "low";
+  provider_kind: ProviderKind;
+  model: string;
+  vendor: string;
+  /** 展示名（供应商 · 模型，未命中时为原始值） */
+  display: string;
+  special?: string;
+  schema_options?: string[] | null;
+  /** 同一 key 在多处值不一致（如顶层扁平副本 vs 分组嵌套） */
+  conflict?: boolean;
+  /** 该处配置存在镜像副本，写回时会一并同步 */
+  mirrored?: boolean;
+}
+
+export interface PluginModelPlugin {
+  name: string;
+  display_name: string;
+  version: string;
+  author: string;
+  dir: string;
+  config_path: string;
+  has_config: boolean;
+  has_schema: boolean;
+  activated: boolean;
+  entries: PluginModelEntry[];
+}
+
+export interface PluginModelsResponse {
+  ok: boolean;
+  error?: string;
+  providers: PluginModelProvider[];
+  plugins: PluginModelPlugin[];
+  stats: {
+    plugins_total?: number;
+    plugins_configured?: number;
+    entries_total?: number;
+    providers_total?: number;
+  };
+}
+
+export interface PluginModelSetItem {
+  plugin: string;
+  path: (string | number)[];
+  value: string;
+  container?: (string | number)[] | null;
+}
+
+export interface PluginModelSetResponse {
+  ok: boolean;
+  error?: string;
+  changed_count?: number;
+  plugins_saved?: string[];
+  runtime_synced?: number;
+  changed?: {
+    plugin: string;
+    path_display: string;
+    old: string;
+    new: string;
+    runtime_synced?: boolean;
+  }[];
+  errors?: { plugin?: string; path_display?: string; error: string }[];
+  /** 新值不在已加载 provider 目录里（可能是手填的自定义模型名） */
+  unknown_values?: string[];
+}
+
+export async function apiGetPluginModels() {
+  return apiGet<PluginModelsResponse>("/panel/plugin_models");
+}
+
+export async function apiSetPluginModels(items: PluginModelSetItem[]) {
+  return apiPost<PluginModelSetResponse>("/panel/plugin_models/set", { items });
+}
+
 // ---------- 默认模型配置（对话 / 回退 / 图片转述） ----------
 export interface DefaultModelOption {
   id: string;

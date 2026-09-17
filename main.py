@@ -15,6 +15,7 @@ from quart import Response, request
 
 from .storage import Storage
 from .session_manager import SessionManager
+from .plugin_models import PluginModelScanner
 
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 
@@ -255,6 +256,8 @@ class ModelPanelPlugin(Star):
         self._model_provider_cache: dict[str, str] = {}
         # 全局并发去重：同时只允许一个一键检测任务在跑
         self._test_all_lock = asyncio.Lock()
+        # 全插件模型配置扫描器（惰性创建，见 _scanner()）
+        self._plugin_scanner: Optional[PluginModelScanner] = None
 
     async def initialize(self):
         # 数据库路径：优先用 AstrBot 提供的数据目录，回退到相对路径
@@ -508,6 +511,8 @@ class ModelPanelPlugin(Star):
             ("/panel/companion/providers", self.api_companion_providers, ["GET"]),
             ("/panel/companion/replace", self.api_companion_replace, ["POST"]),
             ("/panel/companion/set", self.api_companion_set, ["POST"]),
+            ("/panel/plugin_models", self.api_plugin_models, ["GET"]),
+            ("/panel/plugin_models/set", self.api_plugin_models_set, ["POST"]),
         ]
         for path, handler, methods in routes:
             self.context.register_web_api(
@@ -1757,6 +1762,60 @@ class ModelPanelPlugin(Star):
             "main_count": main_count,
             "fallback_count": fb_count,
         }
+
+    # ---------------- 全插件模型配置（扫描 / 改写） ----------------
+    def _scanner(self) -> PluginModelScanner:
+        """惰性创建扫描器，并把 companion 专用读写语义注入进去复用。
+
+        陪伴插件把 provider key 同时写在顶层扁平副本与 model_assignment_config
+        分组里，只有 _flat_set 语义能保证两处一起改；这个函数是 main.py 与
+        plugin_models.py 之间的唯一耦合点。
+        """
+        if self._plugin_scanner is None:
+            self._plugin_scanner = PluginModelScanner(
+                self,
+                flat_set=_flat_set,
+                flat_set_existing=_flat_set_existing,
+            )
+        return self._plugin_scanner
+
+    async def api_plugin_models(self) -> dict:
+        """扫描所有已安装插件，列出其中的模型相关配置。
+
+        只读接口；识别规则（schema `_special` / 值命中 provider id 或模型名 /
+        键名提示）见 plugin_models.py 模块文档。
+        """
+        try:
+            return self._scanner().scan()
+        except Exception as e:
+            logger.error(f"[ModelPanel] 插件模型扫描失败: {e}", exc_info=True)
+            return {
+                "ok": False,
+                "error": str(e),
+                "providers": [],
+                "plugins": [],
+                "stats": {},
+            }
+
+    async def api_plugin_models_set(self) -> dict:
+        """按 (plugin, path) 精确改写插件配置里的模型。
+
+        body: {
+          "items": [
+            {"plugin": "astrbot_plugin_x", "path": ["a","b"], "value": "provider_id"}
+          ]
+        }
+        - path 支持字符串键与整数下标（列表元素）；
+        - JSON 字符串映射（如陪伴插件 model_fallback_overrides）传 container 指定容器路径；
+        - value 为空字符串表示清除该处配置。
+        """
+        payload = await self._json_payload()
+        items = payload.get("items")
+        try:
+            return self._scanner().set_values(items)
+        except Exception as e:
+            logger.error(f"[ModelPanel] 插件模型写入失败: {e}", exc_info=True)
+            return {"ok": False, "error": str(e), "changed": []}
 
     # ---------------- 内部 ----------------
     async def _json_payload(self) -> dict:

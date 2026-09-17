@@ -98,6 +98,7 @@ const navItems = [
   { to: "/detect", titleKey: "nav.detect" },
   { to: "/default", titleKey: "nav.defaultModel" },
   { to: "/companion", titleKey: "nav.companion" },
+  { to: "/plugins", titleKey: "nav.plugins" },
   { to: "/settings", titleKey: "nav.settings" },
 ];
 

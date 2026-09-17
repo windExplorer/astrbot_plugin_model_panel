@@ -1,5 +1,48 @@
 # 更新日志
 
+## v1.2.6
+
+- 新增「插件模型」页：自动扫描**所有已安装插件**的配置，把其中的模型项列出来，
+  可直接单项更换，也可按「旧模型 → 新模型」批量替换
+  - 需求：换模型时不该只盯着陪伴插件——别的插件（视觉模型、TTS、向量模型…）
+    也各自配了一份模型，全靠人工去每个插件的配置页翻找，容易漏
+  - 识别来源按可信度分三级，前端逐条标注：
+    1. **schema 声明（high）**：`_conf_schema.json` 里 `_special` 为
+       `select_provider` / `select_provider_tts` / `select_provider_stt` 的配置项。
+       这是 AstrBot 官方约定，值一定是 provider id，识别最准
+    2. **值命中（high / medium）**：配置树里任意字符串值等于某个已加载 provider 的 id
+       （high）或模型名（medium）；JSON 字符串里套着 `{key: provider_id}` 映射的
+       （如陪伴插件 `model_fallback_overrides`）会展开成多条
+    3. **键名提示（low）**：键名含 `provider` / `model`、值为非空短字符串，
+       但既不是已知 id 也不是已知模型名（典型场景：这个模型已经被删掉了）。
+       标注「低可信」，可一键隐藏
+  - 后端新增模块 `plugin_models.py`：
+    - 拍平 `_conf_schema.json`（含 `object` 分组与 `template_list` 模板）得到「路径级 schema 表」
+    - 递归遍历插件 config；跳过 `__` 前缀的 AstrBot 内部字段（如 `__template_key`）
+    - **镜像去重**：同一个 key 既在顶层扁平副本又在分组嵌套里（陪伴插件就是这种结构），
+      值相同时只保留最深的一条并标注「镜像」；值不同则两条都列并标「配置不一致」
+    - **写回**：按 path 精确写回（支持 dict 键、list 下标、JSON 映射内层）；
+      陪伴插件走 `_flat_set` 语义全量同步（否则「改了配置、插件读到的还是旧值」）；
+      写前校验原值必须是字符串，路径失效则报错且不改
+    - **运行时同步**：插件实例属性名 == 配置键名、且属性当前值 == 我们看到的旧值时，
+      才 `setattr` 同步（很多插件 bootstrap 时把配置读进实例属性、之后不再读 config）；
+      其余情况由前端提示「可能需要重载插件」
+    - 误报防护：schema 带 `options` 的枚举项、非字符串类型不参与「键名提示」
+      （否则 `provider_config_mode=quick` 这类会被当成模型）；
+      JSON 映射内层只信「值确实命中」，避免把 `task_prompt_overrides` 里的提示词正文
+      当成模型（它的内层键名同样带 provider）
+  - 前端新增 `webui-src/src/views/PluginsView.vue`（导航「插件模型」）：
+    - 按插件折叠展示：用途（优先取 schema description）/ 配置键 / 当前模型 / 更换为 / 状态，
+      条目里可展开看 schema `hint`
+    - 顶部支持搜索、显示低可信项、隐藏无模型配置的插件，并统计「N / M 个插件含模型配置」
+    - **批量替换**：选一个「旧模型」→「新模型」，只作用于当前筛选出的列表，弹窗确认后再写
+    - 状态标签：未匹配 / 配置不一致 / 低可信 / 镜像；TTS、STT、向量模型单独标注类型；
+      更换下拉按 provider 类型分组，同名模型附加 provider id 后缀区分渠道
+  - 新增接口：`GET /panel/plugin_models`（扫描，只读）、
+    `POST /panel/plugin_models/set`（按 `{plugin, path, value}` 批量写回）
+  - 与「陪伴插件」页的关系：陪伴页保留主模型 / 备用模型的专用语义（按模型名批量替换、
+    同步陪伴插件实例属性）；本页是通用视图。两者读写同一份配置，改完互相可见
+
 ## v1.2.5
 
 - 修复陪伴插件页模型选择在**同名模型**场景下只显示一个提供商的问题：

@@ -6,6 +6,7 @@ import DashboardView from "./views/DashboardView.vue";
 import DetectView from "./views/DetectView.vue";
 import DefaultModelView from "./views/DefaultModelView.vue";
 import CompanionReplaceView from "./views/CompanionReplaceView.vue";
+import PluginsView from "./views/PluginsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 
 import { i18n } from "./i18n";
@@ -32,6 +33,7 @@ const router = createRouter({
     { path: "/detect", name: "detect", component: DetectView, meta: { titleKey: "nav.detect" } },
     { path: "/default", name: "default", component: DefaultModelView, meta: { titleKey: "nav.defaultModel" } },
     { path: "/companion", name: "companion", component: CompanionReplaceView, meta: { titleKey: "nav.companion" } },
+    { path: "/plugins", name: "plugins", component: PluginsView, meta: { titleKey: "nav.plugins" } },
     { path: "/settings", name: "settings", component: SettingsView, meta: { titleKey: "nav.settings" } },
   ],
 });
