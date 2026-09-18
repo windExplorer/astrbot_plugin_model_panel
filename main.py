@@ -378,6 +378,153 @@ class ModelPanelPlugin(Star):
                 return label
         return "极度疏离"
 
+    # 伴侣插件"当前互动状态"（短期互动温度）七档，key 与中文标签取自
+    # companion_interaction_expression.ExpressionBand / EXPRESSION_BAND_LABELS，
+    # 从冷到暖排序（下面按顺序比较档位高低，不能乱序）。
+    _INTERACTION_BANDS: tuple[str, ...] = (
+        "avoidant",
+        "hurt",
+        "relaxed",
+        "lively",
+        "warm",
+        "close",
+        "affectionate",
+    )
+    _INTERACTION_BAND_LABELS: dict[str, str] = {
+        "avoidant": "回避",
+        "hurt": "受伤",
+        "relaxed": "放松",
+        "lively": "活泼",
+        "warm": "温暖",
+        "close": "亲近",
+        "affectionate": "爱意",
+    }
+    # 仅主要用户可用的档位（普通用户会被伴侣插件降到「温暖」）
+    _INTERACTION_OWNER_ONLY: frozenset[str] = frozenset({"close", "affectionate"})
+    # 普通用户的互动温度上限候选（伴侣插件 NORMAL_INTERACTION_BAND_CAPS）
+    _INTERACTION_NORMAL_CAPS: tuple[str, ...] = ("relaxed", "lively", "warm")
+    _INTERACTION_DEFAULT_CAP = "warm"
+
+    @staticmethod
+    def _num(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _interaction_band_of(cls, value: Any) -> str:
+        """从多种历史结构里取出互动档位 key（兼容 band/expression_band/state/mode）。"""
+        if isinstance(value, dict):
+            for key in ("expression_band", "band", "state", "mode"):
+                text = str(value.get(key) or "").strip().lower()
+                if text in cls._INTERACTION_BAND_LABELS:
+                    return text
+            return ""
+        text = str(value or "").strip().lower()
+        return text if text in cls._INTERACTION_BAND_LABELS else ""
+
+    @classmethod
+    def _baseline_interaction_band(cls, score: int, *, owner_exclusive: bool) -> str:
+        """伴侣插件 `_baseline_band`：专属联结恒为亲近，其余按关系分数分档。
+
+        用于档案里没有 current_interaction（旧档案 / 未开启关系距离感）时的推算，
+        保证指令仍能给出一个与伴侣插件运行时一致的基线状态。
+        """
+        if owner_exclusive:
+            return "close"
+        if score < -400:
+            return "avoidant"
+        if score < 0:
+            return "hurt"
+        if score >= 600:
+            return "warm"
+        if score >= 200:
+            return "lively"
+        return "relaxed"
+
+    @classmethod
+    def _interaction_state(
+        cls,
+        record: dict,
+        score: int,
+        *,
+        owner_exclusive: bool,
+        role: str,
+    ) -> dict:
+        """解析伴侣插件的「当前互动状态」（短期互动温度，七档）。
+
+        数据源：用户档案的 `current_interaction`（伴侣插件由
+        `current_interaction_projection` 归一化后写入）。历史数据可能：
+        - 档位键名是 `expression_band` / `band` / `state` / `mode` 之一；
+        - 整个字段缺失（旧档案、或未开启关系距离感）→ 用关系分数按伴侣插件的
+          `_baseline_band` 推算，并标注 inferred（不谎报为"真实状态"）。
+
+        同时复刻投影的归一化语义（否则会显示伴侣插件实际不会用的档位）：
+        - 普通用户不能进入「亲近 / 爱意」，会被降到「温暖」；
+        - 普通用户不得超过 `normal_interaction_band_cap`（默认温暖）；
+        - `expires_at` 过期且无动态余波时回到「放松」。
+        """
+        payload = record.get("current_interaction")
+        band = cls._interaction_band_of(payload)
+        if not band and isinstance(payload, dict):
+            # 兜底：档案里可能只写了中文标签
+            label = str(payload.get("label") or "").strip()
+            for key, cn in cls._INTERACTION_BAND_LABELS.items():
+                if label == cn:
+                    band = key
+                    break
+        raw: dict = payload if isinstance(payload, dict) else {}
+
+        inferred = not band
+        if inferred:
+            band = cls._baseline_interaction_band(
+                score, owner_exclusive=owner_exclusive
+            )
+
+        manual = bool(raw.get("manual_override")) or str(
+            raw.get("source") or ""
+        ).strip().lower() == "manual"
+        expires_at = cls._num(raw.get("expires_at"))
+
+        capped = False
+        if role != "owner":
+            if band in cls._INTERACTION_OWNER_ONLY:
+                band = "warm"
+                capped = True
+            else:
+                cap = str(raw.get("normal_interaction_band_cap") or "").strip().lower()
+                if cap not in cls._INTERACTION_NORMAL_CAPS:
+                    cap = cls._INTERACTION_DEFAULT_CAP
+                if cls._INTERACTION_BANDS.index(band) > cls._INTERACTION_BANDS.index(cap):
+                    band = cap
+                    capped = True
+
+        expired = False
+        if not inferred and expires_at and expires_at <= time.time():
+            expired = True
+            band = "relaxed"
+            manual = False
+
+        if inferred:
+            source = "baseline"
+        elif manual:
+            source = "manual"
+        else:
+            source = "auto"
+        reason = " ".join(str(raw.get("reason") or raw.get("reason_code") or "").split())
+        return {
+            "band": band,
+            "label": cls._INTERACTION_BAND_LABELS.get(band, band),
+            "source": source,
+            "manual": manual,
+            "expires_at": expires_at,
+            "reason": reason[:40],
+            "capped": capped,
+            "expired": expired,
+            "inferred": inferred,
+        }
+
     @staticmethod
     def _find_affinity_record(users: dict, sender: str) -> Optional[dict]:
         direct = users.get(sender)
@@ -455,9 +602,42 @@ class ModelPanelPlugin(Star):
             extra = "\n状态：专属联结（分数已冻结）"
         elif str(record.get("relationship_role") or "").strip().lower() == "owner":
             extra = "\n身份：主要用户"
+        # 当前互动状态（短期互动温度）：伴侣插件按边界、被刺到、重新接近等事件
+        # 实时调整，和"关系阶段"（长期分数）是两个维度，所以单独一行展示。
+        role = str(record.get("relationship_role") or "").strip().lower()
+        state = self._interaction_state(
+            record,
+            score,
+            owner_exclusive=str(record.get("relationship_mode") or "")
+            .strip()
+            .lower()
+            == "owner_exclusive",
+            role=role,
+        )
+        notes: list[str] = []
+        if state["inferred"]:
+            notes.append("按好感度推算")
+        elif state["manual"]:
+            notes.append("管理员设置")
+        elif state["expired"]:
+            notes.append("原状态已过期")
+        else:
+            notes.append("自动判定")
+        if state["capped"]:
+            notes.append("受互动温度上限限制")
+        expires_at = float(state.get("expires_at") or 0)
+        if expires_at > time.time():
+            notes.append(
+                "有效期至 " + time.strftime("%m-%d %H:%M", time.localtime(expires_at))
+            )
+        # 原因多为内部错误码（no_contact / boundary_violation…），只在写了中文说明时展示
+        reason = str(state.get("reason") or "")
+        if reason and any("\u4e00" <= ch <= "\u9fff" for ch in reason):
+            notes.append(f"原因：{reason}")
         yield event.plain_result(
             f"💕 好感度查询\n"
             f"当前分数：{score}（{self._affinity_stage_label(score)}）{extra}\n"
+            f"互动状态：{state['label']}（{' · '.join(notes)}）\n"
             f"更新时间：{updated_text}"
         )
 
