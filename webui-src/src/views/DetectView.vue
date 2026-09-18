@@ -459,7 +459,9 @@ async function testMany(ids: string[] | null = null) {
   testProgress.total = 0;
   testProgress.percent = 0;
   lastSessionStats.value = null;
-  const skip = ids ? [] : Object.keys(enabled).filter((k) => !enabled[k]);
+  // 勾选规则对「一键检测」和「分组测试」同样生效：未勾选的 provider 一律跳过。
+  // 语义与复选框一致（undefined 视为已勾选）；后端还会用检测开关偏好兜底。
+  const skip = Object.keys(enabled).filter((k) => enabled[k] === false);
   const scope = ids ? new Set(ids) : null;
   for (const k of Object.keys(pending)) pending[k] = false;
   try {
@@ -471,7 +473,8 @@ async function testMany(ids: string[] | null = null) {
             testProgress.total = e.total || 0;
             for (const k of Object.keys(enabled)) {
               if (!scope || scope.has(k)) {
-                if (enabled[k] || ids) pending[k] = true;
+                // 未勾选的项不进"检测中"状态（后端会直接返回 skipped 结果）
+                if (enabled[k] !== false) pending[k] = true;
               }
             }
           },

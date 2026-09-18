@@ -176,7 +176,9 @@ const loading = ref(false);
 const batchSaving = ref(false);
 const savingKey = ref("");
 const keyword = ref("");
-const showLow = ref(true);
+// 低可信项默认隐藏：这类条目大多是插件自己的业务模型字段
+// （如 comfyui-anima 的 LoRA 文件名、工作流底模），不是 AstrBot provider
+const showLow = ref(false);
 const hideEmpty = ref(true);
 const expanded = ref<string[]>([]);
 const plugins = ref<PluginModelPlugin[]>([]);
@@ -191,7 +193,7 @@ const stats = reactive({
 const batchOld = ref("");
 const batchNew = ref("");
 
-const KIND_ORDER = ["chat", "tts", "stt", "embedding"];
+const KIND_ORDER = ["chat", "tts", "stt", "embedding", "rerank"];
 
 function kindLabel(kind: string): string {
   return t(`plugins.kind.${kind || "other"}`);
@@ -201,13 +203,20 @@ function rowKey(plugin: string, entry: PluginModelEntry): string {
   return plugin + "|" + entry.path_display;
 }
 
-/** 供应商/模型 label 相同时补 provider id 后缀，保证每个渠道可区分 */
+/** 供应商/模型 label 相同时补 provider id 后缀，保证每个渠道可区分；默认项加标记 */
 function providerSelectOptions(): any[] {
-  const groups = new Map<string, { label: string; value: string }[]>();
+  const groups = new Map<
+    string,
+    { label: string; value: string; isDefault: boolean }[]
+  >();
   for (const p of providers.value) {
     const kind = p.kind || "chat";
     if (!groups.has(kind)) groups.set(kind, []);
-    groups.get(kind)!.push({ label: p.label || p.id, value: p.id });
+    groups.get(kind)!.push({
+      label: p.label || p.id,
+      value: p.id,
+      isDefault: Boolean(p.is_default),
+    });
   }
   const options: any[] = [];
   for (const kind of KIND_ORDER) {
@@ -219,11 +228,12 @@ function providerSelectOptions(): any[] {
       type: "group",
       key: kind,
       label: kindLabel(kind),
-      children: items.map((it) =>
-        (counts.get(it.label) || 0) > 1
-          ? { label: `${it.label} · ${it.value}`, value: it.value }
-          : it,
-      ),
+      children: items.map((it) => {
+        let label = it.label;
+        if ((counts.get(it.label) || 0) > 1) label = `${label} · ${it.value}`;
+        if (it.isDefault) label = `${label} ${t("plugins.defaultMark")}`;
+        return { label, value: it.value };
+      }),
     });
   }
   return options;

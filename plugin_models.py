@@ -19,7 +19,19 @@
    （陪伴插件的 `model_fallback_overrides` 就是这样存的），会被展开成多条。
 3. **键名提示（low）**：键名含 `provider` / `model`，值是非空短字符串，
    但既不是已知 provider id 也不是已知模型名（典型场景：这个模型已经被删掉了，
-   或插件用了自定义字段名）。低可信项在前端有明确标记，可一键隐藏。
+   或插件用了自定义字段名）。低可信项在前端有明确标记，默认隐藏、可一键显示。
+   两类情况**刻意排除**，否则会把插件自己的业务模型当成 AstrBot provider：
+   - `template_list` 模板内的字段（LoRA 列表的 `model_name`、工作流卡片的
+     `base_model` 等，值是 `xxx.safetensors` 这种绘图模型文件名）
+   - 带 `options` 的枚举项与非字符串类型（如 `provider_config_mode=quick`）
+
+## provider 目录覆盖范围
+
+命中判定与"更换为"下拉都基于 `provider_catalog()`，它覆盖 AstrBot 支持的**全部**
+provider 类型：`chat`（get_all_providers）、`tts`、`stt`、`embedding`
+以及 `rerank`（4.27.4 的 Context 没有 rerank getter，直接取
+`provider_manager.rerank_provider_insts`）。少一类就会出现"插件里明明配了
+TTS/向量模型，却被标成未匹配、下拉里也选不到"。
 
 ## 写回
 
@@ -130,10 +142,13 @@ class PluginModelScanner:
             return []
 
     def provider_catalog(self) -> list[dict]:
-        """所有已加载 provider（chat / tts / stt / embedding）的扁平目录。
+        """所有已加载 provider（chat / tts / stt / embedding / rerank）的扁平目录。
 
-        前端"更换为"下拉、值命中判定都依赖它。同一个 provider id 只登记一次
-        （AstrBot 的 inst_map 可能让同一实例出现在多个列表里）。
+        前端"更换为"下拉、值命中判定都依赖它。必须覆盖 AstrBot 支持的全部
+        provider 类型，否则插件配置里引用的 TTS / STT / 向量 / 重排序模型
+        会因为"查不到这个 id"而被标成「未匹配」，下拉里也选不到。
+        同一个 provider id 只登记一次（AstrBot 的 inst_map 可能让同一实例
+        出现在多个列表里）。
         """
         out: list[dict] = []
         seen: set[str] = set()
@@ -141,18 +156,28 @@ class PluginModelScanner:
         if ctx is None:
             return out
 
-        pairs: list[tuple[str, str]] = [("chat", "get_all_providers")]
-        pairs += [
+        pairs: list[tuple[str, str]] = [
+            ("chat", "get_all_providers"),
             ("tts", "get_all_tts_providers"),
             ("stt", "get_all_stt_providers"),
             ("embedding", "get_all_embedding_providers"),
         ]
+        pending: list[tuple[str, list[Any]]] = []
         for kind, method in pairs:
             getter = getattr(ctx, method, None)
-            if not callable(getter):
-                continue
-            for provider in self._safe_list(getter):
-                entry = self._provider_entry(provider, kind)
+            if callable(getter):
+                pending.append((kind, self._safe_list(getter)))
+        # rerank：AstrBot 4.27.4 的 Context 没有 getter 方法，直接从
+        # provider_manager 拿（manager 里确实维护了 rerank_provider_insts）。
+        pm = getattr(ctx, "provider_manager", None)
+        rerank = getattr(pm, "rerank_provider_insts", None)
+        if isinstance(rerank, (list, tuple)):
+            pending.append(("rerank", list(rerank)))
+
+        default_ids = self._default_provider_ids()
+        for kind, providers in pending:
+            for provider in providers:
+                entry = self._provider_entry(provider, kind, default_ids)
                 if not entry:
                     continue
                 pid = entry["id"]
@@ -162,7 +187,34 @@ class PluginModelScanner:
                 out.append(entry)
         return out
 
-    def _provider_entry(self, provider: Any, kind: str) -> Optional[dict]:
+    def _default_provider_ids(self) -> dict[str, str]:
+        """各类别"当前默认 provider id"。
+
+        - chat：`provider_settings.default_provider_id`（旧键）/ provider_manager
+          上的 `default_chat_provider_id` 快照
+        - tts：`provider_tts_settings.provider_id`
+        - stt：`provider_stt_settings.provider_id`
+        - embedding / rerank：AstrBot 主配置里**没有**全局默认项，
+          由使用它们的插件自己指定，故不标默认。
+        """
+        out = {"chat": "", "tts": "", "stt": ""}
+        try:
+            pm = getattr(self.context, "provider_manager", None)
+            ps = getattr(pm, "provider_settings", None) or {}
+            out["chat"] = str(
+                getattr(pm, "default_chat_provider_id", "") or ps.get("default_provider_id") or ""
+            )
+            tts = getattr(pm, "provider_tts_settings", None) or {}
+            out["tts"] = str(tts.get("provider_id") or "")
+            stt = getattr(pm, "provider_stt_settings", None) or {}
+            out["stt"] = str(stt.get("provider_id") or "")
+        except Exception as e:
+            logger.debug(f"[ModelPanel] 读取默认 provider 失败: {e}")
+        return out
+
+    def _provider_entry(
+        self, provider: Any, kind: str, default_ids: Optional[dict] = None
+    ) -> Optional[dict]:
         cfg = getattr(provider, "provider_config", None)
         cfg = cfg if isinstance(cfg, dict) else {}
         pid = str(cfg.get("id") or "").strip()
@@ -175,7 +227,16 @@ class PluginModelScanner:
         except Exception:
             model = ""
         if not model:
-            for key in ("model", "default_model", "selected_model"):
+            # 不同 provider 类型把模型名写在不同的配置字段里
+            for key in (
+                "model",
+                "default_model",
+                "selected_model",
+                "embedding_model",
+                "rerank_model",
+                "tts_model",
+                "stt_model",
+            ):
                 value = cfg.get(key)
                 if isinstance(value, str) and value.strip():
                     model = value.strip()
@@ -193,6 +254,9 @@ class PluginModelScanner:
             label = f"{vendor} · {model}"
         else:
             label = model or vendor or pid
+        is_default = bool(
+            default_ids and str(default_ids.get(kind) or "").strip() == pid
+        )
         return {
             "id": pid,
             "kind": kind,
@@ -200,6 +264,7 @@ class PluginModelScanner:
             "model": model,
             "vendor": vendor,
             "label": label,
+            "is_default": is_default,
         }
 
     # ================= 扫描 =================
@@ -494,6 +559,12 @@ class PluginModelScanner:
         key = str(path[-1]) if path else ""
         if not key or not _KEY_HINT.search(key) or _KEY_HINT_EXCLUDE.search(key):
             return
+        # template_list 模板内的字段（LoRA 列表的 model_name、工作流卡片的
+        # base_model…）是插件自己的业务模型，不是 AstrBot provider，靠键名猜
+        # 只会产生噪音（如 comfyui-anima 的 LoRA 文件名）。这里只认 pass1 的
+        # schema `_special` 或值命中，不做键名提示。
+        if self._is_template_field(schema_map, path):
+            return
         node = self._lookup_schema(schema_map, path)
         if node is not None:
             # schema 已声明：枚举项 / 非字符串类型一律不是模型配置
@@ -566,6 +637,20 @@ class PluginModelScanner:
                 continue
             out[path] = node
         return out
+
+    @staticmethod
+    def _is_template_field(schema_map: dict[tuple, dict], path: tuple) -> bool:
+        """该路径是否落在 template_list 模板内（schema 里用 None 占位索引）。
+
+        两种入参都要支持：具体配置路径（`loras.0.model_name`）与 schema 表里的
+        占位路径（`loras.None.model_name`）。
+        """
+        if any(seg is None for seg in path):
+            return tuple(path) in schema_map
+        if tuple(path) in schema_map:
+            return False
+        alt = tuple(None if isinstance(seg, int) else seg for seg in path)
+        return alt != tuple(path) and alt in schema_map
 
     @staticmethod
     def _lookup_schema(schema_map: dict[tuple, dict], path: tuple) -> Optional[dict]:

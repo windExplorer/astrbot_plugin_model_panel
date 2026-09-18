@@ -282,7 +282,7 @@
     "tagUnresolved": "Not matched",
     "tagUnresolvedTip": "The value matches no loaded provider / model — the model may have been deleted, or this field is not a model at all.",
     "tagLow": "Low confidence",
-    "tagLowTip": "Guessed from the key name only; please verify before changing.",
+    "tagLowTip": "Guessed from the key name only (e.g. a plugin's own drawing model or LoRA filename) — not necessarily an AstrBot provider. Hidden by default; please verify before changing.",
     "tagMirrored": "Mirrored",
     "tagMirroredTip": "This key exists as a mirror copy (flat top-level + nested group) and will be synced together when written.",
     "setSuccess": "Updated {n} entries; config saved",
@@ -295,8 +295,10 @@
       "tts": "TTS",
       "stt": "STT",
       "embedding": "Embedding",
+      "rerank": "Rerank",
       "other": "Other"
-    }
+    },
+    "defaultMark": "(default)"
   },
   "settings": {
     "title": "Detection Settings",

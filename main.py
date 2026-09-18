@@ -1149,6 +1149,27 @@ class ModelPanelPlugin(Star):
             logger.warning(f"[ModelPanel] /panel/preferences PUT 失败: {e}")
             return {"ok": False, "error": str(e)}
 
+    async def _skip_ids(self, payload: dict) -> set[str]:
+        """本次检测需要跳过的 provider id 集合。
+
+        前端会显式传 skip；但「分组一键测试」历史上只传 ids、不传 skip，
+        导致分组内未勾选的模型也被真实检测（既浪费额度又违反"勾选=参与检测"
+        的约定）。这里以 storage 里的检测开关偏好做兜底合并，
+        保证「没勾选就不测」在任何调用路径下都成立（前端也同步修了）。
+        """
+        skip = {
+            str(x).strip() for x in (payload.get("skip") or []) if str(x).strip()
+        }
+        try:
+            if self.storage:
+                prefs = await self.storage.get_detection_preferences()
+                for pid, enabled in prefs.items():
+                    if not enabled:
+                        skip.add(str(pid))
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 读取检测开关偏好失败: {e}")
+        return skip
+
     async def api_test_provider(self) -> dict:
         payload = await self._json_payload()
         provider_id = str(payload.get("id") or "").strip()
@@ -1196,7 +1217,7 @@ class ModelPanelPlugin(Star):
             return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "items": []}
         async with self._test_all_lock:
             payload = await self._json_payload()
-            skip = set(payload.get("skip") or [])
+            skip = await self._skip_ids(payload)
             cfg = self._test_config()
             timeout = float(payload.get("timeout") or cfg["test_timeout"])
             providers = self._chat_providers()
@@ -1252,11 +1273,13 @@ class ModelPanelPlugin(Star):
         if self._test_all_lock.locked():
             return {"ok": False, "error": "已有检测任务在执行，请稍后再试", "session_id": None}
         payload = await self._json_payload()
-        skip = set(payload.get("skip") or [])
+        skip = await self._skip_ids(payload)
         cfg = self._test_config()
         timeout = float(payload.get("timeout") or cfg["test_timeout"])
         providers = self._chat_providers()
-        # 可选：只测指定的 provider 子集（分组一键测试用）
+        # 可选：只测指定的 provider 子集（分组一键测试用）。
+        # 注意：ids 只负责"缩小范围"，跳过的判定仍由 _skip_ids（skip ∪ 未勾选偏好）
+        # 在 _run_stream 里逐项生效 —— 分组内未勾选的模型同样不会被检测。
         only_ids = set(str(x).strip() for x in (payload.get("ids") or []) if str(x).strip())
         if only_ids:
             providers = [p for p in providers if str(self._provider_display(p)["id"]) in only_ids]

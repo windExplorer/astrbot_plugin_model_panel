@@ -282,7 +282,7 @@
     "tagUnresolved": "未匹配",
     "tagUnresolvedTip": "当前值不是任何一个已加载的模型 / 提供商，可能是模型已被删除，或该字段存的本来就不是模型。",
     "tagLow": "低可信",
-    "tagLowTip": "仅凭键名推测可能是模型配置，请自行确认后再改。",
+    "tagLowTip": "仅凭键名推测可能是模型配置（如插件自己的绘图模型、LoRA 文件名），不一定是 AstrBot 的模型提供商。这类项默认隐藏，请自行确认后再改。",
     "tagMirrored": "镜像",
     "tagMirroredTip": "该键在配置里存在镜像副本（顶层扁平 + 分组嵌套），写回时会一起同步。",
     "setSuccess": "已更新 {n} 处，配置已保存",
@@ -295,8 +295,10 @@
       "tts": "语音合成",
       "stt": "语音识别",
       "embedding": "向量模型",
+      "rerank": "重排序模型",
       "other": "其他"
-    }
+    },
+    "defaultMark": "（默认）"
   },
   "settings": {
     "title": "检测配置",

@@ -293,8 +293,8 @@ export async function apiCompanionSet(
 }
 
 // ---------- 全插件模型配置（扫描 / 改写） ----------
-/** provider 类型：chat=对话模型 tts=语音合成 stt=语音识别 embedding=向量 */
-export type ProviderKind = "chat" | "tts" | "stt" | "embedding" | "";
+/** provider 类型：chat=对话 tts=语音合成 stt=语音识别 embedding=向量 rerank=重排序 */
+export type ProviderKind = "chat" | "tts" | "stt" | "embedding" | "rerank" | "";
 
 /** 某个已加载 provider（"更换为"下拉的选项来源） */
 export interface PluginModelProvider {
@@ -304,6 +304,8 @@ export interface PluginModelProvider {
   model: string;
   vendor: string;
   label: string;
+  /** 是否是 AstrBot 当前的默认 provider（embedding / rerank 无全局默认） */
+  is_default?: boolean;
 }
 
 /** 扫描到的一处模型配置 */

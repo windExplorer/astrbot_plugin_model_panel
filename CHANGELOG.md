@@ -1,5 +1,42 @@
 # 更新日志
 
+## v1.2.7
+
+- 修复「分组一键测试」不遵守勾选规则：分组内未勾选的模型也会被真实检测（既浪费额度，
+  也违反"勾选 = 参与检测"的约定）
+  - 根因：前端 `testMany(ids)` 在分组模式下把 `skip` 直接置空（`ids ? [] : …`），
+    后端 `api_test_all_stream` 又只按 `ids` 缩小范围、不剔除未勾选项 ——
+    于是"取消勾选"实际只对一键检测生效
+  - 修复（前端 + 后端双保险）：
+    - `DetectView.testMany` 无论全测还是分组测都传完整 skip；判定语义与复选框一致
+      （`enabled[k] === false` 才算未勾选，undefined 视为已勾选）
+    - 新增 `ModelPanelPlugin._skip_ids()`：以 storage 里的检测开关偏好兜底合并 skip，
+      `api_test_all_providers` / `api_test_all_stream` 都改用，保证任何调用路径下
+      「没勾选就不测」
+  - 分组内被跳过的模型仍会出现在结果里（标「已跳过」），只是不再发真实请求
+- 修复「插件模型」页把插件自己的业务模型当成模型配置列出
+  （如 comfyui-anima 的 LoRA 文件名 `anima_lacrimosa.safetensors`、工作流底模 `illustrious`）
+  - 根因：键名提示（`model_name` / `base_model` 命中 "model"）对 `template_list`
+    模板内的字段同样生效；而模板条目是用户自定义的列表项，里面的模型字段属于
+    该插件自己的业务（绘图模型、LoRA 文件），并不是 AstrBot 的 provider
+  - 修复：新增 `_is_template_field()`，`template_list` 模板内的字段**只认**
+    schema `_special` 声明与值命中，不做键名提示；该方法同时兼容具体配置路径
+    （`loras.0.model_name`）与 schema 占位路径（`loras.None.model_name`）
+  - 前端「低可信项」默认改为**不显示**（此前默认显示）：这类条目绝大多数就是
+    插件自己的业务模型字段（如 `nai_model`），需要排查时再勾选显示
+- 修复 provider 目录不含重排序模型，并补上"默认 provider"信息
+  - AstrBot 支持的 provider 有 5 类：chat / tts / stt / embedding / rerank，
+    少一类就会出现「插件里明明配了这类模型，却被标成未匹配、下拉里也选不到」
+  - `rerank` 在 AstrBot 4.27.4 的 `Context` 上**没有 getter**，改为直接取
+    `provider_manager.rerank_provider_insts`
+  - 非对话 provider 的模型名可能写在 `embedding_model` / `rerank_model` /
+    `tts_model` / `stt_model` 等字段，补进取值兜底
+  - provider 目录新增 `is_default`：chat 取 `provider_settings.default_provider_id`
+    （及 `default_chat_provider_id` 快照），tts / stt 取
+    `provider_tts_settings.provider_id` / `provider_stt_settings.provider_id`，
+    前端下拉里标「（默认）」。embedding / rerank 在 AstrBot 主配置里**没有**
+    全局默认项（由使用它们的插件各自指定），故不标
+
 ## v1.2.6
 
 - 新增「插件模型」页：自动扫描**所有已安装插件**的配置，把其中的模型项列出来，
