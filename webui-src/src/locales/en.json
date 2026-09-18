@@ -246,7 +246,7 @@
     "setFail": "Update failed: {msg}"
   },
   "plugins": {
-    "explain": "Scans the config of every installed plugin and lists the model-related entries so you can change them here. Entries are detected in three ways: declared model pickers in the plugin schema (most reliable), values matching a loaded model name / provider ID, and key-name hints (marked as low confidence — please verify). Only non-empty entries are listed; fill empty ones on the plugin's own config page. Changes are saved immediately, but a few plugins cache config at startup and need a reload.",
+    "explain": "Scans the config of every installed plugin and lists the model-related entries so you can change them here. Entries are detected in three ways: declared model pickers in the plugin schema (most reliable — empty ones are listed as “Not set” and can be configured right here), values matching a loaded model name / provider ID, and key-name hints (marked as low confidence, hidden by default). Changes are saved immediately, but a few plugins cache config at startup and need a reload.",
     "btnRefresh": "Rescan",
     "refreshed": "Rescanned",
     "searchPlaceholder": "Search plugin / key / model…",
@@ -263,7 +263,10 @@
     "batchDone": "Replaced {n} entries",
     "batchPartial": "Some entries failed: {msg}",
     "emptyAll": "No matching plugin or model config.",
-    "entriesCount": "{n} model entries",
+    "entriesCount": "{c} set · {u} not set",
+    "showUnconfigured": "Show not-set entries",
+    "tagUnconfigured": "Not set",
+    "hiddenLow": "{n} low-confidence entries are hidden (usually the plugin's own models, e.g. drawing models or LoRA filenames) — click to show",
     "disabled": "Disabled",
     "configFile": "Config file:",
     "configPathUnknown": "(unknown)",

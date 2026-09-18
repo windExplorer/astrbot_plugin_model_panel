@@ -342,6 +342,11 @@ export interface PluginModelEntry {
   conflict?: boolean;
   /** 该处配置存在镜像副本，写回时会一并同步 */
   mirrored?: boolean;
+  /**
+   * false = 插件 schema 声明了这是模型配置入口，但当前值为空（未配置）。
+   * 这类条目也会列出，可直接在本页配置。
+   */
+  configured?: boolean;
 }
 
 export interface PluginModelPlugin {
@@ -355,6 +360,12 @@ export interface PluginModelPlugin {
   has_schema: boolean;
   activated: boolean;
   entries: PluginModelEntry[];
+  /** 该插件 schema 声明的模型配置入口总数（含未配置） */
+  special_slots?: number;
+  /** 其中已配置的数量 */
+  special_configured?: number;
+  /** 其中未配置的数量 */
+  special_unconfigured?: number;
 }
 
 export interface PluginModelsResponse {
@@ -366,6 +377,10 @@ export interface PluginModelsResponse {
     plugins_total?: number;
     plugins_configured?: number;
     entries_total?: number;
+    entries_configured?: number;
+    entries_unconfigured?: number;
+    slots_total?: number;
+    slots_unconfigured?: number;
     providers_total?: number;
   };
 }

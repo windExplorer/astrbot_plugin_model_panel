@@ -16,6 +16,9 @@
           :placeholder="t('plugins.searchPlaceholder')"
           style="width: 220px"
         />
+        <n-checkbox v-model:checked="showUnconfigured" size="small">
+          {{ t("plugins.showUnconfigured") }}
+        </n-checkbox>
         <n-checkbox v-model:checked="showLow" size="small">
           {{ t("plugins.showLow") }}
         </n-checkbox>
@@ -33,6 +36,15 @@
           }}
         </n-text>
       </n-space>
+
+      <n-text
+        v-if="!showLow && hiddenLowCount > 0"
+        depth="3"
+        class="hidden-hint"
+        @click="showLow = true"
+      >
+        {{ t("plugins.hiddenLow", { n: hiddenLowCount }) }}
+      </n-text>
 
       <n-divider style="margin: 12px 0" />
 
@@ -92,9 +104,14 @@
               size="small"
               round
               :bordered="false"
-              :type="group.entries.length ? 'success' : 'default'"
+              :type="configuredCount(group) ? 'success' : 'default'"
             >
-              {{ t("plugins.entriesCount", { n: group.entries.length }) }}
+              {{
+                t("plugins.entriesCount", {
+                  c: configuredCount(group),
+                  u: unconfiguredCount(group),
+                })
+              }}
             </n-tag>
             <n-tag v-if="!group.activated" size="small" round type="warning" :bordered="false">
               {{ t("plugins.disabled") }}
@@ -179,6 +196,10 @@ const keyword = ref("");
 // 低可信项默认隐藏：这类条目大多是插件自己的业务模型字段
 // （如 comfyui-anima 的 LoRA 文件名、工作流底模），不是 AstrBot provider
 const showLow = ref(false);
+// 未配置项默认显示：插件 schema 声明了「模型配置入口」但还没填值时，
+// 也必须列出来（否则用户会以为"我插件里的翻译模型/工具模型怎么没显示"），
+// 而且要能直接在本页配置。不想要时可一键关掉（如伴侣插件有几十个空模型入口）。
+const showUnconfigured = ref(true);
 const hideEmpty = ref(true);
 const expanded = ref<string[]>([]);
 const plugins = ref<PluginModelPlugin[]>([]);
@@ -201,6 +222,18 @@ function kindLabel(kind: string): string {
 
 function rowKey(plugin: string, entry: PluginModelEntry): string {
   return plugin + "|" + entry.path_display;
+}
+
+function isConfigured(entry: PluginModelEntry): boolean {
+  return entry.configured !== false;
+}
+
+function configuredCount(group: PluginModelPlugin): number {
+  return group.entries.filter((e) => isConfigured(e)).length;
+}
+
+function unconfiguredCount(group: PluginModelPlugin): number {
+  return group.entries.filter((e) => !isConfigured(e)).length;
 }
 
 /** 供应商/模型 label 相同时补 provider id 后缀，保证每个渠道可区分；默认项加标记 */
@@ -260,6 +293,9 @@ const visiblePlugins = computed<Group[]>(() => {
   for (const p of plugins.value) {
     if (hideEmpty.value && !p.entries.length) continue;
     let entries = p.entries.filter((e) => showLow.value || e.confidence !== "low");
+    if (!showUnconfigured.value) {
+      entries = entries.filter((e) => isConfigured(e));
+    }
     if (kw) {
       entries = entries.filter((e) =>
         [
@@ -284,6 +320,17 @@ const visiblePlugins = computed<Group[]>(() => {
     });
   }
   return out;
+});
+
+/** 被「显示低可信项」开关挡掉的条目数（用于提示用户还有内容没显示） */
+const hiddenLowCount = computed(() => {
+  let n = 0;
+  for (const p of plugins.value) {
+    for (const e of p.entries) {
+      if (e.confidence === "low" && !(e.configured === false)) n += 1;
+    }
+  }
+  return n;
 });
 
 /** 批量替换：当前可见条目里出现过的值（含出现次数） */
@@ -326,6 +373,17 @@ const canBatch = computed(
 // ---------- 状态标签 ----------
 function statusTags(entry: PluginModelEntry): any[] {
   const tags: any[] = [];
+  if (!isConfigured(entry)) {
+    // 未配置项：不用再报「未匹配 / 低可信」，它本来就没值
+    tags.push(
+      h(
+        NTag,
+        { size: "small", type: "default", round: true, bordered: false },
+        () => t("plugins.tagUnconfigured"),
+      ),
+    );
+    return tags;
+  }
   if (entry.conflict) {
     tags.push(
       h(
@@ -440,8 +498,11 @@ const columns = computed<DataTableColumn<Row>[]>(() => [
     title: t("plugins.colCurrent"),
     key: "current",
     minWidth: 220,
-    render: (row) =>
-      h("div", null, [
+    render: (row) => {
+      if (!isConfigured(row.entry)) {
+        return h(NText, { depth: 3 }, () => t("plugins.tagUnconfigured"));
+      }
+      return h("div", null, [
         h(
           "div",
           {
@@ -456,7 +517,8 @@ const columns = computed<DataTableColumn<Row>[]>(() => [
               row.entry.provider_id,
             )
           : null,
-      ]),
+      ]);
+    },
   },
   {
     title: t("plugins.colReplace"),
@@ -644,5 +706,13 @@ onMounted(() => reload());
   font-size: 12px;
   margin-bottom: 8px;
   word-break: break-all;
+}
+.hidden-hint {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline dotted;
 }
 </style>

@@ -303,18 +303,30 @@ class PluginModelScanner:
 
         plugins: list[dict] = []
         entries_total = 0
+        entries_configured = 0
+        slots_total = 0
+        slots_unconfigured = 0
         for star in self._stars():
             info = self._scan_plugin(star, by_id, by_model)
             if info is None:
                 continue
             plugins.append(info)
             entries_total += len(info["entries"])
+            entries_configured += sum(
+                1 for e in info["entries"] if e.get("configured", True)
+            )
+            slots_total += int(info.get("special_slots") or 0)
+            slots_unconfigured += int(info.get("special_unconfigured") or 0)
         # 有模型配置的插件排前面，其次按插件名
         plugins.sort(key=lambda x: (0 if x["entries"] else 1, x["name"]))
-        configured = sum(1 for p in plugins if p["entries"])
+        configured = sum(
+            1 for p in plugins if any(e.get("configured", True) for e in p["entries"])
+        )
         logger.info(
             f"[ModelPanel] 插件模型扫描完成：{len(plugins)} 个插件，"
-            f"{configured} 个含模型配置，共 {entries_total} 处；"
+            f"{configured} 个含已配置模型，共 {entries_total} 处条目"
+            f"（已配置 {entries_configured} / 未配置 {entries_total - entries_configured}）；"
+            f"schema 声明的模型入口 {slots_total} 个（其中 {slots_unconfigured} 个未配置）；"
             f"provider 目录 {len(catalog)} 条"
         )
         return {
@@ -325,6 +337,10 @@ class PluginModelScanner:
                 "plugins_total": len(plugins),
                 "plugins_configured": configured,
                 "entries_total": entries_total,
+                "entries_configured": entries_configured,
+                "entries_unconfigured": entries_total - entries_configured,
+                "slots_total": slots_total,
+                "slots_unconfigured": slots_unconfigured,
                 "providers_total": len(catalog),
             },
         }
@@ -362,28 +378,43 @@ class PluginModelScanner:
         }
         if not isinstance(cfg, dict):
             # 插件没有 _conf_schema.json（AstrBot 不会为它创建 config 对象）
-            return {**base, "has_config": False, "entries": []}
+            return {
+                **base,
+                "has_config": False,
+                "entries": [],
+                "special_slots": 0,
+                "special_configured": 0,
+                "special_unconfigured": 0,
+            }
 
         entries: list[dict] = []
         seen_paths: set[tuple] = set()
 
         # ---- pass 1：schema 声明 _special 的 provider 选择项（最准）----
+        # 空值也收：这些键是插件官方声明的"模型配置入口"（例如 comfyui-anima 的
+        # translate_llm_model / llm_model），用户没配时同样要列出来 —— 否则会以为
+        # "我插件里的模型配置怎么没显示"。空值条目 configured=False，
+        # 前端显示「未配置」并可当场配置。
+        special_slots = 0
+        special_configured = 0
         for path, node in schema_map.items():
             special = str(node.get("_special") or "")
             kind = SPECIAL_KIND_MAP.get(special, "")
             if not kind:
                 continue
             for concrete in self._expand_paths(cfg, path):
-                value = self._get_value(cfg, concrete)
-                if not isinstance(value, str) or not value.strip():
-                    continue
                 if concrete in seen_paths:
                     continue
+                raw_value = self._get_value(cfg, concrete)
+                value = raw_value.strip() if isinstance(raw_value, str) else ""
                 seen_paths.add(concrete)
+                special_slots += 1
+                if value:
+                    special_configured += 1
                 entries.append(
                     self._make_entry(
                         path=concrete,
-                        raw=value.strip(),
+                        raw=value,
                         match="schema_special",
                         confidence="high",
                         node=node,
@@ -391,6 +422,7 @@ class PluginModelScanner:
                         default_kind=kind,
                         by_id=by_id,
                         by_model=by_model,
+                        configured=bool(value),
                     )
                 )
 
@@ -406,7 +438,16 @@ class PluginModelScanner:
         )
 
         entries = self._dedupe(entries)
-        return {**base, "has_config": True, "entries": entries}
+        # 已配置的排前面（stable 排序保持各自相对顺序），未配置的沉到分组末尾
+        entries.sort(key=lambda e: 0 if e.get("configured", True) else 1)
+        return {
+            **base,
+            "has_config": True,
+            "entries": entries,
+            "special_slots": special_slots,
+            "special_configured": special_configured,
+            "special_unconfigured": max(0, special_slots - special_configured),
+        }
 
     # ---------- 配置树遍历 ----------
     def _walk(
@@ -710,6 +751,7 @@ class PluginModelScanner:
         special: str = "",
         default_kind: str = "",
         container: Optional[tuple] = None,
+        configured: bool = True,
     ) -> dict:
         node = node or {}
         hit: dict = by_id.get(raw) or by_model.get(raw) or {}
@@ -752,6 +794,8 @@ class PluginModelScanner:
             "schema_options": list(options) if isinstance(options, list) else None,
             "conflict": False,
             "mirrored": False,
+            # False = schema 声明的模型配置入口，但当前值为空（未配置）
+            "configured": configured,
         }
 
     def _dedupe(self, entries: list[dict]) -> list[dict]:
