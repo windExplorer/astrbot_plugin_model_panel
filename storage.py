@@ -30,6 +30,9 @@
 - idx_results_checked_at：按时间倒序查询历史
 - idx_results_provider：按 provider_id 过滤
 - idx_results_session：按 session_id 过滤
+
+- detection_preferences：三通道检测范围（手动 / 定时 / 指令），NULL 表示跟随计费类型推默认
+- model_profile：模型档案（计费类型、限时免费到期、单价、来源渠道、角色、流式能力、探测模式）
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ import asyncio
 import os
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 try:
@@ -80,13 +83,40 @@ CREATE INDEX IF NOT EXISTS idx_results_checked_at ON model_test_results(checked_
 CREATE INDEX IF NOT EXISTS idx_results_provider   ON model_test_results(provider_id);
 CREATE INDEX IF NOT EXISTS idx_results_session    ON model_test_results(session_id);
 
--- 用户对每个 provider 是否勾选参与一键检测。
--- 默认全部勾选（enabled 默认 1）；用户取消勾选后写入 0；
--- 不存在的行视为 enabled=1。
+-- 用户对每个 provider 是否勾选参与检测。三个通道各自独立，回答的是三个不同问题：
+--   enabled          WebUI 一键/分组检测（我手点的）
+--   allow_scheduled  定时巡检（系统自己花额度，NULL 表示跟随计费类型推默认）
+--   allow_command    指令检测（谁能点、能点哪些）
+-- NULL 是「未显式设置」，由 billing_type 推导；0/1 是用户显式覆盖。
+-- 之所以不做成 NOT NULL DEFAULT，是因为用户改了计费类型后，
+-- 固化下来的默认值不会跟着变，会出现「付费模型仍在被定时烧钱」。
 CREATE TABLE IF NOT EXISTS detection_preferences (
     provider_id     TEXT PRIMARY KEY,
-    enabled         INTEGER NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    allow_scheduled INTEGER,
+    allow_command   INTEGER,
     updated_at      INTEGER NOT NULL
+);
+
+-- 模型档案：一行一个 provider。AstrBot 里 1 个 provider 实例恰好对应 1 个模型
+-- （openai_source.py 在 init 时 set_model(config["model"])，model 是单数），
+-- 所以「给同一供应商的不同模型分别定价」不存在——不同模型本来就是不同 provider。
+-- 核心没有任何计费字段（models.dev 带 cost 但解析时被丢弃），只能自己存。
+CREATE TABLE IF NOT EXISTS model_profile (
+    provider_id        TEXT PRIMARY KEY,
+    billing_type       TEXT    NOT NULL DEFAULT 'unknown',
+    free_until         INTEGER,               -- 限时免费到期日，可空，仅展示
+    currency           TEXT    NOT NULL DEFAULT '',
+    price_input_per_m  REAL,                  -- 单价一律「每百万 token」
+    price_output_per_m REAL,
+    price_cached_per_m REAL,                  -- 缓存命中价，DeepSeek 类折扣很大
+    channel_kind       TEXT    NOT NULL DEFAULT 'unknown',
+    role               TEXT    NOT NULL DEFAULT 'unknown',
+    supports_streaming TEXT    NOT NULL DEFAULT 'unknown',  -- true/false/unknown
+    probe_mode         TEXT    NOT NULL DEFAULT 'non_stream',
+    note               TEXT    NOT NULL DEFAULT '',
+    model_name         TEXT    NOT NULL DEFAULT '',  -- 快照，provider 删除后仍可回显
+    updated_at         INTEGER NOT NULL DEFAULT 0
 );
 
 -- LLM 调用用量统计：由 on_llm_response 钩子写入，每行一次调用。
@@ -106,6 +136,67 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_usage_day   ON llm_usage(day);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON llm_usage(model);
 """
+
+
+# ---------------- 档案枚举与取值约束 ----------------
+# paid_overage 单独一类：它平时表现为「免费」，额度用完当天才变红，是最容易漏的预算炸弹。
+BILLING_TYPES = ("unknown", "free", "temp_free", "trial", "paid_overage", "paid", "subscription")
+# 来源渠道决定告警口径（中转站 5xx 是常态，阈值应比官方宽松）与成本语义。
+CHANNEL_KINDS = ("unknown", "official", "aggregator", "reseller", "self_hosted")
+# primary 有特权：它是正在服务用户的那个，标红时和观察模型标红完全不是一回事。
+ROLES = ("unknown", "primary", "backup", "fallback", "dedicated", "watch", "retired")
+STREAM_FLAGS = ("unknown", "true", "false")
+PROBE_MODES = ("non_stream", "stream", "both")
+
+# 定时巡检会持续产生真实调用，默认只对「单次不产生费用」的计费类型开放。
+SCHEDULED_DEFAULT_ON = ("free", "temp_free", "subscription")
+
+# 三通道 → 列名。manual 沿用既有的 enabled，保持老前端语义不变。
+DETECT_CHANNELS = ("manual", "scheduled", "command")
+_CHANNEL_COLUMN = {"manual": "enabled", "scheduled": "allow_scheduled", "command": "allow_command"}
+
+_ENUM_FIELDS = {
+    "billing_type": BILLING_TYPES,
+    "channel_kind": CHANNEL_KINDS,
+    "role": ROLES,
+    "supports_streaming": STREAM_FLAGS,
+    "probe_mode": PROBE_MODES,
+}
+_INT_FIELDS = ("free_until",)
+_FLOAT_FIELDS = ("price_input_per_m", "price_output_per_m", "price_cached_per_m")
+_TEXT_FIELDS = ("currency", "note", "model_name")
+PROFILE_FIELDS = tuple(_ENUM_FIELDS) + _INT_FIELDS + _FLOAT_FIELDS + _TEXT_FIELDS
+
+
+def scheduled_default_for(billing_type: str) -> bool:
+    """按计费类型推导「是否参与定时巡检」的默认值。"""
+    return billing_type in SCHEDULED_DEFAULT_ON
+
+
+def _coerce_profile(field: str, value: Any) -> Any:
+    """把前端传来的档案值收敛成合法类型。非法枚举值退回 unknown，不抛异常。"""
+    if field in _ENUM_FIELDS:
+        raw = str(value or "").strip()
+        return raw if raw in _ENUM_FIELDS[field] else "unknown"
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        if field in _INT_FIELDS:
+            # 前端日期选择器给的是 "YYYY-MM-DD"，按本地零点存成 epoch；直接给数字则当 epoch
+            if isinstance(value, str) and "-" in value:
+                day = date.fromisoformat(value.strip()[:10])
+                return int(datetime(day.year, day.month, day.day).timestamp())
+            return int(float(value))
+        if field in _FLOAT_FIELDS:
+            price = float(value)
+            # 负单价没有意义；0 是合法值（免费额度内、订阅内含）
+            return price if price >= 0 else 0.0
+        if field == "currency":
+            return str(value).strip().upper()[:8]
+        return str(value).strip()[:200]
+    except (TypeError, ValueError):
+        return None
+
 
 
 class Storage:
@@ -129,8 +220,22 @@ class Storage:
                 await db.execute("PRAGMA synchronous = NORMAL")
                 await db.execute("PRAGMA foreign_keys = ON")
                 await db.executescript(SCHEMA_SQL)
+                await self._migrate(db)
                 await db.commit()
             self._initialized = True
+
+    @staticmethod
+    async def _migrate(db: "aiosqlite.Connection") -> None:
+        """老库补列。CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，
+        漏了这一步的话老用户一进档案页就 "no such column" 白屏。"""
+        cur = await db.execute("PRAGMA table_info(detection_preferences)")
+        existing = {row[1] for row in await cur.fetchall()}
+        if not existing:
+            return
+        for col in ("allow_scheduled", "allow_command"):
+            if col not in existing:
+                # 列名来自上面的固定字面量，不是用户输入
+                await db.execute(f"ALTER TABLE detection_preferences ADD COLUMN {col} INTEGER")
 
     async def close(self) -> None:
         # aiosqlite 没有常驻连接，无需显式 close。
@@ -440,23 +545,157 @@ class Storage:
                 await db.commit()
 
     async def set_detection_preferences(self, prefs: dict[str, bool]) -> None:
-        """批量写入；先清空再插入，确保与前端传来的集合一致（缺失项回到默认 True）。"""
+        """批量写入手动通道的勾选。
+
+        改成逐条 upsert，不再「先 DELETE 再插入」：原来的清空会把同一张表里
+        ``allow_scheduled`` / ``allow_command`` 两个新通道一起抹掉，
+        用户在档案页配好的定时名单会被前端一次普通的勾选保存悄悄清空。
+        """
         await self.init()
         now = int(time.time())
         async with self._lock:
             async with aiosqlite.connect(self.db_path) as db:
-                # 删除所有 preference，由调用方传入完整集合（缺失即默认勾选）
-                await db.execute("DELETE FROM detection_preferences")
-                rows = [
-                    (pid, 1 if enabled else 0, now)
-                    for pid, enabled in prefs.items()
-                ]
-                if rows:
-                    await db.executemany(
-                        "INSERT INTO detection_preferences (provider_id, enabled, updated_at) VALUES (?, ?, ?)",
-                        rows,
-                    )
+                await db.executemany(
+                    """INSERT INTO detection_preferences
+                       (provider_id, enabled, updated_at) VALUES (?, ?, ?)
+                       ON CONFLICT(provider_id)
+                       DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at""",
+                    [(pid, 1 if enabled else 0, now) for pid, enabled in prefs.items()],
+                )
                 await db.commit()
+
+    # ---------- 三通道检测范围 ----------
+    async def get_detect_scopes(self) -> dict[str, dict[str, Any]]:
+        """返回 {provider_id: {manual, scheduled, command, billing_type, explicit}}。
+
+        库里存 NULL 表示「未显式设置」，由 billing_type 推导：
+        manual / command 默认开放，scheduled 只对不产生单次费用的计费类型开放。
+        所以新装用户什么都没标时，**定时名单是空的** —— 这是刻意的省钱默认，
+        而不是漏配；档案页可以按供应商批量勾选。
+        """
+        await self.init()
+        sql = """SELECT d.provider_id AS pid, d.enabled AS manual,
+                        d.allow_scheduled AS scheduled, d.allow_command AS command,
+                        m.billing_type AS billing
+                 FROM detection_preferences d
+                 LEFT JOIN model_profile m ON m.provider_id = d.provider_id"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql)
+            rows = await cur.fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            billing = str(row["billing"] or "unknown")
+            explicit = {
+                "manual": row["manual"] is not None,
+                "scheduled": row["scheduled"] is not None,
+                "command": row["command"] is not None,
+            }
+            out[row["pid"]] = {
+                "billing_type": billing,
+                "explicit": explicit,
+                "manual": bool(row["manual"]) if explicit["manual"] else True,
+                "scheduled": bool(row["scheduled"]) if explicit["scheduled"] else scheduled_default_for(billing),
+                "command": bool(row["command"]) if explicit["command"] else True,
+            }
+        return out
+
+    async def set_detect_scope(
+        self, provider_id: str, channel: str, enabled: Optional[bool]
+    ) -> bool:
+        """设置某个 provider 在某通道的参与情况。``enabled=None`` 表示恢复跟随默认。"""
+        if channel not in _CHANNEL_COLUMN:
+            return False
+        await self.init()
+        col = _CHANNEL_COLUMN[channel]
+        value = None if enabled is None else (1 if enabled else 0)
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                # 先保证行存在（新 provider 的 manual 默认勾选），再定点改那一列
+                await db.execute(
+                    """INSERT INTO detection_preferences (provider_id, enabled, updated_at)
+                       VALUES (?, 1, ?)
+                       ON CONFLICT(provider_id) DO UPDATE SET updated_at=excluded.updated_at""",
+                    (provider_id, int(time.time())),
+                )
+                await db.execute(
+                    f"UPDATE detection_preferences SET {col} = ? WHERE provider_id = ?",
+                    (value, provider_id),
+                )
+                await db.commit()
+        return True
+
+    # ---------- 模型档案 ----------
+    async def get_all_profiles(self) -> dict[str, dict[str, Any]]:
+        await self.init()
+        cols = ", ".join(PROFILE_FIELDS)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(f"SELECT provider_id, {cols}, updated_at FROM model_profile")
+            rows = await cur.fetchall()
+        return {
+            r["provider_id"]: {
+                "provider_id": r["provider_id"],
+                **{f: r[f] for f in PROFILE_FIELDS},
+                "updated_at": int(r["updated_at"] or 0),
+            }
+            for r in rows
+        }
+
+    async def upsert_profile(self, provider_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """写入/更新档案，返回落库后的完整档案。非法枚举退回 unknown，不抛异常。"""
+        await self.init()
+        clean = {f: _coerce_profile(f, patch.get(f)) for f in PROFILE_FIELDS if f in patch}
+        now = int(time.time())
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT * FROM model_profile WHERE provider_id = ?", (provider_id,)
+                )
+                row = await cur.fetchone()
+                merged = {f: row[f] for f in PROFILE_FIELDS} if row else {}
+                merged.update(clean)
+                # 枚举列 NOT NULL，缺值时补 unknown；数值/文本列允许 NULL
+                for f in _ENUM_FIELDS:
+                    if merged.get(f) is None:
+                        merged[f] = "unknown"
+                cols = list(merged)
+                placeholders = ", ".join("?" for _ in cols)
+                updates = ", ".join(f"{c}=excluded.{c}" for c in cols)
+                await db.execute(
+                    f"""INSERT INTO model_profile (provider_id, {", ".join(cols)}, updated_at)
+                        VALUES (?, {placeholders}, ?)
+                        ON CONFLICT(provider_id) DO UPDATE SET {updates}, updated_at=excluded.updated_at""",
+                    [provider_id] + [merged[c] for c in cols] + [now],
+                )
+                await db.commit()
+        cur_row = await self.get_all_profiles()
+        return cur_row.get(provider_id, {"provider_id": provider_id, **merged})
+
+    async def reap_orphans(self, live_ids: set[str]) -> dict[str, int]:
+        """清掉 provider 已不存在的档案/范围行。
+
+        AstrBot 的 delete_provider 不做任何级联清理，用户改名/删除后这边会留孤儿；
+        改名更狠——旧 id 的行会永远显示一个不存在的模型。
+        """
+        await self.init()
+        removed = {"model_profile": 0, "detection_preferences": 0}
+        if not live_ids:
+            # 一个 provider 都没有时不做全表删，交给上层确认，避免误清空
+            return removed
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                marks = ", ".join("?" for _ in live_ids)
+                params = tuple(live_ids)
+                for table in removed:
+                    cur = await db.execute(
+                        f"DELETE FROM {table} WHERE provider_id NOT IN ({marks})", params
+                    )
+                    removed[table] = cur.rowcount or 0
+                await db.commit()
+        return removed
+
 
 
 # ---------- helpers ----------
