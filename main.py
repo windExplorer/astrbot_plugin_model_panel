@@ -2911,8 +2911,160 @@ class ModelPanelPlugin(Star):
             logger.warning("[ModelPanel] 告警未送达任何管理员：检查 WebUI 平台设置里的「管理员 ID」是否已添加")
         return sent
 
+    # ================= 指令检测（真打模型） =================
+    _PROBE_MAX_TARGETS = 3
+
+    async def _match_models_async(self, keywords: list[str]):
+        """按关键词匹配模型，返回 (命中, 未开放指令检测)。
+
+        一个关键词可能命中多个模型（同名模型在不同渠道各一个 provider），
+        所以命中集按 provider id 去重，而不是取第一个。
+        """
+        scopes = {}
+        if self.storage:
+            try:
+                scopes = await self.storage.get_detect_scopes()
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取指令检测名单失败: {e}")
+        return self._match_models_with(scopes, keywords)
+
+    def _match_models_with(self, scopes: dict, keywords: list[str]):
+        hits, denied, matched_ids = [], [], set()
+        pats = [k.lower() for k in keywords if k]
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = str(d.get("id") or "")
+            if not pid or pid in matched_ids:
+                continue
+            hay = " ".join([str(d.get("display_model") or ""), str(d.get("model") or ""),
+                            str(d.get("name") or ""), pid]).lower()
+            if not any(pat in hay for pat in pats):
+                continue
+            matched_ids.add(pid)
+            if not (scopes.get(pid) or {}).get("command", True):
+                denied.append(d)
+                continue
+            hits.append((pid, d, p))
+        return hits, denied
+
+    async def _probe_result_chain(self, results: list[dict], names: dict[str, str], context_line: str):
+        """把一次指令探测的结果拼成卡片；没有可用字体时退回文本。"""
+        down = sum(1 for r in results if not r.get("ok"))
+        stats = [
+            {"label": "成功", "value": str(len(results) - down), "state": "healthy"},
+            {"label": "失败", "value": str(down), "state": "down" if down else "healthy"},
+        ]
+        rows = []
+        for r in results:
+            pid = str(r.get("id") or "")
+            ok = bool(r.get("ok"))
+            rows.append({
+                "state": "healthy" if ok else "down",
+                "name": names.get(pid) or pid,
+                "sub": (f"重试 {r.get('retry_count')} 次" if ok and r.get("retry_count")
+                        else (str(r.get("error_code") or "") if not ok else "")),
+                "cells": [_fmt_ms(r.get("latency_ms")),
+                          time.strftime("%H:%M:%S", time.localtime(int(r.get("checked_at") or time.time())))],
+            })
+        notes = ["口径：这里是空载探测值（一句 PONG 的往返），不是真实对话延迟，两者不可横向比较",
+                 context_line]
+        cfg = getattr(self, "config", None)
+        font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
+        png = await asyncio.to_thread(render_card, "模型探测结果", "指令", stats, ["探测延迟", "时间"],
+                                      rows, notes, font)
+        if png is not None:
+            return MessageChain([Image.fromBytes(png)])
+        lines = ["模型探测结果"]
+        for r in results:
+            pid = str(r.get("id") or "")
+            lines.append(f"{'OK ' if r.get('ok') else 'FAIL'} {names.get(pid) or pid} "
+                         f"{_fmt_ms(r.get('latency_ms'))} {r.get('error_code') or ''}".rstrip())
+        lines.append(notes[0])
+        return MessageChain([Plain("\n".join(lines))])
+
+    async def _run_command_probe(self, targets: list, umo: str, timeout: float) -> None:
+        """后台跑指令探测并把结果推回原会话。
+
+        不阻塞指令回执：3 个模型串起来最坏是 3 × 超时，直接在 handler 里等会让用户以为 bot 挂了。
+        """
+        results: list[dict] = []
+        names = {}
+        try:
+            tcfg = self._test_config()
+            sem = asyncio.Semaphore(max(1, min(3, MonitorConfig.from_config(self.config).probe_concurrency)))
+
+            async def one(item):
+                pid, d, provider = item
+                names[pid] = d.get("display_model") or d.get("model") or pid
+                async with sem:
+                    try:
+                        r = await self._test_one(provider, timeout, tcfg)
+                    except Exception as e:
+                        code, msg = _normalize_error(e)
+                        r = {"ok": False, "latency_ms": None, "error_code": code,
+                             "error": msg, "retry_count": 0}
+                    r.update({"id": pid, "name": d.get("name") or "", "model": d.get("model") or "",
+                              "skipped": False, "checked_at": int(time.time())})
+                    return r
+
+            results = list(await asyncio.gather(*[one(x) for x in targets]))
+            if self.storage:
+                try:
+                    ok_n = sum(1 for r in results if r.get("ok"))
+                    session = await self.storage.create_session("command", len(results))
+                    for r in results:
+                        await self.storage.insert_result(session["id"], r)
+                    await self.storage.finish_session(session["id"], ok_n, len(results) - ok_n, 0)
+                except Exception as e:
+                    logger.warning(f"[ModelPanel] 指令探测写历史失败: {e}")
+            # 每行已经带各自时刻，底部再放一个总时间戳会看着像两处不一致
+            chain = await self._probe_result_chain(
+                results, names,
+                f"超时上限 {int(timeout)}s · 单模型最多重试 {tcfg.get('test_retry_count', 0)} 次")
+            if not await self.context.send_message(umo, chain):
+                logger.warning("[ModelPanel] 指令探测结果未能送回原会话")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 指令探测异常: {e}", exc_info=True)
+        finally:
+            self._test_all_lock.release()
+
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
-    @astr_filter.command("模型静音")
+    @astr_filter.command("检测模型")
+    async def cmd_model_probe(self, event: AstrMessageEvent):
+        """指令检测：/检测模型 <名称关键词> [更多关键词…]，真打一次模型，会花额度。"""
+        keywords = _cmd_args(event).split()
+        if not keywords:
+            yield event.plain_result(
+                "用法：/检测模型 <模型名关键词>，可空格分隔多个\n"
+                f"例如：/检测模型 deepseek 或 /检测模型 硅基流动 kimi\n"
+                f"单次最多 {self._PROBE_MAX_TARGETS} 个模型，且只测档案里开放了「指令检测」通道的模型。")
+            return
+        hits, denied = await self._match_models_async(keywords)
+        if denied:
+            yield event.plain_result(
+                "这些模型没开放指令检测（去模型档案页勾选「指令」通道）："
+                + "、".join(str(d.get("display_model") or d.get("id")) for d in denied[:5]))
+            return
+        if not hits:
+            yield event.plain_result("没找到匹配「" + " ".join(keywords) + "」的模型")
+            return
+        if len(hits) > self._PROBE_MAX_TARGETS:
+            yield event.plain_result(
+                f"匹配到 {len(hits)} 个，超过单次上限 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
+                + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6]))
+            return
+        if self._test_all_lock.locked():
+            yield event.plain_result("已经有一轮检测在跑了（手动或定时），等它结束再试～")
+            return
+        # 先占锁再回执：避免回执到真正开跑之间插进来一次手动一键检测
+        await self._test_all_lock.acquire()
+        timeout = float(self._test_config()["test_timeout"])
+        asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
+        yield event.plain_result(
+            f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
+            + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
+
+
     async def cmd_model_mute(self, event: AstrMessageEvent):
         """临时关闭某模型的告警推送：/模型静音 <名称> [时长]，或 /模型静音 取消 <名称>。
 
