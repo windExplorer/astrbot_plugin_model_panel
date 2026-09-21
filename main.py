@@ -1782,14 +1782,19 @@ class ModelPanelPlugin(Star):
         首字与整轮耗时，数量级不同、语义不同，混起来统计就会骗人
         （口径详见 docs/模型监测与配置规划.md 第五节）。
         """
+        now = int(time.time())
         profiles: dict = {}
         scopes: dict = {}
         probes: dict = {}
+        mstates: dict = {}
+        alerts: list = []
         if self.storage:
             try:
                 profiles = await self.storage.get_all_profiles()
                 scopes = await self.storage.get_detect_scopes()
                 probes = await self.storage.latest_per_provider()
+                mstates = await self.storage.get_model_states()
+                alerts = await self.storage.open_alerts()
             except Exception as e:
                 logger.warning(f"[ModelPanel] 读取档案/范围/探测历史失败: {e}")
         live: dict = {}
@@ -1811,8 +1816,17 @@ class ModelPanelPlugin(Star):
             }
             l = live.get(pid) or {}
             pr = probes.get(pid) or {}
+            ms = mstates.get(pid) or {}
             state, reason = _derive_state(l, pr)
+            # 巡检状态机优先：它带连续失败计数与静音语义，而 _derive_state 只是按需现算的
+            # 近似值。两边各给一个结论而不统一的话，面板显示的和告警发出去的会各说各话。
+            persisted = str(ms.get("state") or "")
+            if persisted and persisted != "unknown":
+                state = persisted
+                if not reason and int(ms.get("consecutive_fail") or 0) > 0:
+                    reason = f"连续失败 {int(ms['consecutive_fail'])} 次"
             left, expiring = self._free_expiry(prof)
+            muted_until = int(ms.get("muted_until") or 0)
             items.append({
                 "id": pid,
                 "name": d["name"],
@@ -1863,10 +1877,26 @@ class ModelPanelPlugin(Star):
                 },
                 "state": state,
                 "reason": reason,
+                "muted": muted_until > now,
+                "muted_until": muted_until,
+                "consecutive_fail": int(ms.get("consecutive_fail") or 0),
             })
         counts = {"healthy": 0, "degraded": 0, "down": 0, "unknown": 0}
         for it in items:
             counts[it["state"]] = counts.get(it["state"], 0) + 1
+        label_of = {str(it.get("id")): str(it.get("display_model") or it.get("id") or "") for it in items}
+        open_alerts = [
+            {
+                "provider_id": str(a.get("provider_id") or ""),
+                "name": label_of.get(str(a.get("provider_id") or ""), str(a.get("provider_id") or "")),
+                "kind": str(a.get("kind") or ""),
+                "detail": redact(a.get("detail")),
+                "opened_at": int(a.get("opened_at") or 0),
+                # notified_at 为空表示这条还没送达过，正在等下一轮补发
+                "pending": not int(a.get("notified_at") or 0),
+            }
+            for a in alerts
+        ]
         return {
             "items": items,
             "counts": counts,
@@ -1874,6 +1904,8 @@ class ModelPanelPlugin(Star):
             "live_available": live_available,
             "truncated": truncated,
             "samples": len(records),
+            "alerts": open_alerts,
+            "muted_count": sum(1 for it in items if it.get("muted")),
             "enums": {
                 "billing_type": list(BILLING_TYPES),
                 "channel_kind": list(CHANNEL_KINDS),

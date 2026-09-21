@@ -584,3 +584,139 @@ export async function startTestAllStream(
     onError?.(e?.message || String(e));
   }
 }
+
+// ---------- 模型监测 / 档案 / 三通道范围 ----------
+export type BillingType =
+  | "unknown" | "free" | "temp_free" | "trial" | "paid_overage" | "paid" | "subscription";
+export type ChannelKind = "unknown" | "official" | "aggregator" | "reseller" | "self_hosted";
+export type ModelRole =
+  | "unknown" | "primary" | "backup" | "fallback" | "dedicated" | "watch" | "retired";
+export type HealthState = "healthy" | "degraded" | "down" | "unknown";
+
+export interface HealthBilling {
+  type: BillingType;
+  free_until: number | null;
+  free_days_left: number | null;
+  free_expiring: boolean;
+  currency: string;
+  price_input_per_m: number | null;
+  price_output_per_m: number | null;
+  price_cached_per_m: number | null;
+  channel_kind: ChannelKind;
+  role: ModelRole;
+  supports_streaming: "unknown" | "true" | "false";
+  probe_mode: "non_stream" | "stream" | "both";
+  note: string;
+}
+
+export interface HealthScope {
+  manual: boolean;
+  scheduled: boolean;
+  command: boolean;
+  /** 各通道是否被显式设置过；false 表示跟随计费类型推导默认值 */
+  explicit: Record<"manual" | "scheduled" | "command", boolean>;
+}
+
+export interface HealthLive {
+  total: number;
+  counted: number;
+  ok: number;
+  fail: number;
+  aborted: number;
+  fail_rate: number;
+  /** 真实对话首字延迟。null 表示没测到（非流式调用不产出该值），不是 0 */
+  avg_ttft_ms: number | null;
+  p95_ttft_ms: number | null;
+  ttft_samples: number;
+  /** 一轮对话总耗时，含工具执行与多步 agent 循环 */
+  avg_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  latency_samples: number;
+  tokens: number;
+}
+
+export interface HealthProbe {
+  /** null 表示从未探测过 */
+  ok: boolean | null;
+  latency_ms: number | null;
+  error_code: string;
+  checked_at: number;
+}
+
+export interface HealthItem {
+  id: string;
+  name: string;
+  model: string;
+  display_model: string;
+  is_default: boolean;
+  billing: HealthBilling;
+  scope: HealthScope;
+  live: HealthLive;
+  probe: HealthProbe;
+  state: HealthState;
+  reason: string;
+  muted: boolean;
+  muted_until: number;
+  consecutive_fail: number;
+}
+
+export interface HealthAlert {
+  provider_id: string;
+  name: string;
+  kind: string;
+  detail: string;
+  opened_at: number;
+  /** true 表示这条还没送达过，正在等下一轮补发 */
+  pending: boolean;
+}
+
+export interface HealthEnums {
+  billing_type: BillingType[];
+  channel_kind: ChannelKind[];
+  role: ModelRole[];
+  supports_streaming: string[];
+  probe_mode: string[];
+  scheduled_default_on: BillingType[];
+}
+
+export interface HealthResponse {
+  items: HealthItem[];
+  counts: Partial<Record<HealthState, number>>;
+  days: number;
+  live_available: boolean;
+  truncated: boolean;
+  samples: number;
+  alerts: HealthAlert[];
+  muted_count: number;
+  enums?: HealthEnums;
+  error?: string;
+}
+
+export async function apiGetHealth(days: number): Promise<HealthResponse> {
+  // 窗口拉长时核心表要全表扫，超时给足
+  return apiGet<HealthResponse>("/panel/health", { days }, 25000);
+}
+
+export async function apiSetProfile(id: string, patch: Partial<HealthBilling>) {
+  return apiPost<{ ok: boolean; error?: string; profile?: HealthBilling }>(
+    "/panel/profile", { id, patch }, 15000
+  );
+}
+
+export async function apiSetScope(id: string, channel: "manual" | "scheduled" | "command", enabled: boolean | null) {
+  return apiPost<{ ok: boolean; error?: string; scope?: HealthScope }>(
+    "/panel/scope", { id, channel, enabled }, 15000
+  );
+}
+
+/** 毫秒延迟格式化。null 显示 – 而不是 0：非流式调用压根没测到首字延迟。 */
+export function fmtMs(v: number | null | undefined): string {
+  if (v === null || v === undefined || !(v > 0)) return "–";
+  return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(1) + "s";
+}
+
+/** 失败率转成功率；样本为 0 时返回 – ，那不是「全对」而是「没数据」。 */
+export function fmtSuccess(counted: number, failRate: number): string {
+  if (!counted) return "–";
+  return ((1 - failRate) * 100).toFixed(1) + "%";
+}
