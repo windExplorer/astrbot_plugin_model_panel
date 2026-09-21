@@ -28,5 +28,47 @@
     "type": "string",
     "hint": "模型状态/告警以图片卡片发送时需要中文字体。留空则自动查找系统字体（Windows 微软雅黑 / Linux Noto Sans CJK / macOS 苹方）。若卡片退化成纯文本，说明没找到中文字体，可在此填一个 .ttc 或 .otf 的绝对路径。插件不内置字体文件，避免包体膨胀数十 MB。",
     "default": ""
+  },
+  "monitor_enabled": {
+    "description": "开启后台巡检与告警",
+    "type": "bool",
+    "hint": "关掉后不再采集状态、也不再发告警；面板上的实时监测查询不受影响（那是按需读取）。建议保持开启。",
+    "default": true
+  },
+  "monitor_interval_sec": {
+    "description": "巡检间隔（秒）",
+    "type": "int",
+    "hint": "每隔多久读一次核心调用记录并判定状态。建议 180 秒。这一步只读本地数据库、不请求模型，所以调小不花钱，但小于 30 秒意义不大且白耗 CPU。",
+    "default": 180
+  },
+  "alert_fail_threshold": {
+    "description": "连续失败几次判定为故障",
+    "type": "int",
+    "hint": "必须是**连续**失败，中间出现一次成功就重新计数。建议 3；设 1 会让一次网络抖动就触发告警，很快你就开始忽略告警了。",
+    "default": 3
+  },
+  "alert_cooldown_min": {
+    "description": "同一模型同类告警的冷却分钟数",
+    "type": "int",
+    "hint": "建议 30。没有冷却的话，一个持续故障的模型会按每条消息的频率反复刷屏（恢复通知也受同一冷却保护，防止在阈值附近抖动时来回发）。",
+    "default": 30
+  },
+  "alert_notify_enabled": {
+    "description": "把告警主动发给管理员",
+    "type": "bool",
+    "hint": "关掉则只记录状态与告警事件、不发聊天消息，适合「先静默收集几天看看再说」。接收人取 WebUI 平台设置里的「管理员 ID」，需要至少填一个真实 QQ 号，默认的 astrbot 占位值会被跳过。",
+    "default": true
+  },
+  "alert_retention_days": {
+    "description": "已结告警事件保留天数（0=不清理）",
+    "type": "int",
+    "hint": "建议 30。只清理已恢复/已关闭的事件；未结事件必须留着，否则冷却判定会失忆、导致重复刷屏。",
+    "default": 30
+  },
+  "free_expiry_alert_days": {
+    "description": "限时免费到期前提醒天数（0=不提醒）",
+    "type": "int",
+    "hint": "建议 3。只在「还没到期且已进入窗口」时提醒一次，已过期不再催——到期后到底转付费还是继续免费需要人来判断，天天催只会变成噪音。",
+    "default": 3
   }
 }

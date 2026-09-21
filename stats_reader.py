@@ -50,6 +50,10 @@ SQL_WINDOW = f"SELECT {_COLS} FROM provider_stats WHERE created_at >= :since ORD
 SQL_SINCE = f"SELECT {_COLS} FROM provider_stats WHERE id > :last_id ORDER BY id ASC LIMIT :limit"
 
 
+# 首轮巡检用：把游标直接放到表尾，避免把陈年历史当新数据评估后立刻告警
+SQL_LATEST = "SELECT COALESCE(MAX(id), 0) FROM provider_stats"
+
+
 def _to_utc_str(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).strftime(_TS_FORMAT)
 
@@ -203,6 +207,24 @@ class LiveStatsReader:
         if not rows:
             return [], last_id
         return rows, rows[-1].id
+
+    async def latest_id(self) -> Optional[int]:
+        """当前表尾主键。首轮巡检用它把游标直接放到最后，跳过陈年历史——
+        否则装上插件的第一秒就会因为「上周那三次失败」发一条莫名其妙的告警。
+
+        返回 ``None`` 表示读不到（表不存在或库不可用）。
+        """
+        try:
+            from sqlalchemy import text
+
+            db = self._get_db()
+            async with db.get_db() as session:
+                result = await session.execute(text(SQL_LATEST))
+                row = result.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            self.available = False
+            return None
 
 
 def percentile(values: list[float], pct: float) -> Optional[float]:

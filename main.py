@@ -9,12 +9,21 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter as astr_filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image, MessageChain, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
 from .card_render import render_card
+from .monitor import (
+    KIND_FAIL,
+    KIND_FREE_EXPIRING,
+    KIND_RECOVER,
+    MonitorConfig,
+    evaluate as evaluate_monitor,
+    free_expiry_decisions,
+    redact,
+)
 from .stats_reader import LiveStatsReader, summarize
 from .storage import (
     BILLING_TYPES,
@@ -224,6 +233,15 @@ def _cmd_args(event: AstrMessageEvent) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
+def _parse_duration(text: Any) -> int:
+    """把 ``30m`` / ``2h`` / ``1d`` / ``90`` 解析成秒。解析不出来返回 0，由调用方兜默认值。"""
+    m = re.fullmatch(r"(\d+)\s*([smhd]?)", str(text or "").strip().lower())
+    if not m:
+        return 0
+    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2) or "m"]
+    return int(m.group(1)) * unit
+
+
 # 陪伴插件的 provider 配置真实存放在 schema 分组 model_assignment_config 下，
 # 同时存在一层 invisible 的顶层扁平 legacy 副本。陪伴插件读写 config 时：
 #   - 读取（_flat_get）：优先读 schema 分组嵌套值，其次读顶层扁平副本；
@@ -347,6 +365,9 @@ class ModelPanelPlugin(Star):
         # 核心 provider_stats 只读适配层。传 lambda 而不是库对象，
         # 是为了热重载后仍拿到当前 Context 里的数据库实例。
         self.live_stats = LiveStatsReader(lambda: context.get_db())
+        # 巡检后台任务（initialize 里按配置启动）
+        self._monitor_running = False
+        self._monitor_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         # 数据库路径：优先用 AstrBot 提供的数据目录，回退到相对路径
@@ -386,6 +407,11 @@ class ModelPanelPlugin(Star):
         # provider 被删除或改名后，这边的档案/范围行不会自动消失（核心不做级联清理）
         await self._reap_orphans()
         self._register_routes()
+        cfg = MonitorConfig.from_config(self.config)
+        if cfg.enabled:
+            self._monitor_running = True
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
+            logger.info(f"[ModelPanel] 巡检已启动：每 {cfg.interval_sec}s 一轮，告警通知={'开' if cfg.notify_enabled else '关'}")
         logger.info(f"[ModelPanel] 模型控制台插件已初始化（db={db_path}）")
 
     async def _reap_orphans(self) -> None:
@@ -2515,6 +2541,259 @@ class ModelPanelPlugin(Star):
         lines.extend(notes[:2])
         return "\n".join(lines)
 
+    # ================= 巡检与告警 =================
+    _ALERT_TITLES = {
+        KIND_FAIL: "模型故障告警",
+        KIND_RECOVER: "模型恢复通知",
+        KIND_FREE_EXPIRING: "限时免费即将到期",
+    }
+
+    async def _monitor_loop(self) -> None:
+        """后台巡检循环。
+
+        单轮异常绝不能终止循环——否则功能会静默停摆到下次重启，
+        而「没告警」看起来永远像「一切正常」。
+        """
+        while getattr(self, "_monitor_running", False):
+            interval = 180
+            try:
+                cfg = MonitorConfig.from_config(self.config)
+                interval = cfg.interval_sec
+                if cfg.enabled:
+                    await self._monitor_tick(cfg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 巡检轮次异常，跳过本轮: {e}", exc_info=True)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
+    async def _monitor_tick(self, cfg: MonitorConfig) -> None:
+        # 开关在 tick 内部也判一次：只有循环检查的话，任何其它调用点
+        # （手动触发、未来的接口）都能绕过这个 kill switch。
+        if not cfg.enabled:
+            return
+        if not self.storage:
+            return
+        now = int(time.time())
+        cursor_raw = await self.storage.get_state_value("stats_cursor", "")
+        if cursor_raw == "":
+            # 首轮：把游标直接放到表尾。否则刚装上就会因为陈年历史里的失败立刻告警。
+            head = await self.live_stats.latest_id()
+            if head is None:
+                return
+            await self.storage.set_state_value("stats_cursor", str(head))
+            logger.info(f"[ModelPanel] 巡检游标已初始化（跳过历史 {head} 条）")
+            return
+        try:
+            cursor = int(cursor_raw)
+        except (TypeError, ValueError):
+            cursor = 0
+        rows, new_cursor = await self.live_stats.fetch_since(cursor, limit=2000)
+        states = await self.storage.get_model_states()
+        notified = await self.storage.last_notified_map()
+
+        def cooling(pid: str, kind: str) -> bool:
+            return notified.get((pid, kind), 0) + cfg.cooldown_sec > now
+
+        names: dict[str, str] = {}
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            if d.get("id"):
+                names[d["id"]] = d.get("display_model") or d.get("model") or d["id"]
+        profiles = await self.storage.get_all_profiles()
+        decisions = evaluate_monitor(rows, states, cfg, now, cooling)
+        decisions += free_expiry_decisions(profiles, cfg, now, cooling, names)
+
+        # 状态照常落库（面板要显示真实状态），投递失败靠 alert_events 里
+        # notified_at 为空的 open 事件在下一轮重试，见 _dispatch_alerts。
+        for d in decisions:
+            prev = states.get(d.provider_id) or {}
+            await self.storage.save_model_state(d.provider_id, {
+                "state": d.state,
+                "consecutive_fail": d.consecutive_fail,
+                "consecutive_ok": d.consecutive_ok,
+                "last_error_code": d.last_error_code,
+                "last_change_at": now if d.action else int(prev.get("last_change_at") or 0),
+                "muted_until": int(prev.get("muted_until") or 0),
+                "samples_total": int(prev.get("samples_total") or 0) + d.samples,
+            })
+        await self.storage.set_state_value("stats_cursor", str(new_cursor))
+        await self._dispatch_alerts(decisions, names, now, cfg)
+        pruned = await self.storage.cleanup_alerts(cfg.alert_retention_days)
+        if pruned:
+            logger.info(f"[ModelPanel] 清理已结告警事件 {pruned} 条")
+
+    async def _dispatch_alerts(self, decisions, names, now: int, cfg: MonitorConfig) -> None:
+        """按告警类型合并投递，并重试上一轮没送达的事件。
+
+        合并的理由：一家供应商挂 10 个模型时，1 条列了 10 行的卡片比 10 条卡片有用。
+        重试的理由：刚装上时 ``admins_id`` 往往还是默认占位值，若不重试，
+        第一批告警会被静默吞掉，而「没收到告警」看起来永远像「一切正常」。
+        """
+        groups: dict[str, list] = {}
+        for d in [x for x in decisions if x.should_notify]:
+            groups.setdefault(d.kind, []).append(d)
+        for kind, group in groups.items():
+            events = []
+            for d in group:
+                events.append((d, await self.storage.open_alert(
+                    d.provider_id, kind, redact(d.reason), now, now + cfg.cooldown_sec)))
+            chain = await self._alert_chain(kind, group, names, max(1, cfg.cooldown_sec // 60))
+            if chain is None or not await self._notify_admins(chain):
+                # 不写 notified_at → 冷却不启动，且该事件会被下一轮 pending_alerts 捞出来
+                logger.warning(f"[ModelPanel] {self._ALERT_TITLES.get(kind, kind)} 未能送达管理员，下一轮重试")
+                continue
+            for d, aid in events:
+                await self.storage.mark_alert_notified(aid, now)
+                if kind == KIND_RECOVER:
+                    # 恢复要把对应的故障事件关掉，否则它会一直挂着像没处理
+                    await self.storage.resolve_alerts(d.provider_id, KIND_FAIL, now)
+            logger.info(f"[ModelPanel] 已推送 {self._ALERT_TITLES.get(kind, kind)} ×{len(group)}")
+
+        pending = await self.storage.pending_alerts()
+        if not pending:
+            return
+        lines = ["之前有告警没能送达，现在补发："]
+        for ev in pending[:10]:
+            pid = str(ev.get("provider_id") or "")
+            title = self._ALERT_TITLES.get(str(ev.get("kind") or ""), "模型告警")
+            lines.append(f"· [{title}] {names.get(pid) or pid} {redact(ev.get('detail'), 60)}")
+        ok = await self._notify_admins(MessageChain([Plain("\n".join(lines))]))
+        if ok:
+            for ev in pending:
+                await self.storage.mark_alert_notified(int(ev["id"]), now)
+            logger.info(f"[ModelPanel] 补发历史未送达告警 ×{len(pending)}")
+
+    async def _alert_chain(self, kind: str, group, names: dict[str, str], cooldown_min: int):
+        """把一组同类告警拼成一条消息：能出图就出图，没字体就退回文本。"""
+        title = self._ALERT_TITLES.get(kind, "模型告警")
+        if kind == KIND_FAIL:
+            columns, stats = ["连续失败", "成功/样本"], [
+                {"label": "故障", "value": str(len(group)), "state": "down"}]
+        elif kind == KIND_RECOVER:
+            columns, stats = ["连续成功", "成功/样本"], [
+                {"label": "恢复", "value": str(len(group)), "state": "healthy"}]
+        else:
+            columns, stats = ["剩余天数"], [
+                {"label": "临期", "value": str(len(group)), "state": "degraded"}]
+        rows = []
+        for d in group:
+            det = d.detail or {}
+            ok_n, fail_n = int(det.get("ok") or 0), int(det.get("fail") or 0)
+            ratio = f"{ok_n}/{ok_n + fail_n + int(det.get('aborted') or 0)}"
+            if kind == KIND_FAIL:
+                cells = [str(d.consecutive_fail), ratio]
+            elif kind == KIND_RECOVER:
+                cells = [str(d.consecutive_ok), ratio]
+            else:
+                cells = [str(det.get("days_left", "?"))]
+            rows.append({
+                "state": "down" if kind == KIND_FAIL else ("degraded" if kind == KIND_FREE_EXPIRING else "healthy"),
+                "name": names.get(d.provider_id) or d.provider_id,
+                "sub": redact(d.reason),
+                "cells": cells,
+            })
+        notes = []
+        if kind == KIND_FAIL:
+            notes.append("故障判定基于真实对话连续失败，不含用户主动打断")
+            notes.append(f"冷却 {cooldown_min} 分钟内不重复推送 · /模型静音 可临时关闭")
+        elif kind == KIND_RECOVER:
+            notes.append("需连续成功才算恢复，避免一次成功就宣布好了")
+        else:
+            notes.append("到期后是否转付费请人工确认，已过期不再重复提醒")
+        notes.append(time.strftime("%m-%d %H:%M"))
+        badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
+        cfg_font = getattr(self, "config", None)
+        font = str(cfg_font.get("card_font_path") or "") if hasattr(cfg_font, "get") else ""
+        png = await asyncio.to_thread(render_card, title, badge, stats, columns, rows, notes, font)
+        if png is not None:
+            return MessageChain([Image.fromBytes(png)])
+        lines = [title] + [f"{names.get(d.provider_id) or d.provider_id} · {redact(d.reason)}" for d in group]
+        lines.append(notes[0])
+        return MessageChain([Plain("\n".join(lines))])
+
+    async def _notify_admins(self, chain) -> int:
+        """主动投递给管理员。
+
+        用 ``context.send_message`` 而不是 ``event.send``：后者只往事件结果链追加、
+        不抛错，事件结束后会静默丢弃——本工作区的 cosyvoice 为此踩过坑。
+        """
+        sent = 0
+        try:
+            cfg = self.context.get_config() or {}
+            admins = [str(a).strip() for a in (cfg.get("admins_id") or []) if str(a).strip()]
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 读取 admins_id 失败: {e}")
+            return 0
+        platforms: list[str] = []
+        try:
+            platforms = [str(p.meta().id) for p in self.context.platform_manager.platform_insts]
+        except Exception:
+            platforms = []
+        if not platforms:
+            platforms = ["aiocqhttp"]
+        for uid in admins:
+            if uid.lower() == "astrbot":
+                # 默认占位值不是真实 UID，发出去只会刷失败日志
+                continue
+            ok = False
+            for plat in platforms:
+                try:
+                    if await self.context.send_message(f"{plat}:FriendMessage:{uid}", chain):
+                        ok = True
+                        break
+                except Exception as e:
+                    logger.debug(f"[ModelPanel] 告警投递失败 {plat}/{uid}: {e}")
+            sent += 1 if ok else 0
+        if not sent:
+            logger.warning("[ModelPanel] 告警未送达任何管理员：检查 WebUI 平台设置里的「管理员 ID」是否已添加")
+        return sent
+
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("模型静音")
+    async def cmd_model_mute(self, event: AstrMessageEvent):
+        """临时关闭某模型的告警推送：/模型静音 <名称> [时长]，或 /模型静音 取消 <名称>。
+
+        只静音通知，不影响状态采集与面板显示——明知某个模型坏了且在等供应商修时，
+        需要的是关掉噪音，而不是把配置删掉。
+        """
+        args = _cmd_args(event).split()
+        if not args:
+            yield event.plain_result(
+                "用法：/模型静音 <模型名关键词> [时长]，例如 /模型静音 kimi 6h\n"
+                "时长支持 30m / 2h / 1d，默认 2h；/模型静音 取消 <名称> 解除")
+            return
+        if not self.storage:
+            yield event.plain_result("存储还没就绪，稍后再试～")
+            return
+        if args[0] in ("取消", "解除", "unmute") and len(args) > 1:
+            keyword, until, hint = " ".join(args[1:]), 0, "已解除静音"
+        else:
+            keyword = args[0]
+            seconds = _parse_duration(args[1] if len(args) > 1 else "2h") or 7200
+            until = int(time.time()) + seconds
+            hint = f"静音 {max(1, seconds // 60)} 分钟"
+        names = {}
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            names[d["id"]] = f"{d.get('display_model') or ''} {d.get('model') or ''} {d.get('name') or ''}".lower()
+        kw = keyword.lower()
+        hits = [pid for pid, text in names.items() if kw in text]
+        if not hits:
+            yield event.plain_result(f"没找到名字里含「{keyword}」的模型")
+            return
+        if len(hits) > 3:
+            yield event.plain_result(
+                f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n"
+                + "\n".join(names[h].split(" ")[0] for h in hits[:5]))
+            return
+        for pid in hits:
+            await self.storage.set_muted(pid, until)
+        yield event.plain_result(f"{hint}：" + "、".join(str(names[h]).split(" ")[0] for h in hits))
+
     @astr_filter.command("模型状态")
     async def cmd_model_status(self, event: AstrMessageEvent):
         """查询模型健康与延迟总览。只读核心记录，不请求模型、不产生任何费用。"""
@@ -2570,6 +2849,13 @@ class ModelPanelPlugin(Star):
         yield event.chain_result([Image.fromBytes(png)])
 
     async def terminate(self):
+        # 必须显式停循环：热重载后旧任务若残留，会出现同一份巡检双份跑、告警双发，
+        # 而且旧任务闭包里抓的是上一版的 self（存储实例可能已经关掉了）
+        self._monitor_running = False
+        task = getattr(self, "_monitor_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._monitor_task = None
         try:
             if self.storage:
                 await self.storage.close()

@@ -135,6 +135,45 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 
 CREATE INDEX IF NOT EXISTS idx_usage_day   ON llm_usage(day);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON llm_usage(model);
+
+-- 少量全局状态（目前只有 provider_stats 的增量读取游标）。
+-- 核心那张表只增不清，靠游标增量读才不会每次巡检都全表扫。
+CREATE TABLE IF NOT EXISTS panel_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+-- 每个模型当前的健康状态，是告警状态机的宿主。
+-- 必须有显式状态行，否则「连续失败几次才告警」「冷却多久不再重复发」
+-- 「已告警过还是刚恢复」这些都没地方记，只能每次现算，既慢又容易重复刷屏。
+CREATE TABLE IF NOT EXISTS model_state (
+    provider_id      TEXT PRIMARY KEY,
+    state            TEXT NOT NULL DEFAULT 'unknown',
+    consecutive_fail INTEGER NOT NULL DEFAULT 0,
+    consecutive_ok   INTEGER NOT NULL DEFAULT 0,
+    last_error_code  TEXT NOT NULL DEFAULT '',
+    last_change_at   INTEGER NOT NULL DEFAULT 0,
+    muted_until      INTEGER NOT NULL DEFAULT 0,
+    samples_total    INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL
+);
+
+-- 告警事件：可追溯 + 冷却判定的依据
+CREATE TABLE IF NOT EXISTS alert_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id     TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'open',
+    detail          TEXT NOT NULL DEFAULT '',
+    count           INTEGER NOT NULL DEFAULT 1,
+    opened_at       INTEGER NOT NULL,
+    notified_at     INTEGER,
+    resolved_at     INTEGER,
+    cooldown_until  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_provider ON alert_events(provider_id, kind, state);
 """
 
 
@@ -673,6 +712,190 @@ class Storage:
         cur_row = await self.get_all_profiles()
         return cur_row.get(provider_id, {"provider_id": provider_id, **merged})
 
+    # ---------- 全局小状态（provider_stats 游标等） ----------
+    async def get_state_value(self, key: str, default: str = "") -> str:
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT value FROM panel_state WHERE key = ?", (key,))
+            row = await cur.fetchone()
+        return str(row[0]) if row and row[0] is not None else default
+
+    async def set_state_value(self, key: str, value: Any) -> None:
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO panel_state (key, value, updated_at) VALUES (?, ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                    (key, str(value), int(time.time())),
+                )
+                await db.commit()
+
+    # ---------- 模型状态机 ----------
+    async def get_model_states(self) -> dict[str, dict[str, Any]]:
+        await self.init()
+        cols = ("state", "consecutive_fail", "consecutive_ok", "last_error_code",
+                "last_change_at", "muted_until", "samples_total")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"SELECT provider_id, {', '.join(cols)} FROM model_state")
+            rows = await cur.fetchall()
+        out = {}
+        for r in rows:
+            d = {"provider_id": r["provider_id"]}
+            for c in cols:
+                d[c] = r[c] if c == "state" else int(r[c] or 0)
+            out[r["provider_id"]] = d
+        return out
+
+    async def save_model_state(self, provider_id: str, patch: dict[str, Any]) -> None:
+        """整行 upsert。巡检是单任务的，所以读-改-写之间不会有并发丢更新。"""
+        await self.init()
+        fields = ("state", "consecutive_fail", "consecutive_ok", "last_error_code",
+                  "last_change_at", "muted_until", "samples_total")
+        cur_state = (await self.get_model_states()).get(provider_id) or {
+            "state": "unknown", "consecutive_fail": 0, "consecutive_ok": 0,
+            "last_error_code": "", "last_change_at": 0, "muted_until": 0, "samples_total": 0,
+        }
+        merged = dict(cur_state)
+        merged.update({k: v for k, v in patch.items() if k in fields})
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"""INSERT INTO model_state (provider_id, {', '.join(fields)}, updated_at)
+                        VALUES ({', '.join('?' for _ in range(len(fields) + 2))})
+                        ON CONFLICT(provider_id) DO UPDATE SET
+                          {', '.join(f'{f}=excluded.{f}' for f in fields)}, updated_at=excluded.updated_at""",
+                    [provider_id] + [merged[f] for f in fields] + [int(time.time())],
+                )
+                await db.commit()
+
+    async def set_muted(self, provider_id: str, until_ts: int) -> None:
+        """只改静默截止时间，不动状态机其它字段。"""
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO model_state (provider_id, muted_until, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(provider_id) DO UPDATE SET muted_until=excluded.muted_until,
+                         updated_at=excluded.updated_at""",
+                    (provider_id, int(until_ts), int(time.time())),
+                )
+                await db.commit()
+
+    # ---------- 告警事件 ----------
+    async def open_alert(
+        self, provider_id: str, kind: str, detail: str, now: int, cooldown_until: int = 0
+    ) -> int:
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    """INSERT INTO alert_events (provider_id, kind, state, detail, count, opened_at, cooldown_until)
+                       VALUES (?, ?, 'open', ?, 1, ?, ?)""",
+                    (provider_id, kind, detail[:300], now, cooldown_until),
+                )
+                await db.commit()
+                return int(cur.lastrowid or 0)
+
+    async def mark_alert_notified(self, alert_id: int, now: int) -> None:
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE alert_events SET state='notified', notified_at=? WHERE id=?",
+                    (now, alert_id),
+                )
+                await db.commit()
+
+    async def pending_alerts(self, max_age_sec: int = 86400, limit: int = 100) -> list[dict[str, Any]]:
+        """已创建但从未送达的告警事件，供下一轮重试。
+
+        只认 ``notified_at IS NULL``：投递失败时不写 notified_at，冷却因此不会启动，
+        这些事件就必须被重试，否则「管理员还没配好」的第一条告警会被静默吞掉。
+        超过 ``max_age_sec`` 的旧事件放弃，避免长期无接收人时无限重试。
+        """
+        await self.init()
+        cutoff = int(time.time()) - max(60, int(max_age_sec))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT * FROM alert_events
+                   WHERE state='open' AND notified_at IS NULL AND opened_at >= ?
+                   ORDER BY opened_at ASC LIMIT ?""",
+                (cutoff, int(limit)),
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def resolve_alerts(self, provider_id: str, kind: str, now: int) -> int:
+        """把该模型该类型的未结告警关掉。恢复通知靠它，否则事件会一直挂着。"""
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    """UPDATE alert_events SET state='resolved', resolved_at=?
+                       WHERE provider_id=? AND kind=? AND state IN ('open','notified')""",
+                    (now, provider_id, kind),
+                )
+                await db.commit()
+                return cur.rowcount or 0
+
+    async def last_notified_at(self, provider_id: str, kind: str) -> int:
+        """该模型该类型最近一次真正发出去告警的时间，冷却判定用。"""
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """SELECT MAX(notified_at) FROM alert_events
+                   WHERE provider_id=? AND kind=? AND notified_at IS NOT NULL""",
+                (provider_id, kind),
+            )
+            row = await cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+    async def last_notified_map(self) -> dict[tuple[str, str], int]:
+        """``{(provider_id, kind): 最近一次发出告警的秒级时间戳}``。
+
+        一次查全而不是逐个问：巡检每轮都要判冷却，N 个模型就是 N 次查询。
+        已 resolved 的事件也要算进来——冷却防的是刷屏，不是只防未结的。
+        """
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """SELECT provider_id, kind, MAX(notified_at) FROM alert_events
+                   WHERE notified_at IS NOT NULL GROUP BY provider_id, kind"""
+            )
+            rows = await cur.fetchall()
+        return {(str(r[0]), str(r[1])): int(r[2] or 0) for r in rows}
+
+    async def open_alerts(self, limit: int = 50) -> list[dict[str, Any]]:
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT * FROM alert_events WHERE state IN ('open','notified')
+                   ORDER BY opened_at DESC LIMIT ?""",
+                (int(limit),),
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def cleanup_alerts(self, days: int) -> int:
+        """只清已结的告警事件，未结的必须留着，否则冷却判定会失忆导致重复刷屏。"""
+        if days <= 0:
+            return 0
+        await self.init()
+        cutoff = int(time.time()) - days * 86400
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    "DELETE FROM alert_events WHERE state='resolved' AND resolved_at < ?", (cutoff,)
+                )
+                await db.commit()
+                return cur.rowcount or 0
+
     async def reap_orphans(self, live_ids: set[str]) -> dict[str, int]:
         """清掉 provider 已不存在的档案/范围行。
 
@@ -680,7 +903,8 @@ class Storage:
         改名更狠——旧 id 的行会永远显示一个不存在的模型。
         """
         await self.init()
-        removed = {"model_profile": 0, "detection_preferences": 0}
+        tables = ("model_profile", "detection_preferences", "model_state", "alert_events")
+        removed = {t: 0 for t in tables}
         if not live_ids:
             # 一个 provider 都没有时不做全表删，交给上层确认，避免误清空
             return removed
@@ -688,7 +912,7 @@ class Storage:
             async with aiosqlite.connect(self.db_path) as db:
                 marks = ", ".join("?" for _ in live_ids)
                 params = tuple(live_ids)
-                for table in removed:
+                for table in tables:
                     cur = await db.execute(
                         f"DELETE FROM {table} WHERE provider_id NOT IN ({marks})", params
                     )

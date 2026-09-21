@@ -1,0 +1,247 @@
+"""告警规则引擎：只做判定，不碰数据库也不发消息。
+
+为什么单独一个模块并且保持纯函数：这套规则的输入（一批调用记录 + 上一轮状态）和
+输出（每个模型的新状态 + 要不要告警）完全可以离线断言。一旦掺进 IO，
+「连续失败几次才告警」「冷却」「恢复通知」这些就只能靠在线上跑一遍来验，代价高得多。
+
+三条判定纪律：
+
+- **连续**失败才算故障，不是窗口内失败率——一次抖动就告警会让人很快开始忽略告警。
+- ``aborted``（用户主动打断）不改变任何计数器，它既不是成功也不是故障。
+- 恢复必须**连续成功**若干次才算，避免「一次成功 → 发恢复 → 立刻又失败」的抖动通知。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional
+
+# 告警类型
+KIND_FAIL = "fail_burst"
+KIND_RECOVER = "recovered"
+KIND_FREE_EXPIRING = "free_expiring"
+
+STATE_HEALTHY = "healthy"
+STATE_DEGRADED = "degraded"
+STATE_DOWN = "down"
+STATE_UNKNOWN = "unknown"
+
+# 从 down 恢复需要连续成功次数。设 2 而不是 1：单次成功就宣布恢复会被抖动骗。
+RECOVER_OK = 2
+# 未达故障阈值但确有失败时标降级，让「在变差」和「坏了」在界面上可区分
+DEGRADED_FAIL_RATE = 0.10
+
+# 告警文案里绝不能出现的凭据形态。
+# 顺序有讲究：通用的 "key=value" 规则必须放最后，否则 "Authorization: Bearer xxx"
+# 会先被它吃掉 "Bearer" 这个词，导致真正的令牌值反而逃过脱敏。
+_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}"),
+    re.compile(r"://[^:/\s]+:[^@/\s]+@"),
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?key|secret[_-]?key|authorization|token|password)\b\s*[=:]\s*[^\s,;&]+"),
+)
+
+
+@dataclass
+class MonitorConfig:
+    """巡检与告警参数。全部有安全默认值，配置缺失时不会炸。"""
+
+    enabled: bool = True
+    notify_enabled: bool = True
+    interval_sec: int = 180
+    fail_threshold: int = 3
+    cooldown_sec: int = 1800
+    alert_retention_days: int = 30
+    free_alert_days: int = 3
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "MonitorConfig":
+        """从 AstrBotConfig（dict 子类）容错读取。任何一项坏掉都退回默认值。"""
+        out = cls()
+        get = getattr(cfg, "get", None)
+        if not callable(get):
+            return out
+        try:
+            out.enabled = bool(get("monitor_enabled", True))
+            out.notify_enabled = bool(get("alert_notify_enabled", True))
+            out.interval_sec = max(30, int(get("monitor_interval_sec") or out.interval_sec))
+            out.fail_threshold = max(1, int(get("alert_fail_threshold") or out.fail_threshold))
+            out.cooldown_sec = max(60, int(get("alert_cooldown_min") or 0) * 60) or out.cooldown_sec
+            out.alert_retention_days = max(0, int(get("alert_retention_days") or out.alert_retention_days))
+            out.free_alert_days = max(0, int(get("free_expiry_alert_days") or 0))
+        except (TypeError, ValueError):
+            return cls()
+        return out
+
+
+@dataclass
+class Decision:
+    """一个模型这一轮的判定结果。"""
+
+    provider_id: str
+    state: str
+    consecutive_fail: int = 0
+    consecutive_ok: int = 0
+    samples: int = 0
+    fails: int = 0
+    action: str = ""  # "" / alert / recover
+    kind: str = ""
+    reason: str = ""
+    suppressed: str = ""  # "" / muted / cooldown / notify_off
+    last_error_code: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def should_notify(self) -> bool:
+        return bool(self.action) and not self.suppressed
+
+
+def redact(text: Any, limit: int = 160) -> str:
+    """抹掉可能混进告警文案的凭据。
+
+    探测的 error_message 只截断到 80 字符，但**截断不保证不含 api_key**——
+    异常字符串完全可能把请求头或带凭据的 URL 回显出来，而告警是发到聊天软件里的。
+    """
+    out = str(text or "")
+    for pattern in _SECRET_PATTERNS:
+        out = pattern.sub("***", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out[:limit]
+
+
+def _default_state() -> dict[str, Any]:
+    return {
+        "state": STATE_UNKNOWN, "consecutive_fail": 0, "consecutive_ok": 0,
+        "last_error_code": "", "muted_until": 0, "samples_total": 0, "last_change_at": 0,
+    }
+
+
+def evaluate(
+    records: Iterable[Any],
+    states: dict[str, dict[str, Any]],
+    cfg: MonitorConfig,
+    now: int,
+    cooldown_active: Optional[Callable[[str, str], bool]] = None,
+) -> list[Decision]:
+    """吃一批新增的真实调用记录，吐每个被触及模型的判定。
+
+    Args:
+        records: ``stats_reader.CallRecord`` 序列。
+        states: 上一轮的 ``model_state``，键为 provider_id。
+        cfg: 阈值与冷却配置。
+        now: 当前秒级时间戳。
+        cooldown_active: ``(provider_id, kind) -> bool``，由调用方接数据库实现；
+            不传表示不做冷却判定（测试或首次启动时用）。
+    """
+    grouped: dict[str, list[Any]] = {}
+    for r in records:
+        pid = str(getattr(r, "provider_id", "") or "") or "(unknown)"
+        grouped.setdefault(pid, []).append(r)
+
+    out: list[Decision] = []
+    for pid, rows in grouped.items():
+        prev = dict(_default_state())
+        prev.update(states.get(pid) or {})
+        fail_streak = int(prev.get("consecutive_fail") or 0)
+        ok_streak = int(prev.get("consecutive_ok") or 0)
+        fails = oks = aborted = 0
+        for r in sorted(rows, key=lambda x: getattr(x, "started_at", 0) or 0):
+            if getattr(r, "aborted", False):
+                aborted += 1
+                continue
+            if getattr(r, "ok", False):
+                oks += 1
+                fail_streak = 0
+                ok_streak += 1
+            else:
+                fails += 1
+                ok_streak = 0
+                fail_streak += 1
+
+        counted = oks + fails
+        rate = (fails / counted) if counted else 0.0
+        before = str(prev.get("state") or STATE_UNKNOWN)
+        if fail_streak >= cfg.fail_threshold:
+            state = STATE_DOWN
+        elif before == STATE_DOWN and ok_streak < RECOVER_OK:
+            # 还没攒够连续成功，先别急着宣布恢复
+            state = STATE_DOWN
+        elif rate > DEGRADED_FAIL_RATE:
+            state = STATE_DEGRADED
+        elif counted:
+            state = STATE_HEALTHY
+        else:
+            state = before or STATE_UNKNOWN
+
+        d = Decision(
+            provider_id=pid,
+            state=state,
+            consecutive_fail=fail_streak,
+            consecutive_ok=ok_streak,
+            samples=counted,
+            fails=fails,
+            last_error_code="" if state != STATE_DOWN else str(prev.get("last_error_code") or ""),
+            detail={"aborted": aborted, "ok": oks, "fail": fails, "fail_rate": round(rate, 4), "before": before},
+        )
+        if state == STATE_DOWN and before != STATE_DOWN:
+            d.action, d.kind = "alert", KIND_FAIL
+            d.reason = f"连续失败 {fail_streak} 次"
+        elif before == STATE_DOWN and state != STATE_DOWN:
+            d.action, d.kind = "recover", KIND_RECOVER
+            d.reason = f"已连续成功 {ok_streak} 次"
+
+        if d.action:
+            if int(prev.get("muted_until") or 0) > now:
+                d.suppressed = "muted"
+            elif not cfg.notify_enabled:
+                d.suppressed = "notify_off"
+            elif cooldown_active and cooldown_active(pid, d.kind):
+                # 恢复通知也要冷却：模型在阈值附近抖动时，down→恢复→down 会来回发，
+                # 只给故障告警设冷却的话，恢复这一路就成了刷屏的缺口。
+                d.suppressed = "cooldown"
+        out.append(d)
+    return out
+
+
+def free_expiry_decisions(
+    profiles: dict[str, dict[str, Any]],
+    cfg: MonitorConfig,
+    now: int,
+    cooldown_active: Optional[Callable[[str, str], bool]] = None,
+    names: Optional[dict[str, str]] = None,
+) -> list[Decision]:
+    """限时免费临期提醒。
+
+    只在「还没到期但已进入提醒窗口」时触发，且走冷却，避免每天重复提醒同一件事。
+    已过期不再提醒——到期后到底转付费还是继续免费得人判断，天天催只会变成噪音。
+    """
+    if cfg.free_alert_days <= 0:
+        return []
+    out: list[Decision] = []
+    for pid, prof in (profiles or {}).items():
+        if str(prof.get("billing_type") or "") != "temp_free":
+            continue
+        try:
+            until = int(prof.get("free_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if until <= 0:
+            continue
+        days_left = int((until - now) // 86400)
+        if not (0 <= days_left <= cfg.free_alert_days):
+            continue
+        d = Decision(
+            provider_id=pid,
+            state=STATE_HEALTHY,
+            action="alert",
+            kind=KIND_FREE_EXPIRING,
+            reason=f"限时免费 {days_left} 天后到期",
+            detail={"days_left": days_left, "name": str((names or {}).get(pid) or pid)},
+        )
+        if not cfg.notify_enabled:
+            d.suppressed = "notify_off"
+        elif cooldown_active and cooldown_active(pid, KIND_FREE_EXPIRING):
+            d.suppressed = "cooldown"
+        out.append(d)
+    return out
