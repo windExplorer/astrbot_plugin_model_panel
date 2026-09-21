@@ -22,5 +22,11 @@
     "type": "int",
     "hint": "超过该天数的检测历史会自动清理，释放磁盘空间。默认 30 天。",
     "default": 30
+  },
+  "card_font_path": {
+    "description": "卡片中文字体路径（留空=自动探测系统字体）",
+    "type": "string",
+    "hint": "模型状态/告警以图片卡片发送时需要中文字体。留空则自动查找系统字体（Windows 微软雅黑 / Linux Noto Sans CJK / macOS 苹方）。若卡片退化成纯文本，说明没找到中文字体，可在此填一个 .ttc 或 .otf 的绝对路径。插件不内置字体文件，避免包体膨胀数十 MB。",
+    "default": ""
   }
 }

@@ -9,11 +9,24 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter as astr_filter
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
-from .storage import Storage
+from .card_render import render_card
+from .stats_reader import LiveStatsReader, summarize
+from .storage import (
+    BILLING_TYPES,
+    CHANNEL_KINDS,
+    DETECT_CHANNELS,
+    PROFILE_FIELDS,
+    PROBE_MODES,
+    ROLES,
+    SCHEDULED_DEFAULT_ON,
+    STREAM_FLAGS,
+    Storage,
+)
 from .session_manager import SessionManager
 from .plugin_models import PluginModelScanner
 
@@ -138,6 +151,79 @@ def _normalize_error(exc: BaseException | str) -> tuple[str, str]:
     return "unknown", raw[:ERROR_MESSAGE_MAX]
 
 
+# 健康态判定阈值。样本不足时坚决不给结论——「1 次失败 = 100% 失败率」是误报的主要来源。
+MIN_LIVE_SAMPLES = 3
+DEGRADED_FAIL_RATE = 0.10
+DOWN_FAIL_RATE = 0.50
+
+
+def _derive_state(live: dict, probe: dict) -> tuple[str, str]:
+    """推一个健康态：真实对话监测优先，样本不够时退回最近一次探测。
+
+    ``rate_limit`` 不判故障：并发探测和真实高负载都会自己触发 429，
+    把它当故障会把健康模型标红，进而误导「换模型」的决策。
+
+    Returns:
+        ``(state, reason)``，state 取值 healthy / degraded / down / unknown。
+    """
+    counted = int((live or {}).get("counted") or 0)
+    if counted >= MIN_LIVE_SAMPLES:
+        rate = float((live or {}).get("fail_rate") or 0.0)
+        if rate >= DOWN_FAIL_RATE:
+            return "down", f"真实调用失败率 {rate:.0%}（{int(live.get('fail') or 0)}/{counted}）"
+        if rate > DEGRADED_FAIL_RATE:
+            return "degraded", f"真实调用失败率 {rate:.0%}"
+        return "healthy", ""
+    if probe:
+        if probe.get("ok"):
+            return "healthy", ""
+        code = str(probe.get("error_code") or "")
+        if code == "skipped":
+            return "unknown", "未参与检测"
+        if code == "rate_limit":
+            return "degraded", "请求受限（可能并发自触发，未判为故障）"
+        if code:
+            return "down", code
+    return "unknown", "暂无数据"
+
+
+def _fmt_ms(value) -> str:
+    """毫秒格式化。<1 秒用 ms，否则用秒。拿不到值显示 ``-`` 而不是 0。
+
+    这里绝不能把「没测到」显示成 0ms —— 非流式调用本就不产出 TTFT，
+    显示 0 会让人以为模型快得离谱。
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if n <= 0:
+        return "-"
+    return f"{n:.0f}ms" if n < 1000 else f"{n / 1000:.1f}s"
+
+
+def _fmt_success(fail_rate) -> str:
+    """失败率转成功率。样本为 0 时不显示 100%（那是「没数据」不是「全对」）。"""
+    try:
+        return f"{(1.0 - float(fail_rate)) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _cmd_args(event: AstrMessageEvent) -> str:
+    """取指令的参数部分（第一个 token 之后的所有内容）。
+
+    没有用 GreedyStr 声明形参：那样缺参时 CommandFilter 会抛 ValueError，
+    而本指令希望缺参时回一句用法提示，所以自己解析。
+    """
+    try:
+        text = re.sub(r"\s+", " ", str(event.get_message_text() or "")).strip()
+    except Exception:
+        return ""
+    parts = text.split(" ", 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 # 陪伴插件的 provider 配置真实存放在 schema 分组 model_assignment_config 下，
 # 同时存在一层 invisible 的顶层扁平 legacy 副本。陪伴插件读写 config 时：
 #   - 读取（_flat_get）：优先读 schema 分组嵌套值，其次读顶层扁平副本；
@@ -258,6 +344,9 @@ class ModelPanelPlugin(Star):
         self._test_all_lock = asyncio.Lock()
         # 全插件模型配置扫描器（惰性创建，见 _scanner()）
         self._plugin_scanner: Optional[PluginModelScanner] = None
+        # 核心 provider_stats 只读适配层。传 lambda 而不是库对象，
+        # 是为了热重载后仍拿到当前 Context 里的数据库实例。
+        self.live_stats = LiveStatsReader(lambda: context.get_db())
 
     async def initialize(self):
         # 数据库路径：优先用 AstrBot 提供的数据目录，回退到相对路径
@@ -285,8 +374,34 @@ class ModelPanelPlugin(Star):
                 logger.info(f"[ModelPanel] 清理用量记录 {deleted_usage} 条（> 90 天）")
         except Exception as e:
             logger.warning(f"[ModelPanel] 清理用量记录失败: {e}")
+        # 探测核心 provider_stats 能否读（老版本 AstrBot 没这张表）。
+        # 读不到就整块实时监测降级，原有的主动探测功能不受影响。
+        try:
+            if await self.live_stats.probe():
+                logger.info("[ModelPanel] 实时监测已启用：只读核心 provider_stats")
+            else:
+                logger.info("[ModelPanel] 实时监测不可用（核心表缺失），仅保留主动探测")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 探测 provider_stats 失败: {e}")
+        # provider 被删除或改名后，这边的档案/范围行不会自动消失（核心不做级联清理）
+        await self._reap_orphans()
         self._register_routes()
         logger.info(f"[ModelPanel] 模型控制台插件已初始化（db={db_path}）")
+
+    async def _reap_orphans(self) -> None:
+        """回收 provider 已不存在的档案与检测范围行。"""
+        try:
+            if not self.storage:
+                return
+            known = {str(i) for i in self._provider_ids() if str(i)}
+            if not known:
+                # 一个 chat provider 都没加载时不做回收，避免把档案全清掉
+                return
+            removed = await self.storage.reap_orphans(known)
+            if any(removed.values()):
+                logger.info(f"[ModelPanel] 回收孤儿行: {removed}")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 回收孤儿行失败: {e}")
 
     # ---------------- LLM 用量采集 ----------------
     @astr_filter.on_llm_response()
@@ -681,6 +796,9 @@ class ModelPanelPlugin(Star):
             ("/panel/providers/session/<session_id>", self.api_session_state, ["GET"]),
             ("/panel/providers/results", self.api_test_results, ["GET"]),
             ("/panel/providers/history", self.api_test_history, ["GET"]),
+            ("/panel/health", self.api_health, ["GET"]),
+            ("/panel/profile", self.api_profile_set, ["POST"]),
+            ("/panel/scope", self.api_scope_set, ["POST"]),
             ("/panel/preferences", self.api_get_preferences, ["GET"]),
             ("/panel/preferences", self.api_set_preferences, ["POST"]),
             ("/panel/config", self.api_get_config, ["GET"]),
@@ -1614,6 +1732,203 @@ class ModelPanelPlugin(Star):
             logger.warning(f"[ModelPanel] /panel/providers/history 失败: {e}")
             return {"items": [], "stats": {}, "error": str(e)}
 
+    # ================= 模型档案 / 检测范围 / 实时监测 =================
+    def _free_expiry(self, profile: dict) -> tuple[Optional[int], bool]:
+        """算限时免费的剩余天数。返回 (剩余天数或 None, 是否三天内到期)。
+
+        到期日目前只做展示与提示，不自动改计费类型——「到期后到底转付费还是继续免费」
+        得人来判断，猜错会让后面的成本统计整体失真。
+        """
+        raw = (profile or {}).get("free_until")
+        try:
+            until = int(raw) if raw else 0
+        except (TypeError, ValueError):
+            return None, False
+        if until <= 0:
+            return None, False
+        left = int((until - time.time()) // 86400)
+        return left, left <= 3
+
+    async def _health_view(self, days: float = 7.0) -> dict:
+        """把四份数据拼成一张视图表：档案 / 三通道范围 / 最近探测 / 真实对话监测。
+
+        刻意不合并成一个「平均延迟」：探测测的是空载非流式往返，监测记录的是真实对话
+        首字与整轮耗时，数量级不同、语义不同，混起来统计就会骗人
+        （口径详见 docs/模型监测与配置规划.md 第五节）。
+        """
+        profiles: dict = {}
+        scopes: dict = {}
+        probes: dict = {}
+        if self.storage:
+            try:
+                profiles = await self.storage.get_all_profiles()
+                scopes = await self.storage.get_detect_scopes()
+                probes = await self.storage.latest_per_provider()
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取档案/范围/探测历史失败: {e}")
+        live: dict = {}
+        live_available = self.live_stats.available
+        truncated = False
+        records: list = []
+        if live_available:
+            records, truncated = await self.live_stats.fetch_window(days=days)
+            live = summarize(records)
+        default_id = await self._default_provider_id()
+        items = []
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = d["id"]
+            prof = profiles.get(pid) or {}
+            scope = scopes.get(pid) or {
+                "manual": True, "scheduled": False, "command": True,
+                "billing_type": "unknown", "explicit": {},
+            }
+            l = live.get(pid) or {}
+            pr = probes.get(pid) or {}
+            state, reason = _derive_state(l, pr)
+            left, expiring = self._free_expiry(prof)
+            items.append({
+                "id": pid,
+                "name": d["name"],
+                "model": d["model"],
+                "display_model": d["display_model"],
+                "is_default": bool(pid and pid == default_id),
+                "billing": {
+                    "type": str(prof.get("billing_type") or "unknown"),
+                    "free_until": prof.get("free_until"),
+                    "free_days_left": left,
+                    "free_expiring": expiring,
+                    "currency": prof.get("currency") or "",
+                    "price_input_per_m": prof.get("price_input_per_m"),
+                    "price_output_per_m": prof.get("price_output_per_m"),
+                    "price_cached_per_m": prof.get("price_cached_per_m"),
+                    "channel_kind": str(prof.get("channel_kind") or "unknown"),
+                    "role": str(prof.get("role") or "unknown"),
+                    "supports_streaming": str(prof.get("supports_streaming") or "unknown"),
+                    "probe_mode": str(prof.get("probe_mode") or "non_stream"),
+                    "note": prof.get("note") or "",
+                },
+                "scope": {
+                    "manual": bool(scope.get("manual")),
+                    "scheduled": bool(scope.get("scheduled")),
+                    "command": bool(scope.get("command")),
+                    "explicit": scope.get("explicit") or {},
+                },
+                "live": {
+                    "total": int(l.get("total") or 0),
+                    "counted": int(l.get("counted") or 0),
+                    "ok": int(l.get("ok") or 0),
+                    "fail": int(l.get("fail") or 0),
+                    "aborted": int(l.get("aborted") or 0),
+                    "fail_rate": float(l.get("fail_rate") or 0.0),
+                    "avg_ttft_ms": l.get("avg_ttft_ms"),
+                    "p95_ttft_ms": l.get("p95_ttft_ms"),
+                    "ttft_samples": int(l.get("ttft_samples") or 0),
+                    "avg_latency_ms": l.get("avg_latency_ms"),
+                    "p95_latency_ms": l.get("p95_latency_ms"),
+                    "latency_samples": int(l.get("latency_samples") or 0),
+                    "tokens": int(l.get("tokens") or 0),
+                },
+                "probe": {
+                    "ok": bool(pr.get("ok")) if pr else None,
+                    "latency_ms": pr.get("latency_ms"),
+                    "error_code": pr.get("error_code") or "",
+                    "checked_at": int(pr.get("checked_at") or 0),
+                },
+                "state": state,
+                "reason": reason,
+            })
+        counts = {"healthy": 0, "degraded": 0, "down": 0, "unknown": 0}
+        for it in items:
+            counts[it["state"]] = counts.get(it["state"], 0) + 1
+        return {
+            "items": items,
+            "counts": counts,
+            "days": days,
+            "live_available": live_available,
+            "truncated": truncated,
+            "samples": len(records),
+            "enums": {
+                "billing_type": list(BILLING_TYPES),
+                "channel_kind": list(CHANNEL_KINDS),
+                "role": list(ROLES),
+                "supports_streaming": list(STREAM_FLAGS),
+                "probe_mode": list(PROBE_MODES),
+                "scheduled_default_on": list(SCHEDULED_DEFAULT_ON),
+            },
+        }
+
+    async def api_health(self) -> dict:
+        """GET /panel/health：监测页与档案页共用的数据源。"""
+        days = 7.0
+        try:
+            raw = request.args.get("days")
+            if raw:
+                days = max(0.5, min(90.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            return await self._health_view(days)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/health 失败: {e}")
+            return {"items": [], "counts": {}, "live_available": False, "error": str(e)}
+
+    async def api_profile_set(self) -> dict:
+        """POST /panel/profile：保存一个 provider 的档案补丁。
+
+        body 两种写法都收：``{id, patch:{...}}`` 或把字段直接平铺在顶层。
+        """
+        payload = await self._json_payload()
+        pid = str(payload.get("id") or payload.get("provider_id") or "").strip()
+        if not pid:
+            return {"ok": False, "error": "缺少 id"}
+        patch = payload.get("patch")
+        if not isinstance(patch, dict):
+            patch = {k: v for k, v in payload.items() if k in PROFILE_FIELDS}
+        if not patch:
+            return {"ok": False, "error": "没有可保存的字段"}
+        unknown = [k for k in patch if k not in PROFILE_FIELDS]
+        if unknown:
+            return {"ok": False, "error": f"未知字段: {', '.join(unknown)}"}
+        known = set(self._provider_ids())
+        if known and pid not in known:
+            # 不接受野 id，否则档案表会被历史脏数据撑大
+            return {"ok": False, "error": "provider 不存在或已删除"}
+        if not self.storage:
+            return {"ok": False, "error": "存储未就绪"}
+        try:
+            saved = await self.storage.upsert_profile(pid, patch)
+            return {"ok": True, "profile": saved}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/profile 保存失败: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def api_scope_set(self) -> dict:
+        """POST /panel/scope：设置某 provider 在某通道的参与情况。
+
+        body: ``{id, channel: manual|scheduled|command, enabled: true|false|null}``，
+        ``enabled=null`` 表示取消显式设置、回到跟随计费类型推导的默认值。
+        """
+        payload = await self._json_payload()
+        pid = str(payload.get("id") or payload.get("provider_id") or "").strip()
+        channel = str(payload.get("channel") or "").strip()
+        if not pid:
+            return {"ok": False, "error": "缺少 id"}
+        if channel not in DETECT_CHANNELS:
+            return {"ok": False, "error": f"channel 只能是 {'/'.join(DETECT_CHANNELS)}"}
+        enabled = payload.get("enabled")
+        if enabled is not None:
+            enabled = bool(enabled)
+        if not self.storage:
+            return {"ok": False, "error": "存储未就绪"}
+        try:
+            await self.storage.set_detect_scope(pid, channel, enabled)
+            scopes = await self.storage.get_detect_scopes()
+            return {"ok": True, "scope": scopes.get(pid) or {}}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/scope 失败: {e}")
+            return {"ok": False, "error": str(e)}
+
     async def api_default_model(self) -> dict:
         return {"default_provider_id": await self._default_provider_id()}
 
@@ -2072,6 +2387,187 @@ class ModelPanelPlugin(Star):
             "error": last_err_msg,
             "retry_count": max(0, attempts - 1),
         }
+
+    # ================= 卡片输出与查询指令 =================
+    _STATE_ORDER = {"down": 0, "degraded": 1, "unknown": 2, "healthy": 3}
+    CARD_MAX_ROWS = 12
+    _BILLING_LABELS = {
+        "unknown": "",
+        "free": "免费",
+        "temp_free": "限时免费",
+        "trial": "试用额度",
+        "paid_overage": "额度+超额付费",
+        "paid": "付费",
+        "subscription": "订阅内含",
+    }
+
+    def _billing_label(self, billing: dict) -> str:
+        """计费摘要文本，限时免费的剩余天数写在里面。"""
+        btype = str(billing.get("type") or "unknown")
+        label = self._BILLING_LABELS.get(btype, "")
+        left = billing.get("free_days_left")
+        if btype == "temp_free" and left is not None:
+            label = f"{label} {'已到期' if left < 0 else f'剩 {left} 天'}" if label else ""
+        return label
+
+    def _row_sub(self, item: dict) -> str:
+        """行副标题：角色 · 计费 · 备注 · （无实时样本时的）探测情况。"""
+        billing = item.get("billing") or {}
+        live = item.get("live") or {}
+        parts = []
+        role = str(billing.get("role") or "unknown")
+        if role not in ("unknown", ""):
+            parts.append({"primary": "主力", "backup": "备用", "fallback": "兜底",
+                          "dedicated": "专用", "watch": "观察", "retired": "弃用"}.get(role, role))
+        bl = self._billing_label(billing)
+        if bl:
+            parts.append(bl)
+        if billing.get("note"):
+            parts.append(str(billing["note"])[:24])
+        probe = item.get("probe") or {}
+        if not int(live.get("counted") or 0) and probe.get("checked_at"):
+            verdict = f"探测 {_fmt_ms(probe.get('latency_ms'))}" if probe.get("ok") \
+                else f"探测失败 {probe.get('error_code') or ''}"
+            parts.append(verdict.strip())
+        if item.get("is_default"):
+            parts.insert(0, "默认模型")
+        if not parts and item.get("reason"):
+            parts.append(str(item["reason"]))
+        return " · ".join(p for p in parts if p)
+
+    def _card_payload(self, view: dict, title: str, badge: str, detailed: bool = False):
+        """把视图表转成卡片要的 stats / columns / rows，并返回被折叠掉的行数。"""
+        items = list(view.get("items") or [])
+        ordered = sorted(
+            items,
+            key=lambda it: (
+                self._STATE_ORDER.get(str(it.get("state")), 9),
+                -int((it.get("live") or {}).get("total") or 0),
+            ),
+        )
+        shown = ordered[: self.CARD_MAX_ROWS]
+        rows = []
+        for it in shown:
+            live = it.get("live") or {}
+            counted = int(live.get("counted") or 0)
+            if detailed:
+                cells = [
+                    _fmt_ms(live.get("avg_ttft_ms")),
+                    _fmt_ms(live.get("p95_ttft_ms")),
+                    _fmt_ms(live.get("avg_latency_ms")),
+                    _fmt_success(live.get("fail_rate")) if counted else "-",
+                    f"{int(live.get('fail') or 0)}/{counted}",
+                ]
+            else:
+                cells = [
+                    _fmt_ms(live.get("avg_ttft_ms")),
+                    _fmt_ms(live.get("avg_latency_ms")),
+                    _fmt_success(live.get("fail_rate")) if counted else "-",
+                    f"n={int(live.get('total') or 0)}",
+                ]
+            rows.append({
+                "state": it.get("state"),
+                "name": it.get("display_model") or it.get("model") or it.get("id") or "(未知)",
+                "sub": self._row_sub(it),
+                "cells": cells,
+            })
+        counts = view.get("counts") or {}
+        stats = [
+            {"label": "正常", "value": str(int(counts.get("healthy") or 0)), "state": "healthy"},
+            {"label": "降级", "value": str(int(counts.get("degraded") or 0)), "state": "degraded"},
+            {"label": "故障", "value": str(int(counts.get("down") or 0)), "state": "down"},
+            {"label": "无数据", "value": str(int(counts.get("unknown") or 0)), "state": "unknown"},
+        ]
+        if detailed:
+            # 明细模式看的就是单个模型的数字，顶部再放全局计数只是噪音
+            stats = []
+        columns = ["首字", "首字P95", "整轮", "成功率", "失败"] if detailed else ["首字", "整轮", "成功率", "样本"]
+        # 脚注是口径纪律落到界面上的地方：探测值和真实对话值绝不能被读成同一个东西
+        notes = ["口径：首字=真实对话首字延迟，整轮=含工具的多步总耗时，都不是空载探测值"]
+        if not view.get("live_available"):
+            notes.append("实时监测不可用（核心表读不到），数值留空，副标题是最近一次探测结果")
+        elif view.get("truncated"):
+            notes.append(f"样本过多已截断，只统计了最近 {int(view.get('samples') or 0)} 条")
+        hidden = len(ordered) - len(shown)
+        if hidden > 0:
+            notes.append(f"另有 {hidden} 个模型未展示（完整列表看模型控制台面板）")
+        notes.append(time.strftime("%m-%d %H:%M"))
+        return stats, columns, rows, notes
+
+    async def _render_status_card(self, view: dict, title: str, badge: str, detailed: bool = False):
+        """渲染状态卡片。返回 PNG bytes；字体不可用时返回 None，调用方降级发文本。"""
+        stats, columns, rows, notes = self._card_payload(view, title, badge, detailed)
+        cfg = getattr(self, "config", None)
+        font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
+        # Pillow 是 CPU 密集的，直接在事件循环里画会卡住整条消息管线
+        return await asyncio.to_thread(
+            render_card, title, badge, stats, columns, rows, notes, font
+        )
+
+    def _status_text(self, view: dict, title: str) -> str:
+        """没有可用中文字体时的纯文本降级。丑，但比发一张豆腐块图或报错好。"""
+        stats, columns, rows, notes = self._card_payload(view, title, "", False)
+        lines = [f"{title}  " + " ".join(f"{s['label']}{s['value']}" for s in stats)]
+        for r in rows:
+            lines.append(f"[{r['state']}] {r['name']}  " + " / ".join(r["cells"]))
+            if r.get("sub"):
+                lines.append(f"    {r['sub']}")
+        lines.extend(notes[:2])
+        return "\n".join(lines)
+
+    @astr_filter.command("模型状态")
+    async def cmd_model_status(self, event: AstrMessageEvent):
+        """查询模型健康与延迟总览。只读核心记录，不请求模型、不产生任何费用。"""
+        try:
+            view = await self._health_view(days=7.0)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /模型状态 取数失败: {e}")
+            yield event.plain_result(f"读取模型监测数据失败：{e}")
+            return
+        if not view.get("items"):
+            yield event.plain_result("当前没有加载任何对话模型，没什么可看的～")
+            return
+        png = await self._render_status_card(view, "模型实时状态", "实时")
+        if png is None:
+            yield event.plain_result(self._status_text(view, "模型实时状态"))
+            return
+        yield event.chain_result([Image.fromBytes(png)])
+
+    @astr_filter.command("模型统计")
+    async def cmd_model_stats(self, event: AstrMessageEvent):
+        """查单个模型明细：/模型统计 <名称关键词>。"""
+        keyword = _cmd_args(event)
+        if not keyword:
+            yield event.plain_result("用法：/模型统计 <模型名关键词>，例如 /模型统计 deepseek")
+            return
+        try:
+            view = await self._health_view(days=7.0)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /模型统计 取数失败: {e}")
+            yield event.plain_result(f"读取模型监测数据失败：{e}")
+            return
+        kw = keyword.lower()
+        hits = [
+            it for it in (view.get("items") or [])
+            if kw in " ".join([
+                str(it.get("display_model") or ""), str(it.get("model") or ""),
+                str(it.get("name") or ""), str(it.get("id") or ""),
+            ]).lower()
+        ]
+        if not hits:
+            yield event.plain_result(f"没找到名字里含「{keyword}」的模型～")
+            return
+        if len(hits) > 6:
+            names = "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6])
+            yield event.plain_result(f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n{names}")
+            return
+        view = dict(view)
+        view["items"] = hits
+        png = await self._render_status_card(view, "模型明细", "详情", detailed=True)
+        if png is None:
+            yield event.plain_result(self._status_text(view, "模型明细"))
+            return
+        yield event.chain_result([Image.fromBytes(png)])
 
     async def terminate(self):
         try:
