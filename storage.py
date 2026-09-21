@@ -21,6 +21,7 @@
     provider_model  TEXT
     ok              INTEGER 0/1
     latency_ms      REAL    延迟毫秒；失败时为 NULL
+    ttft_ms         REAL    流式探测的首字毫秒；非流式或失败时为 NULL
     error_code      TEXT    归一化错误码（timeout/connect/refused/auth/unknown/...）
     error_message   TEXT    原始错误短文本（≤200 字符）
     retry_count     INTEGER 实际重试次数（0 表示一次就过）
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS model_test_results (
     provider_model  TEXT    NOT NULL DEFAULT '',
     ok              INTEGER NOT NULL,
     latency_ms      REAL,
+    ttft_ms         REAL,
     error_code      TEXT    NOT NULL DEFAULT '',
     error_message   TEXT    NOT NULL DEFAULT '',
     retry_count     INTEGER NOT NULL DEFAULT 0,
@@ -269,12 +271,15 @@ class Storage:
         漏了这一步的话老用户一进档案页就 "no such column" 白屏。"""
         cur = await db.execute("PRAGMA table_info(detection_preferences)")
         existing = {row[1] for row in await cur.fetchall()}
-        if not existing:
-            return
-        for col in ("allow_scheduled", "allow_command"):
-            if col not in existing:
-                # 列名来自上面的固定字面量，不是用户输入
-                await db.execute(f"ALTER TABLE detection_preferences ADD COLUMN {col} INTEGER")
+        if existing:
+            for col in ("allow_scheduled", "allow_command"):
+                if col not in existing:
+                    # 列名来自上面的固定字面量，不是用户输入
+                    await db.execute(f"ALTER TABLE detection_preferences ADD COLUMN {col} INTEGER")
+        cur = await db.execute("PRAGMA table_info(model_test_results)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if cols and "ttft_ms" not in cols:
+            await db.execute("ALTER TABLE model_test_results ADD COLUMN ttft_ms REAL")
 
     async def close(self) -> None:
         # aiosqlite 没有常驻连接，无需显式 close。
@@ -323,8 +328,8 @@ class Storage:
                 cur = await db.execute(
                     """INSERT INTO model_test_results
                        (session_id, provider_id, provider_name, provider_model,
-                        ok, latency_ms, error_code, error_message, retry_count, checked_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ok, latency_ms, ttft_ms, error_code, error_message, retry_count, checked_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         str(item.get("id") or ""),
@@ -332,6 +337,7 @@ class Storage:
                         str(item.get("model") or ""),
                         1 if item.get("ok") else 0,
                         item.get("latency_ms"),
+                        item.get("ttft_ms"),
                         str(item.get("error_code") or ""),
                         str(item.get("error") or ""),
                         int(item.get("retry_count") or 0),
@@ -930,6 +936,7 @@ def _row_to_result_dict(row: Any) -> dict:
         "model": row["provider_model"] or "",
         "ok": bool(row["ok"]),
         "latency_ms": row["latency_ms"],
+        "ttft_ms": row["ttft_ms"] if "ttft_ms" in row.keys() else None,
         "error_code": row["error_code"] or "",
         "error": row["error_message"] or "",
         "retry_count": int(row["retry_count"] or 0),

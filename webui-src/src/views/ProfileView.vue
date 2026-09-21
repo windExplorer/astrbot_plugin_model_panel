@@ -77,9 +77,11 @@
               @update:value="(v: string) => setVal(editing!, 'supports_streaming', v)" />
           </n-form-item>
           <n-form-item :label="t('profile.fProbeMode')">
-            <span class="drawer-hint">
-              {{ t('profile.probeMode.' + (val(editing, 'probe_mode') || 'non_stream')) }} · {{ t('profile.probeModeLocked') }}
-            </span>
+            <div class="probe-mode">
+              <n-select :value="val(editing, 'probe_mode')" :options="probeModeOptions"
+                @update:value="(v: string) => setVal(editing!, 'probe_mode', v)" />
+              <div class="drawer-hint">{{ t('profile.probeModeHint') }}</div>
+            </div>
           </n-form-item>
 
           <n-divider>{{ t('profile.priceGroup') }}</n-divider>
@@ -206,6 +208,7 @@ const billingOptions = computed(() => opts(BILLING, "monitor.billing"));
 const roleOptions = computed(() => opts(ROLES, "monitor.role"));
 const channelOptions = computed(() => opts(["unknown", "official", "aggregator", "reseller", "self_hosted"], "monitor.channel"));
 const streamOptions = computed(() => opts(["unknown", "true", "false"], "monitor.stream"));
+const probeModeOptions = computed(() => opts(["non_stream", "stream", "both"], "profile.probeMode"));
 const currencyOptions = computed(() => [
   { label: t("profile.curNone"), value: "" },
   { label: "CNY ¥", value: "CNY" },

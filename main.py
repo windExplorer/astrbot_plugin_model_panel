@@ -150,6 +150,11 @@ _ERROR_RULES: list[tuple[str, re.Pattern[str]]] = [
 # 错误短消息最长字符数（防止 200 字符堆栈塞满前端）
 ERROR_MESSAGE_MAX = 80
 
+# 流式探测用的提示词与非流式保持一致，否则两种延迟测的不是同一件事。
+_STREAM_PROBE_PROMPT = "REPLY `PONG` ONLY"
+# 拿到第几个分片就断流。1 = 只为测首字，绝不为跑完整段生成付钱。
+_STREAM_PROBE_CHUNKS = 1
+
 
 def _normalize_error(exc: BaseException | str) -> tuple[str, str]:
     """把异常归一化为 (error_code, error_message)。"""
@@ -810,6 +815,20 @@ class ModelPanelPlugin(Star):
         defaults["test_retry_count"] = max(0, int(defaults["test_retry_count"]))
         defaults["test_retry_backoff"] = max(0.0, float(defaults["test_retry_backoff"]))
         return defaults
+
+    async def _probe_modes(self) -> dict[str, str]:
+        """provider_id -> probe_mode。档案缺失一律 non_stream：最保守，不多花钱。"""
+        if not self.storage:
+            return {}
+        try:
+            profiles = await self.storage.get_all_profiles()
+        except Exception:
+            return {}
+        out = {}
+        for pid, prof in profiles.items():
+            mode = str((prof or {}).get("probe_mode") or "non_stream")
+            out[pid] = mode if mode in PROBE_MODES else "non_stream"
+        return out
 
     # ---------------- 路由注册 ----------------
     def _register_routes(self) -> None:
@@ -1502,7 +1521,8 @@ class ModelPanelPlugin(Star):
         for p in self._chat_providers():
             d = self._provider_display(p)
             if d["id"] == provider_id:
-                result = await self._test_one(p, timeout, cfg)
+                result = await self._test_one(
+                    p, timeout, cfg, (await self._probe_modes()).get(provider_id, "non_stream"))
                 result.update({
                     "id": provider_id,
                     "name": d["name"],
@@ -1545,6 +1565,7 @@ class ModelPanelPlugin(Star):
             cfg = self._test_config()
             timeout = float(payload.get("timeout") or cfg["test_timeout"])
             providers = self._chat_providers()
+            modes = await self._probe_modes()
             results: list[dict] = []
             session_id: Optional[int] = None
             for p in providers:
@@ -1563,7 +1584,7 @@ class ModelPanelPlugin(Star):
                         "checked_at": int(time.time()),
                     })
                     continue
-                r = await self._test_one(p, timeout, cfg)
+                r = await self._test_one(p, timeout, cfg, modes.get(d["id"], "non_stream"))
                 r.update({
                     "id": d["id"],
                     "name": d["name"],
@@ -1633,6 +1654,7 @@ class ModelPanelPlugin(Star):
         timeout: float,
         cfg: dict,
     ) -> None:
+        modes = await self._probe_modes()
         async with self._test_all_lock:
             ok_n = fail_n = skip_n = 0
             try:
@@ -1654,7 +1676,7 @@ class ModelPanelPlugin(Star):
                         }
                         skip_n += 1
                     else:
-                        r = await self._test_one(p, timeout, cfg)
+                        r = await self._test_one(p, timeout, cfg, modes.get(d["id"], "non_stream"))
                         item = {
                             "id": d["id"],
                             "name": d["name"],
@@ -2400,52 +2422,149 @@ class ModelPanelPlugin(Star):
         except Exception:
             return {}
 
-    async def _test_one(self, provider: Any, timeout: float, cfg: dict) -> dict:
+    async def _test_one(self, provider: Any, timeout: float, cfg: dict, mode: str = "non_stream") -> dict:
         """检测单个模型，支持重试 + 错误归一化。
 
-        返回：
-        {
-          ok: bool,
-          latency_ms: float | None,
-          error_code: str,
-          error: str,
-          retry_count: int,
-        }
+        Args:
+            mode: ``non_stream``（默认，走核心 provider.test()）/
+                ``stream``（流式，测首字延迟）/ ``both``。
+
+        Returns:
+            ``{ok, latency_ms, ttft_ms, error_code, error, retry_count}``
         """
         retry_count = max(0, int(cfg.get("test_retry_count") or 0))
         backoff = max(0.0, float(cfg.get("test_retry_backoff") or 0.0))
         attempts = retry_count + 1  # 至少一次
-        last_err_code = "unknown"
-        last_err_msg = ""
+        last: dict = {"ok": False, "latency_ms": None, "ttft_ms": None,
+                      "error_code": "unknown", "error": ""}
         for i in range(attempts):
-            start = time.monotonic()
-            try:
-                await asyncio.wait_for(provider.test(timeout=timeout), timeout=timeout + 5)
-                latency_ms = round((time.monotonic() - start) * 1000, 1)
-                return {
-                    "ok": True,
-                    "latency_ms": latency_ms,
-                    "error_code": "",
-                    "error": "",
-                    "retry_count": i,
-                }
-            except asyncio.TimeoutError as e:
-                last_err_code, last_err_msg = _normalize_error("timeout")
-            except Exception as e:
-                last_err_code, last_err_msg = _normalize_error(e)
+            r = await self._probe_once(provider, timeout, mode)
+            if r["ok"]:
+                r["retry_count"] = i
+                return r
+            last = r
             if i < attempts - 1 and backoff > 0:
                 try:
                     await asyncio.sleep(backoff * (i + 1))
                 except Exception:
                     pass
-        return {
-            "ok": False,
-            "latency_ms": None,
-            "error_code": last_err_code,
-            "error": last_err_msg,
-            "retry_count": max(0, attempts - 1),
-        }
+        last["retry_count"] = max(0, attempts - 1)
+        return last
 
+    async def _probe_once(self, provider: Any, timeout: float, mode: str) -> dict:
+        """跑一次探测。``both`` 模式下非流式与流式都必须成功才算成功。"""
+        base = {"ok": False, "latency_ms": None, "ttft_ms": None, "error_code": "", "error": ""}
+        ns_ok: Optional[bool] = None
+        if mode in ("non_stream", "both"):
+            ns = await self._probe_non_stream(provider, timeout)
+            ns_ok = bool(ns["ok"])
+            base.update({"latency_ms": ns.get("latency_ms"), "error_code": ns.get("error_code", ""),
+                         "error": ns.get("error", "")})
+            if not ns_ok:
+                return base
+            if mode == "non_stream":
+                base["ok"] = True
+                return base
+        if mode in ("stream", "both"):
+            st = await self._probe_stream(provider, timeout)
+            st_ok = bool(st.get("ok"))
+            base["ttft_ms"] = st.get("ttft_ms")
+            # 用 ns_ok 这个显式局部量判断，不能读 base["ok"]——它初始就是 False，
+            # 写成 `st_ok and base.get("ok", True)` 会让 stream / both 两种模式永远失败。
+            base["ok"] = st_ok and (True if ns_ok is None else ns_ok)
+            if not st_ok:
+                # 流式失败不覆盖非流式已拿到的 latency_ms，但整体算失败
+                base["error_code"] = st.get("error_code") or "stream"
+                base["error"] = st.get("error") or "stream probe failed"
+                return base
+            if mode == "stream":
+                base["latency_ms"] = st.get("latency_ms")
+            else:
+                # 两路都通了，清掉中途可能留下的错误文案
+                base["error_code"] = ""
+                base["error"] = ""
+        return base
+
+    async def _probe_non_stream(self, provider: Any, timeout: float) -> dict:
+        """核心 provider.test()：一句 PONG 的非流式往返。"""
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(provider.test(timeout=timeout), timeout=timeout + 5)
+            return {"ok": True, "latency_ms": round((time.monotonic() - start) * 1000, 1),
+                    "error_code": "", "error": ""}
+        except asyncio.TimeoutError:
+            code, msg = _normalize_error("timeout")
+        except Exception as e:
+            code, msg = _normalize_error(e)
+        return {"ok": False, "latency_ms": None, "error_code": code, "error": msg}
+
+    async def _probe_stream(self, provider: Any, timeout: float) -> dict:
+        """流式探测：测首字延迟，并覆盖「只有流式才挂」的网关故障。
+
+        TTFT 的口径刻意与核心一致——**第一个 ``is_chunk`` 分片的到达耗时**
+        （见 ``tool_loop_agent_runner`` 记 ``time_to_first_token`` 的写法），
+        这样探测值和 provider_stats 里的真实对话值才放在同一把尺子上。
+
+        拿到首字就走，不等生成结束：核心在流末尾还会再 yield 一次完整结果，
+        继续读等于让模型把整段话讲完，白花钱。
+        而且必须显式 ``aclose()``——异步生成器的收尾靠 GC 回调，不保证时机，
+        只靠 break 会让底层 HTTP 连接悬着不释放；这条链路每几分钟就跑一轮 × N 个模型，
+        漏一次就攒一个僵尸连接。
+        """
+        start = time.monotonic()
+        gen = None
+        try:
+            gen = provider.text_chat_stream(prompt=_STREAM_PROBE_PROMPT)
+            if not hasattr(gen, "__anext__"):
+                # 个别实现不是异步生成器（返回协程），这里不猜，直接判不可用。
+                # 注意协程的 close() 是同步方法，await 它反而会抛 TypeError。
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                return {"ok": False, "latency_ms": None, "ttft_ms": None,
+                        "error_code": "stream_unsupported", "error": "not an async generator"}
+
+            async def consume():
+                ttft = None
+                chunks = 0
+                async for resp in gen:
+                    if getattr(resp, "is_chunk", False):
+                        if ttft is None:
+                            ttft = (time.monotonic() - start) * 1000.0
+                        chunks += 1
+                        if chunks >= _STREAM_PROBE_CHUNKS:
+                            break
+                    elif ttft is None:
+                        # 不发 chunk、直接给完整结果的 provider：不算流式失败，
+                        # 但首字延迟确实没测到，别记成 0ms 骗人说模型很快
+                        ttft = (time.monotonic() - start) * 1000.0
+                        break
+                return ttft, chunks
+
+            ttft, chunks = await asyncio.wait_for(consume(), timeout=timeout + 5)
+            total = round((time.monotonic() - start) * 1000, 1)
+            if ttft is None:
+                return {"ok": False, "latency_ms": total, "ttft_ms": None,
+                        "error_code": "empty_stream",
+                        "error": f"stream opened but produced no chunks ({chunks})"}
+            return {"ok": True, "latency_ms": total, "ttft_ms": round(ttft, 1),
+                    "error_code": "", "error": ""}
+        except asyncio.TimeoutError:
+            code, msg = _normalize_error("timeout")
+        except Exception as e:
+            code, msg = _normalize_error(e)
+        finally:
+            # 三条退出路径（正常 break / 超时 / 抛异常）都必须关流
+            aclose = getattr(gen, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:
+                    pass
+        return {"ok": False, "latency_ms": None, "ttft_ms": None, "error_code": code, "error": msg}
     # ================= 卡片输出与查询指令 =================
     _STATE_ORDER = {"down": 0, "degraded": 1, "unknown": 2, "healthy": 3}
     CARD_MAX_ROWS = 12
@@ -2812,8 +2931,9 @@ class ModelPanelPlugin(Star):
                 # 付费/试用/超额类不重试：重试等于双倍花钱，而探测一次就足够定性
                 if billing in ("paid", "paid_overage", "trial"):
                     t["test_retry_count"] = 0
+                mode = str((profiles.get(pid) or {}).get("probe_mode") or "non_stream")
                 try:
-                    r = await self._test_one(provider, timeout, t)
+                    r = await self._test_one(provider, timeout, t, mode)
                 except Exception as e:
                     code, msg = _normalize_error(e)
                     r = {"ok": False, "latency_ms": None, "error_code": code,
@@ -2991,6 +3111,7 @@ class ModelPanelPlugin(Star):
         names = {}
         try:
             tcfg = self._test_config()
+            modes = await self._probe_modes()
             sem = asyncio.Semaphore(max(1, min(3, MonitorConfig.from_config(self.config).probe_concurrency)))
 
             async def one(item):
@@ -2998,7 +3119,7 @@ class ModelPanelPlugin(Star):
                 names[pid] = d.get("display_model") or d.get("model") or pid
                 async with sem:
                     try:
-                        r = await self._test_one(provider, timeout, tcfg)
+                        r = await self._test_one(provider, timeout, tcfg, modes.get(pid, "non_stream"))
                     except Exception as e:
                         code, msg = _normalize_error(e)
                         r = {"ok": False, "latency_ms": None, "error_code": code,
