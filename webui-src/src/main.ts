@@ -3,9 +3,8 @@ import { createRouter, createWebHashHistory } from "vue-router";
 
 import App from "./App.vue";
 import DashboardView from "./views/DashboardView.vue";
-import DetectView from "./views/DetectView.vue";
+import ModelsView from "./views/ModelsView.vue";
 import MonitorView from "./views/MonitorView.vue";
-import ProfileView from "./views/ProfileView.vue";
 import DefaultModelView from "./views/DefaultModelView.vue";
 import CompanionReplaceView from "./views/CompanionReplaceView.vue";
 import PluginsView from "./views/PluginsView.vue";
@@ -32,9 +31,8 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: "/", name: "dashboard", component: DashboardView, meta: { titleKey: "nav.dashboard" } },
-    { path: "/detect", name: "detect", component: DetectView, meta: { titleKey: "nav.detect" } },
+    { path: "/models", name: "models", component: ModelsView, meta: { titleKey: "nav.models" } },
     { path: "/monitor", name: "monitor", component: MonitorView, meta: { titleKey: "nav.monitor" } },
-    { path: "/profile", name: "profile", component: ProfileView, meta: { titleKey: "nav.profile" } },
     { path: "/default", name: "default", component: DefaultModelView, meta: { titleKey: "nav.defaultModel" } },
     { path: "/companion", name: "companion", component: CompanionReplaceView, meta: { titleKey: "nav.companion" } },
     { path: "/plugins", name: "plugins", component: PluginsView, meta: { titleKey: "nav.plugins" } },

@@ -2679,7 +2679,6 @@ class ModelPanelPlugin(Star):
         return {"ok": False, "latency_ms": None, "ttft_ms": None, "error_code": code, "error": msg}
     # ================= 卡片输出与查询指令 =================
     _STATE_ORDER = {"down": 0, "degraded": 1, "unknown": 2, "healthy": 3}
-    CARD_MAX_ROWS = 12
     _BILLING_LABELS = {
         "unknown": "",
         "free": "免费",
@@ -2699,17 +2698,40 @@ class ModelPanelPlugin(Star):
             label = f"{label} {'已到期' if left < 0 else f'剩 {left} 天'}" if label else ""
         return label
 
-    _SOURCE_LABELS = {"chat": "对话", "manual": "手动检测",
-                      "command": "指令检测", "scheduled": "定时探测"}
+    def _card_name(self, item: dict, dup: set) -> str:
+        """卡片里的模型名。
 
-    def _last_label(self, last: dict) -> str:
-        """最新一次调用：成败 + 延迟 + 来源。"""
-        if not last:
-            return "-"
-        verdict = "正常" if last.get("ok") else ("打断" if last.get("aborted") else "失败")
-        src = self._SOURCE_LABELS.get(str(last.get("source") or ""), "")
-        lat = _fmt_ms(last.get("ttft_ms") or last.get("latency_ms"))
-        return (f"{verdict} {lat}".strip()) + (f"·{src}" if src else "")
+        总览卡不按供应商分组，所以同名模型（不同渠道各是一个 provider）必须带上
+        供应商标才能分辨；其余情况只写模型名 —— 「供应商/一长串路径」在两栏排版里
+        会被截断到看不出差别。
+        """
+        model = str(item.get("model") or "").strip()
+        if not model:
+            return str(item.get("display_model") or item.get("id") or "(未知)")
+        if model in dup:
+            vendor = str(item.get("name") or "").strip()
+            return f"{model} · {vendor}" if vendor else model
+        return model
+
+    def _row_note(self, item: dict) -> str:
+        """总览卡的行副标题只留给「需要解释的话」。
+
+        这张卡要列**全部**模型，每多一行装饰就多一分不可读，所以角色、计费、备注
+        这些档案信息都不进来，只有故障原因、静音、限时免费到期才值得占第二行。
+        """
+        parts = []
+        billing = item.get("billing") or {}
+        if item.get("is_default"):
+            parts.append("默认模型")
+        if str(billing.get("type") or "") == "temp_free":
+            bl = self._billing_label(billing)
+            if bl:
+                parts.append(bl)
+        if item.get("muted"):
+            parts.append("告警静音中")
+        if str(item.get("state") or "") in ("down", "degraded") and item.get("reason"):
+            parts.append(str(item["reason"]))
+        return " · ".join(parts)
 
     def _row_sub(self, item: dict) -> str:
         """行副标题：角色 · 计费 · 备注 · （窗口内无调用时的）最近一次结果。"""
@@ -2739,7 +2761,12 @@ class ModelPanelPlugin(Star):
         return " · ".join(p for p in parts if p)
 
     def _card_payload(self, view: dict, title: str, badge: str, detailed: bool = False):
-        """把视图表转成卡片要的 stats / columns / rows，并返回被折叠掉的行数。"""
+        """把视图表转成卡片要的 stats / columns / rows。
+
+        总览卡**不折叠行数**：用户要的是「一眼看完所有模型谁挂了」，截断会把恰好
+        故障的那个藏起来，而它正是这张卡存在的理由。行高已经压到 44px，
+        超过约 15 行由渲染器自动折成两栏。
+        """
         items = list(view.get("items") or [])
         ordered = sorted(
             items,
@@ -2748,9 +2775,10 @@ class ModelPanelPlugin(Star):
                 -int((it.get("window") or {}).get("total") or 0),
             ),
         )
-        shown = ordered[: self.CARD_MAX_ROWS]
+        models = [str(it.get("model") or "").strip() for it in ordered]
+        dup = {m for m in models if m and models.count(m) > 1}
         rows = []
-        for it in shown:
+        for it in ordered:
             w = it.get("window") or {}
             last = it.get("last") or {}
             counted = int(w.get("counted") or 0)
@@ -2763,17 +2791,15 @@ class ModelPanelPlugin(Star):
                     f"{int(w.get('fail') or 0)}/{counted}",
                 ]
             else:
-                # 默认看最新一次结果，窗口平均值放后面
+                # 总览只看最新一次：延迟 + 窗口成功率，样本数这类次要信息一律不进卡片
                 cells = [
-                    self._last_label(last),
-                    _fmt_ms(w.get("avg_ttft_ms")),
+                    _fmt_ms(last.get("ttft_ms") or last.get("latency_ms")) if last else "-",
                     _fmt_success(w.get("fail_rate")) if counted else "-",
-                    f"n={int(w.get('total') or 0)}",
                 ]
             rows.append({
                 "state": it.get("state"),
-                "name": it.get("display_model") or it.get("model") or it.get("id") or "(未知)",
-                "sub": self._row_sub(it),
+                "name": self._card_name(it, dup),
+                "sub": self._row_sub(it) if detailed else self._row_note(it),
                 "cells": cells,
             })
         counts = view.get("counts") or {}
@@ -2787,17 +2813,18 @@ class ModelPanelPlugin(Star):
             # 明细模式看的就是单个模型的数字，顶部再放全局计数只是噪音
             stats = []
         columns = (["首字", "首字P95", "整轮", "成功率", "失败"] if detailed
-                   else ["最新结果", "平均首字", "成功率", "样本"])
+                   else ["延迟", "成功率"])
         # 脚注是口径纪律落到界面上的地方：探测值和真实对话值绝不能被读成同一个东西
-        notes = ["口径：成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）；"
-                 "「平均首字」只统计真实对话，不含探测"]
+        if detailed:
+            notes = ["口径：成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）；"
+                     "「首字」与「首字P95」只统计真实对话，不含探测"]
+        else:
+            notes = ["延迟取最近一次调用：对话为首字耗时，探测为整次往返，两者不可直接比较；"
+                     "成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）"]
         if not view.get("live_available"):
             notes.append("实时监测不可用（核心表读不到），数值留空，副标题是最近一次探测结果")
         elif view.get("truncated"):
             notes.append(f"样本过多已截断，只统计了最近 {int(view.get('samples') or 0)} 条")
-        hidden = len(ordered) - len(shown)
-        if hidden > 0:
-            notes.append(f"另有 {hidden} 个模型未展示（完整列表看模型控制台面板）")
         notes.append(time.strftime("%m-%d %H:%M"))
         return stats, columns, rows, notes
 

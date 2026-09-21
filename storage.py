@@ -591,7 +591,11 @@ class Storage:
 
     # ---------- 检测勾选偏好 ----------
     async def get_detection_preferences(self) -> dict[str, bool]:
-        """返回 {provider_id: enabled}。缺失的 provider 视为 True（默认勾选）。"""
+        """返回 {provider_id: enabled}。缺失的 provider 视为 True（默认勾选）。
+
+        ``enabled`` 列是 NOT NULL，所以这里不需要处理第三态：manual 的「跟随默认」
+        在写入侧就被归成了 1（见 ``set_detect_scope``）。
+        """
         await self.init()
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -640,13 +644,21 @@ class Storage:
         manual / command 默认开放，scheduled 只对不产生单次费用的计费类型开放。
         所以新装用户什么都没标时，**定时名单是空的** —— 这是刻意的省钱默认，
         而不是漏配；档案页可以按供应商批量勾选。
+
+        两张表要并集遍历，不能从 ``detection_preferences`` 单侧 LEFT JOIN：
+        只标过计费、没碰过通道开关的 provider 在前者里没有行，那样会整个从结果里消失，
+        于是「免费模型默认参与定时巡检」这条推导对它根本不生效 —— 定时探测名单
+        （``_maybe_probe``）与面板显示读的都是这个函数，结果就是免费模型永远排不进巡检。
         """
         await self.init()
-        sql = """SELECT d.provider_id AS pid, d.enabled AS manual,
+        sql = """SELECT x.pid AS pid, d.enabled AS manual,
                         d.allow_scheduled AS scheduled, d.allow_command AS command,
                         m.billing_type AS billing
-                 FROM detection_preferences d
-                 LEFT JOIN model_profile m ON m.provider_id = d.provider_id"""
+                 FROM (SELECT provider_id AS pid FROM detection_preferences
+                       UNION
+                       SELECT provider_id AS pid FROM model_profile) x
+                 LEFT JOIN detection_preferences d ON d.provider_id = x.pid
+                 LEFT JOIN model_profile m ON m.provider_id = x.pid"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql)
@@ -677,6 +689,12 @@ class Storage:
         await self.init()
         col = _CHANNEL_COLUMN[channel]
         value = None if enabled is None else (1 if enabled else 0)
+        # manual 复用老表的 enabled 列，它是 NOT NULL DEFAULT 1 —— 「跟随默认」在这列上
+        # 落不回 NULL，直接写会抛 IntegrityError（合并页的「跟随默认」一点就 500）。
+        # 而 manual 的默认本来就只有「开」，不随计费变，所以把 None 归一成 1 即可，
+        # 语义与 get_detect_scopes 里 explicit=False → manual=True 的推导结果一致。
+        if col == "enabled" and value is None:
+            value = 1
         async with self._lock:
             async with aiosqlite.connect(self.db_path) as db:
                 # 先保证行存在（新 provider 的 manual 默认勾选），再定点改那一列

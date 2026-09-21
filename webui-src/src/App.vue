@@ -95,9 +95,8 @@ const { locale: localeStore, setLocale, supported } = useLocale();
 const version = PLUGIN_VERSION;
 const navItems = [
   { to: "/", titleKey: "nav.dashboard" },
-  { to: "/detect", titleKey: "nav.detect" },
+  { to: "/models", titleKey: "nav.models" },
   { to: "/monitor", titleKey: "nav.monitor" },
-  { to: "/profile", titleKey: "nav.profile" },
   { to: "/default", titleKey: "nav.defaultModel" },
   { to: "/companion", titleKey: "nav.companion" },
   { to: "/plugins", titleKey: "nav.plugins" },
