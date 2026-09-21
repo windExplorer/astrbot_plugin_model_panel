@@ -1,5 +1,28 @@
 # 更新日志
 
+## v1.3.2
+
+- 修复 **v1.3.1 装不上**：`from astrbot.api.message_components import MessageChain`
+  直接抛 `ImportError`，插件加载失败、安装被回滚。
+  - 根因：`astrbot/api/message_components.py` 只有一行
+    `from astrbot.core.message.components import *`，而 `MessageChain` 定义在
+    `astrbot/core/message/message_event_result.py`，**不在 components 里**，
+    所以 `import *` 也带不出来。它由 `astrbot.api.event` 导出。
+  - 修复：改成 `from astrbot.api.event import AstrMessageEvent, MessageChain, filter as astr_filter`，
+    `Image` / `Plain` 仍从 `astrbot.api.message_components` 导入（那两个确实在 components 里）。
+  - 为什么本地 190+ 项断言全过却没发现：测试脚本用 `sys.modules` 给 astrbot 打桩，
+    桩模块里我写 `MessageChain=...` 它就存在，**结构上不可能发现真实导入路径写错**。
+    这类错只在真装上 AstrBot 的那一刻暴露。
+  - 防复发：补了一个静态检查，按 AST 解析真实核心源码（不执行任何代码），
+    把插件里每条 `from astrbot... import X` 的 X 逐个对照模块公开面
+    （`__all__` 优先，并展开 `import *` 再导出链、并入包目录下的子模块名）。
+    反向对照验证过：它能抓到 v1.3.1 这个 `MessageChain` 错误本身。
+  - 另把属性级调用点也逐个对过源码：`filter.PermissionType`、`context.send_message`、
+    `context.get_db`、`context.platform_manager.platform_insts`、
+    `event.chain_result`、`provider.test(timeout=)`、`provider.text_chat_stream(prompt=)`、
+    `Image.fromBytes` 均与 4.28.1 实现一致。
+
+
 ## v1.3.1
 
 新增「模型监测 + 模型档案 + 自动告警」整条链路。设计与口径推导见 `docs/模型监测与配置规划.md`。
