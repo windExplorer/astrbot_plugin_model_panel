@@ -202,10 +202,11 @@ def _derive_state(live: dict, probe: dict) -> tuple[str, str]:
 
 
 def _fmt_ms(value) -> str:
-    """毫秒格式化。<1 秒用 ms，否则用秒。拿不到值显示 ``-`` 而不是 0。
+    """延迟格式化：**一律按毫秒原样给**，只有超过 1 分钟才折成「X分Y秒」。
 
-    这里绝不能把「没测到」显示成 0ms —— 非流式调用本就不产出 TTFT，
-    显示 0 会让人以为模型快得离谱。
+    之前把 4200ms 显示成 4.2s 被否掉了 —— 一位小数的秒等于把精度四舍五入掉了，
+    而看延迟的人要比的正是那几百毫秒的差别。拿不到值显示 ``-`` 而不是 0：
+    非流式调用本就不产出 TTFT，显示 0 会让人以为模型快得离谱。
     """
     try:
         n = float(value)
@@ -213,7 +214,15 @@ def _fmt_ms(value) -> str:
         return "-"
     if n <= 0:
         return "-"
-    return f"{n:.0f}ms" if n < 1000 else f"{n / 1000:.1f}s"
+    ms = int(round(n))
+    if ms < 60_000:
+        return f"{ms}ms"
+    total_sec = ms // 1000
+    minutes, seconds = divmod(total_sec, 60)
+    if minutes < 60:
+        return f"{minutes}分{seconds}秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}时{minutes}分"
 
 
 def _fmt_success(fail_rate) -> str:
@@ -2760,6 +2769,22 @@ class ModelPanelPlugin(Star):
             parts.append(str(item["reason"]))
         return " · ".join(p for p in parts if p)
 
+    def _command_scope(self, view: dict) -> dict:
+        """把视图裁到「指令检测」通道开放的模型 —— 聊天里能看到的就该是指令里能测的。
+
+        两边对不齐会让人困惑：卡片列了 12 个模型，`/检测模型` 却说其中 9 个没开放通道。
+        顶部计数也跟着重算，否则汇总说「故障 2」而列表里只剩一个故障模型。
+        """
+        items = [it for it in (view.get("items") or []) if (it.get("scope") or {}).get("command")]
+        counts = {"healthy": 0, "degraded": 0, "down": 0, "unknown": 0}
+        for it in items:
+            counts[it.get("state") or "unknown"] = counts.get(it.get("state") or "unknown", 0) + 1
+        out = dict(view)
+        out["items"] = items
+        out["counts"] = counts
+        out["samples"] = sum(int((it.get("window") or {}).get("total") or 0) for it in items)
+        return out
+
     def _card_payload(self, view: dict, title: str, badge: str, detailed: bool = False):
         """把视图表转成卡片要的 stats / columns / rows。
 
@@ -2819,8 +2844,8 @@ class ModelPanelPlugin(Star):
             notes = ["口径：成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）；"
                      "「首字」与「首字P95」只统计真实对话，不含探测"]
         else:
-            notes = ["延迟取最近一次调用：对话为首字耗时，探测为整次往返，两者不可直接比较；"
-                     "成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）"]
+            notes = ["只列开放了「指令检测」通道的模型（与 /检测模型 可测的范围一致）；"
+                     "延迟取最近一次调用：对话为首字耗时，探测为整次往返，两者不可直接比较"]
         if not view.get("live_available"):
             notes.append("实时监测不可用（核心表读不到），数值留空，副标题是最近一次探测结果")
         elif view.get("truncated"):
@@ -3384,17 +3409,21 @@ class ModelPanelPlugin(Star):
             await self.storage.set_muted(pid, until)
         yield event.plain_result(f"{hint}：" + "、".join(str(names[h]).split(" ")[0] for h in hits))
 
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型状态")
     async def cmd_model_status(self, event: AstrMessageEvent):
-        """查询模型健康与延迟总览。只读核心记录，不请求模型、不产生任何费用。"""
+        """查询模型健康与延迟总览。只读已有记录，不请求模型、不产生任何费用。"""
         try:
             view = await self._health_view(days=7.0)
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型状态 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")
             return
+        view = self._command_scope(view)
         if not view.get("items"):
-            yield event.plain_result("当前没有加载任何对话模型，没什么可看的～")
+            yield event.plain_result(
+                "没有任何模型开放了「指令检测」通道，所以这张卡是空的。\n"
+                "去 WebUI 的「模型管理」页，把需要在这里关注的模型勾上「指令检测」。")
             return
         png = await self._render_status_card(view, "模型实时状态", "实时")
         if png is None:
@@ -3402,6 +3431,7 @@ class ModelPanelPlugin(Star):
             return
         yield event.chain_result([Image.fromBytes(png)])
 
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型统计")
     async def cmd_model_stats(self, event: AstrMessageEvent):
         """查单个模型明细：/模型统计 <名称关键词>。"""
@@ -3415,6 +3445,7 @@ class ModelPanelPlugin(Star):
             logger.warning(f"[ModelPanel] /模型统计 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")
             return
+        view = self._command_scope(view)
         kw = keyword.lower()
         hits = [
             it for it in (view.get("items") or [])

@@ -1,20 +1,21 @@
-"""卡片渲染：把模型状态/告警画成一张浅色粉彩面板图，以图片形式发给用户。
+"""卡片渲染：把模型状态/告警画成一张浅色卡片图，以图片形式发给用户。
 
 设计取向（借鉴「萌萌资料卡」的观感，不照抄它的代码与内容）：
 
-- 资料卡的可用之处是**浅色底 + 粉彩渐变头 + 行内圆角药丸 + 带色柔光投影**，
-  这套在 QQ 里比深色面板耐看，深色截图在聊天气泡里发灰、对比也被吃掉。
-  所以这里也走浅色，但配色是「粉→紫」双调（资料卡是纯粉），
-  装饰只留一个自绘的信号条标记，不放爱心星星——它是监控面板，不是人设卡。
-- 内容仍然按监控面板组织：左侧状态色条 + 右对齐数值列 + 顶部汇总胶囊。
-- 行数多时自动折成两栏。实时状态要列**全部**模型，单栏会长到两三千像素，
-  在手机上根本没法扫读；两栏是这类总览卡的常规排法。
+- 走浅色：白卡体 + 粉→紫强调色 + 带色柔光投影 + 品牌描边。深色截图塞进 QQ 气泡
+  会发灰、对比被吃掉。资料卡是纯粉，这里做成粉→紫双调以示区分。
+- **一行一条，不折栏**。曾经按行数自动折两栏，结果窄栏里模型名被截得看不出差别，
+  而且两栏读起来要来回扫，比长列表更累。长列表靠行高和留白控制节奏就够了。
+- 数据行**不用底色药丸**。药丸适合「标签：值」的资料条目，不适合右对齐的数字表——
+  一行一个药丸叠上去就是一堵斑马墙，看着乱。这里改成发丝分隔线 + 状态色点。
 
 技术前提与约束：
 
 - **不引入新依赖**：AstrBot 核心自身已依赖 ``pillow>=11.2.1``，所以这里可以直接用。
 - **不用 emoji、不用 fontTools**：那两者不是核心依赖（只有资料卡这类插件自己声明）。
-  卡片里的状态一律用绘制的色条/图形表达，不依赖 emoji 字形。
+  卡片里的状态一律用自绘的色点表达，不依赖 emoji 字形。
+- **往 RGBA 图上画带 alpha 的颜色是替换像素、不是叠加**：在白卡上画 ``(*color, 46)``
+  会得到一个近乎透明的窟窿。要淡色就先用 ``_mix`` 和白底混成不透明色（见 ``_state_dot``）。
 - 中文字体只从系统里找（候选见 ``_font_candidates``），**不往插件包里塞几十 MB 字体**；
   找不到可用字体时返回 ``None``，由调用方降级发纯文本 —— 宁可丑，不可空白图。
 - 渲染是 CPU 密集的，**必须用 ``asyncio.to_thread`` 包起来调用**，别在事件循环里直接跑。
@@ -30,46 +31,43 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 # ---------------- 画布与配色 ----------------
-CARD_W = 880
-SHADOW_PAD = 30
-PAD_X = 30
+CARD_W = 760
+SHADOW_PAD = 28
+PAD_X = 34
 
 CARD_BG = (255, 255, 255)
-ROW_BG = (248, 245, 252)
-ROW_BG_ALT = (252, 249, 255)
-HEADER_TOP = (255, 227, 242)   # 粉
-HEADER_BOTTOM = (219, 200, 255)  # 紫 —— 资料卡是纯粉，这里做成双调以区分
-FOOTER_BG = (252, 241, 248)
-BORDER = (242, 218, 233)
+BADGE_BG = (250, 236, 245)
+BORDER = (243, 221, 235)
 SHADOW = (196, 110, 150)
 
-FG = (70, 60, 84)
-FG_DIM = (126, 116, 142)
-FG_FAINT = (163, 154, 178)
-LABEL = (178, 110, 148)
-LINE = (238, 230, 244)
+FG = (64, 56, 78)
+FG_DIM = (122, 112, 138)
+FG_FAINT = (163, 155, 176)
+LABEL = (172, 106, 142)
+LINE = (240, 234, 245)
 ACCENT_A = (232, 82, 148)  # 粉
-ACCENT_B = (134, 96, 224)  # 紫
-ON_HEADER = (92, 56, 88)   # 渐变头之上的深色文字
+ACCENT_B = (134, 96, 224)  # 紫 —— 资料卡是纯粉，这里做成双调以区分
 
 # 状态色：浅色底上要压得住，所以全部走深一档
 STATE_COLORS = {
-    "healthy": (34, 158, 108),
-    "degraded": (208, 132, 16),
-    "down": (214, 66, 88),
+    "healthy": (30, 150, 102),
+    "degraded": (206, 128, 12),
+    "down": (212, 60, 84),
     "unknown": (140, 132, 158),
     "muted": (150, 145, 165),
     "skipped": (150, 145, 165),
 }
 
-HEADER_H = 88
-STATS_H = 66
-COLHEAD_H = 26
-ROW_H = 44          # 单行行高：列全部模型时靠它压住总高
-ROW_H_SUB = 66      # 带副标题的行
-ROW_GAP = 8
-FOOT_H = 22
-TWO_COL_MIN = 15    # 行数超过这个值就折两栏
+HEAD_H = 62        # 标题行，下方一条渐变细线收口
+STATS_H = 44       # 汇总点行
+COLHEAD_H = 32
+ROW_H = 48         # 单行行高
+ROW_H_SUB = 72     # 带副标题的行
+FOOT_H = 23
+DOT_R = 5          # 状态点直径
+COL_GAP = 28       # 数值列间距
+NAME_MIN = 260     # 名称列至少留这么宽，否则模型名会被数字列挤成「deepseek-v3 …」
+CARD_W_MAX = 1080  # 自适应上限：再宽发出去就不像一张卡了
 
 # 字号 → 已加载字体，按字号缓存避免每次重开字体文件
 _font_cache: dict[int, Any] = {}
@@ -164,11 +162,34 @@ def _fit(draw, text: str, font, max_w: float) -> str:
     return (text + ell) if text else ell
 
 
-def _signal_mark(draw, x: int, y: int, color: tuple) -> None:
+def _signal_mark(draw, x: int, y: int, size: int) -> None:
     """自绘的三格信号标，替代 emoji 当标题图标。"""
-    for i, h in enumerate((10, 17, 24)):
-        bx = x + i * 9
-        draw.rounded_rectangle([bx, y + (24 - h), bx + 6, y + 24], radius=3, fill=_mix(color, (255, 255, 255), i * 0.16))
+    for i, frac in enumerate((0.42, 0.68, 1.0)):
+        h = int(size * frac)
+        bx = x + int(i * size * 0.30)
+        draw.rounded_rectangle(
+            [bx, y + (size - h), bx + size * 0.20, y + size],
+            radius=size * 0.10,
+            fill=_mix(ACCENT_A, ACCENT_B, i / 2),
+        )
+
+
+def _gradient_rule(draw, x0: int, x1: int, y: int, height: int = 3) -> None:
+    """一条粉→紫细线：整张卡唯一的装饰性渐变，用来代替大色块标题底。"""
+    span = max(1, x1 - x0)
+    for i in range(span):
+        draw.line([(x0 + i, y), (x0 + i, y + height)], fill=_mix(ACCENT_A, ACCENT_B, i / span))
+
+
+def _state_dot(draw, cx: int, cy: int, color: tuple) -> None:
+    """状态点外圈一层淡色晕：单个小点在浅底上偏弱，晕一圈才有「这行有问题」的注意力。
+
+    不能直接用带 alpha 的颜色 —— ImageDraw 在 RGBA 图上是替换像素而不是混合，
+    白底上会挖出个半透明窟窿。所以先把状态色和白底混成不透明淡色。
+    """
+    halo = DOT_R + 4
+    draw.ellipse([cx - halo, cy - halo, cx + halo, cy + halo], fill=_mix(color, CARD_BG, 0.72))
+    draw.ellipse([cx - DOT_R, cy - DOT_R, cx + DOT_R, cy + DOT_R], fill=color)
 
 
 def _wrap_lines(draw, text: str, font, max_w: float) -> list[str]:
@@ -193,63 +214,27 @@ def _row_height(row: dict) -> int:
     return ROW_H_SUB if str(row.get("sub") or "") else ROW_H
 
 
-def _column_anchors(draw, rows: list[dict], columns: list[str], left: int, right: int) -> list[tuple[int, int]]:
-    """在 [left, right] 区间内算出每个数值列的右对齐锚点 (l, r)。
+def _column_widths(draw, rows: list[dict], columns: list[str]) -> list[int]:
+    """每个数值列需要的像素宽：表头与各单元格文本宽的最大值。
 
-    列宽取「表头与各单元格文本像素宽的最大值」，这样同一列在不同卡片里都能对齐，
-    数字也不会因为中英文宽度差异错位。分栏时每栏各自算，窄栏不会被宽栏撑出来。
+    这样同一列在不同卡片里都能对齐，数字也不会因为中英文宽度差异错位。
     """
-    body_size = 20 if len(columns) > 2 else 19
-    widths = [int(_text_w(draw, c, _font(16))) for c in columns]
+    widths = [int(_text_w(draw, c, _font(15))) for c in columns]
     for r in rows:
         cells = list(r.get("cells") or [])
         for i in range(len(columns)):
             txt = str(cells[i]) if i < len(cells) else ""
-            widths[i] = max(widths[i], int(_text_w(draw, txt, _font(body_size))))
-    gap = 16 if len(columns) > 3 else 22
+            widths[i] = max(widths[i], int(_text_w(draw, txt, _font(19))))
+    return widths
+
+
+def _anchors_from_widths(widths: list[int], right: int) -> list[tuple[int, int]]:
+    """从最右侧往回铺，得到每列的 (l, r) 右对齐锚点。"""
     out, x = [], right
     for w in reversed(widths):
         out.append((x - w, x))
-        x -= w + gap
-    return list(reversed(out))
-
-
-def _paint_rows(draw, rows: list[dict], cols: list[str], lx: int, rx: int, top: int) -> int:
-    """在 [lx, rx] 区间内画一组行，返回底边 y。"""
-    if not rows:
-        return top
-    anchors = _column_anchors(draw, rows, cols, lx, rx) if cols else []
-    name_x = lx + 16
-    name_max = max(110, ((anchors[0][0] - 16) if anchors else rx) - name_x)
-    name_font, sub_font, cell_font = _font(20), _font(15), _font(20 if len(cols) > 2 else 19)
-    head_font = _font(15)
-    y = top
-    if anchors:
-        for i, c in enumerate(cols):
-            _, right = anchors[i]
-            draw.text((right - _text_w(draw, c, head_font), y + 4), c, font=head_font, fill=FG_FAINT)
-        y += COLHEAD_H
-    for idx, r in enumerate(rows):
-        state = str(r.get("state") or "unknown")
-        color = STATE_COLORS.get(state, STATE_COLORS["unknown"])
-        sub = str(r.get("sub") or "")
-        h = _row_height(r)
-        draw.rounded_rectangle([lx, y, rx, y + h - ROW_GAP], radius=12,
-                               fill=ROW_BG if idx % 2 == 0 else ROW_BG_ALT)
-        bar_y0 = y + 8
-        bar_y1 = y + h - ROW_GAP - 8
-        draw.rounded_rectangle([lx + 4, bar_y0, lx + 9, bar_y1], radius=2, fill=color)
-        ty = y + (11 if sub else 9)
-        draw.text((name_x, ty), _fit(draw, str(r.get("name") or ""), name_font, name_max), font=name_font, fill=FG)
-        if sub:
-            draw.text((name_x, ty + 25), _fit(draw, sub, sub_font, name_max), font=sub_font, fill=FG_FAINT)
-        vals = list(r.get("cells") or [])
-        for i, (_, right) in enumerate(anchors):
-            txt = str(vals[i]) if i < len(vals) else "-"
-            fill = FG if i == 0 else FG_DIM
-            draw.text((right - _text_w(draw, txt, cell_font), ty + 1), txt, font=cell_font, fill=fill)
-        y += h
-    return y
+        x -= w + COL_GAP
+    return out[::-1]
 
 
 def render_card(
@@ -261,15 +246,15 @@ def render_card(
     footnotes: list[str],
     font_path: str = "",
 ) -> Optional[bytes]:
-    """画一张浅色粉彩面板卡片，返回 PNG bytes；字体不可用时返回 None 表示「请降级成文本」。
+    """画一张浅色卡片，返回 PNG bytes；字体不可用时返回 None 表示「请降级成文本」。
 
     Args:
-        title: 顶部渐变标题条上的标题。
+        title: 顶部标题。
         badge: 标题右侧的小标签文本，例如「实时」「告警」。
-        stats: ``[{"label": str, "value": str, "state": str}]``，顶部汇总胶囊。
+        stats: ``[{"label": str, "value": str, "state": str}]``，标题下的汇总点。
         columns: 右对齐数值列表头，例如 ``["延迟", "成功率"]``。
         rows: ``[{"state", "name", "sub", "cells"}]``。``sub`` 为空即单行矮行；
-            只有真正要解释的话才填 sub，否则「列全部模型」会把卡片拉得过高。
+            只有真正要解释的话才填 sub，否则长列表会被拉得更高。
         footnotes: 底部口径说明。**必须写明延迟是探测还是真实对话**，
             两种延迟不可混读（见 docs/模型监测与配置规划.md 第五节）。
     """
@@ -284,99 +269,100 @@ def render_card(
     cols = list(columns or [])
 
     # ---------- 先量后画 ----------
-    two_col = len(rows) > TWO_COL_MIN
-    if two_col:
-        half = (len(rows) + 1) // 2
-        blocks = [rows[:half], rows[half:]]
-    else:
-        blocks = [rows]
-
-    # 表头行随栏内是否有行而定，两栏时共用同一段高度
-    head_extra = COLHEAD_H if (cols and rows) else 0
-    body_h = max(sum(_row_height(r) for r in b) + head_extra for b in blocks) if blocks else 0
-    header_h = HEADER_H if rows or stats else HEADER_H - 26
-    # 脚注先按最终宽度折好行，再据此定高：口径说明被截断就等于没写
-    scratch = Image.new("RGBA", (8, 8))
-    mdraw = ImageDraw.Draw(scratch)
-    note_w = CARD_W - 2 * SHADOW_PAD - 2 * PAD_X
-    foot_lines = [ln for note in footnotes for ln in _wrap_lines(mdraw, note, _font(15), note_w)]
-    foot_h = (FOOT_H * len(foot_lines) + 12) if foot_lines else 0
-    stats_h = STATS_H if stats else 0
-    card_h = header_h + stats_h + body_h + foot_h + 26
-    w, h = CARD_W, card_h + SHADOW_PAD * 2
+    scratch = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    col_widths = _column_widths(scratch, rows, cols) if cols else []
+    numbers_w = (sum(col_widths) + COL_GAP * (len(col_widths) - 1)) if col_widths else 0
+    # 宽度跟着内容走：明细卡有五个数值列，固定 760 会把模型名挤到只剩省略号
+    card_w = min(CARD_W_MAX, max(CARD_W, 2 * SHADOW_PAD + 2 * PAD_X + NAME_MIN + numbers_w + 24))
+    inner_l, inner_r = SHADOW_PAD + PAD_X, card_w - SHADOW_PAD - PAD_X
+    body_h = sum(_row_height(r) for r in rows) + (COLHEAD_H if cols and rows else 0)
+    foot_lines = [ln for note in footnotes for ln in _wrap_lines(scratch, note, _font(14), inner_r - inner_l)]
+    card_h = (HEAD_H + (STATS_H if stats else 0) + body_h
+              + (FOOT_H * len(foot_lines) + 18 if foot_lines else 12))
+    w, h = card_w, card_h + SHADOW_PAD * 2
 
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     # 投影：单独一层高斯模糊，且带粉调 —— 纯灰投影在浅色卡上会发脏
     shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
         [SHADOW_PAD, SHADOW_PAD + 12, w - SHADOW_PAD, h - SHADOW_PAD + 6],
-        radius=30, fill=(*SHADOW, 95),
+        radius=28, fill=(*SHADOW, 90),
     )
     img = Image.alpha_composite(img, shadow.filter(ImageFilter.GaussianBlur(16)))
+    draw = ImageDraw.Draw(img)
+
     x0, y0 = SHADOW_PAD, SHADOW_PAD
     x1, y1 = w - SHADOW_PAD, h - SHADOW_PAD
-    draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([x0, y0, x1, y1], radius=26, fill=CARD_BG)
 
-    # ---------- 渐变标题条（上圆角，下方直接接内容） ----------
-    header = Image.new("RGBA", (x1 - x0, header_h), (0, 0, 0, 0))
-    hdraw = ImageDraw.Draw(header)
-    for i in range(header_h):
-        hdraw.line([(0, i), (header.width, i)], fill=(*_mix(HEADER_TOP, HEADER_BOTTOM, i / max(1, header_h - 1)), 255))
-    hmask = Image.new("L", header.size, 0)
-    ImageDraw.Draw(hmask).rounded_rectangle([0, 0, header.width - 1, header.height - 1], radius=26, fill=255)
-    ImageDraw.Draw(hmask).rectangle([0, 26, header.width, header.height], fill=255)
-    img.paste(header, (x0, y0), hmask)
-    draw = ImageDraw.Draw(img)
-
-    _signal_mark(draw, x0 + PAD_X, y0 + 24, ACCENT_B)
-    draw.text((x0 + PAD_X + 34, y0 + 20), _fit(draw, title, _font(28), 420), font=_font(28), fill=ON_HEADER)
+    # ---------- 标题 ----------
+    title_font = _font(24)
+    _signal_mark(draw, inner_l, y0 + 19, 22)
+    badge = _fit(draw, str(badge or ""), _font(15), 200)
+    badge_w = int(_text_w(draw, badge, _font(15))) + 24 if badge else 0
+    draw.text((inner_l + 34, y0 + 17),
+              _fit(draw, title, title_font, inner_r - (inner_l + 34) - badge_w - 18),
+              font=title_font, fill=FG)
     if badge:
-        # 徽章也要截断，否则长徽章会顶到标题
-        badge = _fit(draw, badge, _font(16), 200)
-        bw = int(_text_w(draw, badge, _font(16))) + 24
-        bx = x1 - PAD_X - bw
-        draw.rounded_rectangle([bx, y0 + 26, bx + bw, y0 + 50], radius=12, fill=(255, 255, 255, 235))
-        draw.text((bx + 12, y0 + 29), badge, font=_font(16), fill=_mix(ACCENT_A, ACCENT_B, 0.5))
+        bx = inner_r - badge_w
+        draw.rounded_rectangle([bx, y0 + 19, bx + badge_w, y0 + 43], radius=12, fill=BADGE_BG)
+        draw.text((bx + 12, y0 + 23), badge, font=_font(15), fill=_mix(ACCENT_A, ACCENT_B, 0.45))
+    _gradient_rule(draw, inner_l, inner_r, y0 + HEAD_H - 10)
+    cursor = y0 + HEAD_H
 
-    cursor = y0 + header_h
-
-    # ---------- 汇总胶囊 ----------
+    # ---------- 汇总点 ----------
     if stats:
-        cx = x0 + PAD_X
+        cx = inner_l
         for s in stats:
             color = STATE_COLORS.get(str(s.get("state") or "unknown"), STATE_COLORS["unknown"])
             label = str(s.get("label") or "")
             value = str(s.get("value") or "")
             lw = int(_text_w(draw, label, _font(16)))
-            vw = int(_text_w(draw, value, _font(23)))
-            box_w = max(92, lw + vw + 42)
-            draw.rounded_rectangle([cx, cursor + 8, cx + box_w, cursor + STATS_H - 8], radius=14, fill=ROW_BG)
-            draw.rounded_rectangle([cx, cursor + 8, cx + 4, cursor + STATS_H - 8], radius=2, fill=color)
-            draw.text((cx + 16, cursor + 26), label, font=_font(16), fill=LABEL)
-            draw.text((cx + 20 + lw, cursor + 18), value, font=_font(23), fill=color)
-            cx += box_w + 10
+            vw = int(_text_w(draw, value, _font(20)))
+            draw.ellipse([cx, cursor + 17, cx + 9, cursor + 26], fill=color)
+            draw.text((cx + 17, cursor + 12), label, font=_font(16), fill=LABEL)
+            draw.text((cx + 21 + lw, cursor + 9), value, font=_font(20), fill=color)
+            cx += 21 + lw + vw + 30
         cursor += STATS_H
-    cursor += 6
+        draw.line([(inner_l, cursor), (inner_r, cursor)], fill=LINE)
 
-    # ---------- 行（单栏或两栏） ----------
-    inner_l, inner_r = x0 + PAD_X, x1 - PAD_X
-    if two_col:
-        gutter = 14
-        col_w = (inner_r - inner_l - gutter) // 2
-        bottoms = []
-        for i, block in enumerate(blocks):
-            lx = inner_l + i * (col_w + gutter)
-            bottoms.append(_paint_rows(draw, block, cols, lx, lx + col_w, cursor))
-        cursor = max(bottoms)
-    else:
-        cursor = _paint_rows(draw, rows, cols, inner_l, inner_r, cursor)
+    # ---------- 表头 ----------
+    anchors = _anchors_from_widths(col_widths, inner_r) if col_widths and rows else []
+    if anchors:
+        for i, c in enumerate(cols):
+            _, right = anchors[i]
+            draw.text((right - _text_w(draw, c, _font(15)), cursor + 8), c, font=_font(15), fill=FG_FAINT)
+        draw.line([(inner_l, cursor + COLHEAD_H - 1), (inner_r, cursor + COLHEAD_H - 1)], fill=LINE)
+        cursor += COLHEAD_H
+
+    # ---------- 行 ----------
+    name_font, sub_font, cell_font = _font(19), _font(14), _font(19)
+    name_x = inner_l + 28
+    name_max = max(120, ((anchors[0][0] - 24) if anchors else inner_r) - name_x)
+    for idx, r in enumerate(rows):
+        state = str(r.get("state") or "unknown")
+        color = STATE_COLORS.get(state, STATE_COLORS["unknown"])
+        sub = str(r.get("sub") or "")
+        rh = _row_height(r)
+        _state_dot(draw, inner_l + 9, cursor + (25 if sub else rh // 2), color)
+        draw.text((name_x, cursor + 14),
+                  _fit(draw, str(r.get("name") or ""), name_font, name_max), font=name_font, fill=FG)
+        if sub:
+            draw.text((name_x, cursor + 41), _fit(draw, sub, sub_font, name_max), font=sub_font, fill=FG_FAINT)
+        vals = list(r.get("cells") or [])
+        for i, (_, right) in enumerate(anchors):
+            txt = str(vals[i]) if i < len(vals) else "-"
+            draw.text((right - _text_w(draw, txt, cell_font), cursor + 14), txt,
+                      font=cell_font, fill=FG if i == 0 else FG_DIM)
+        cursor += rh
+        if idx < len(rows) - 1:
+            draw.line([(inner_l, cursor - 1), (inner_r, cursor - 1)], fill=LINE)
 
     # ---------- 脚注（口径说明就落在这里） ----------
     if foot_lines:
-        cursor += 10
+        cursor += 16
         for line in foot_lines:
-            draw.text((inner_l, cursor), line, font=_font(15), fill=FG_FAINT)
+            draw.text((inner_l, cursor), line, font=_font(14), fill=FG_FAINT)
             cursor += FOOT_H
 
     # ---------- 品牌描边 + 圆角裁切 ----------

@@ -28,8 +28,8 @@ EXPECTED_COMMANDS = {
     "cmd_companion_affinity": ("陪伴分数", None),
     "cmd_model_probe": ("检测模型", "ADMIN"),
     "cmd_model_mute": ("模型静音", "ADMIN"),
-    "cmd_model_status": ("模型状态", None),
-    "cmd_model_stats": ("模型统计", None),
+    "cmd_model_status": ("模型状态", "ADMIN"),
+    "cmd_model_stats": ("模型统计", "ADMIN"),
 }
 
 _failures: list[str] = []

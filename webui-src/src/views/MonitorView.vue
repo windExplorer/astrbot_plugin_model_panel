@@ -251,7 +251,8 @@ const columns = computed<DataTableColumns<HealthItem>>(() => [
   {
     title: t("monitor.colModel"), key: "model", minWidth: 200, ellipsis: { tooltip: true },
     render: (it) => h("div", { class: "model-cell" }, [
-      h("div", { class: "model-name" }, it.display_model || it.model || it.id),
+      // 组头已经写了供应商，这里再走 display_model 等于同一件事说两遍
+      h("div", { class: "model-name" }, it.model || it.display_model || it.id),
       it.reason ? h("div", { class: "model-reason" }, it.reason) : null,
     ]),
   },
@@ -362,7 +363,7 @@ onMounted(load);
 :deep(.badge-default) { background: rgba(139, 92, 246, .18); color: #a78bfa; }
 :deep(.badge-muted) { background: rgba(148, 163, 184, .18); color: #94a3b8; }
 :deep(.model-cell) { display: flex; flex-direction: column; gap: 2px; }
-:deep(.model-name) { font-size: 13px; }
+:deep(.model-name) { font-size: 14px; font-weight: 700; line-height: 1.4; }
 :deep(.model-reason) { font-size: 11px; opacity: .6; }
 :deep(.last-cell) { display: flex; flex-direction: column; gap: 2px; }
 :deep(.last-main) { display: flex; align-items: center; gap: 6px; }

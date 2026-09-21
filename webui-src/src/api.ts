@@ -725,10 +725,20 @@ export async function apiSetScope(id: string, channel: "manual" | "scheduled" | 
   );
 }
 
-/** 毫秒延迟格式化。null 显示 – 而不是 0：非流式调用压根没测到首字延迟。 */
+/**
+ * 延迟格式化：**一律按毫秒原样给**，只有超过 1 分钟才折成「X分Y秒」。
+ * 与后端 main.py 的 _fmt_ms 同一条规则 —— 面板显示 4.2s、卡片显示 4200ms 会让人觉得两处数不是同一回事。
+ * 看延迟的人要比的正是那几百毫秒，折算成带一位小数的秒等于把精度四舍五入掉了。
+ * null 显示 – 而不是 0：非流式调用压根没测到首字延迟。
+ */
 export function fmtMs(v: number | null | undefined): string {
   if (v === null || v === undefined || !(v > 0)) return "–";
-  return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(1) + "s";
+  const ms = Math.round(v);
+  if (ms < 60000) return ms + "ms";
+  const totalSec = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSec / 60);
+  if (minutes < 60) return `${minutes}分${totalSec % 60}秒`;
+  return `${Math.floor(minutes / 60)}时${minutes % 60}分`;
 }
 
 /** 失败率转成功率；样本为 0 时返回 – ，那不是「全对」而是「没数据」。 */
