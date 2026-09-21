@@ -1,5 +1,55 @@
 # 更新日志
 
+## v1.3.4
+
+补文档时挖出一个静默失效的指令。
+
+### 问题
+
+`/模型静音` 在 CHANGELOG、README 和功能描述里都被当成可用特性写着，实际**从未注册过**——
+在聊天里发它，bot 完全无反应，也没有任何报错日志。
+
+### 根因
+
+M5 那一版给 `main.py` 插入代码时，用 `cmd_model_mute` 头上的两行装饰器当了
+`old_string` 的上下文，替换文本里没有把它们重新写回去。于是：
+
+- 方法体还在，`python -m compileall` 通过，导入期不报错；
+- 少了 `@astr_filter.command(...)` / `@astr_filter.permission_type(...)`，
+  AstrBot 扫描指令时看不见它，它就退化成一个普通的死方法；
+- 丢装饰器是**静默**的，不像丢导入会炸——所以 190 多条断言全绿也没发现。
+
+写 README「指令有哪些」时，我用 grep 逐个枚举注册了的指令，才对不上数量。
+
+### 修复（后端）
+
+- 把 `@astr_filter.permission_type(ADMIN)` + `@astr_filter.command("模型静音")` 补回
+  `cmd_model_mute`，顺序保持 permission_type 在上。
+- 新增 `tests/test_static_guards.py`（纯解析源码，不需要 AstrBot 环境、不给外部 API 打桩），
+  跑 `python tests/test_static_guards.py` 即可。它管两类静默失效：
+  - **指令注册**：五个 `cmd_*` 必须带 `@command`、`permission_type` 要写在 `@command`
+    之上（AstrBot 由外向内套装饰器，写反了权限不生效）、必须是 async generator，
+    另外断言 `@register` 没误挂到顶层函数上。
+  - **`astrbot.*` 导入**：顺着核心源码把 `from x import *` 的门面链展开，逐个核对
+    名字是否真的存在。需要本地有 `_Refs/AstrBot`，找不到就 skip 而不是 fail。
+- 反向对照做过，不是「空跑全绿」：手工把 `/模型静音` 的装饰器删回去、把
+  `permission_type` 挪到 `@command` 下面、把那年的
+  `from astrbot.api.message_components import MessageChain` 原样重放一遍、
+  再凭空捏一个不存在的名——四项分别被抓住，基线仍为 0 失败。
+  对照脚本是一次性的，用完已删。
+
+### 文档
+
+- README 新增「指令」一节：先给一张权限 / 是否花额度的总表，再逐条写用法、参数、
+  匹配上限和被拒绝时的行为。数字全部回查过代码而不是凭印象写：
+  卡片最多 12 行（`CARD_MAX_ROWS`）、`/检测模型` 单次上限 3 个（`_PROBE_MAX_TARGETS`，
+  正好 3 个放行）、`/模型统计` 超过 6 个命中改为提示收窄、静音默认 2h
+  （`_parse_duration(...) or 7200`）。
+- README 功能清单补齐 v1.3.0 之后的四块：实时监测、模型档案、自动告警、定时探测。
+- 明确写出**前置条件：管理员 ID**。`/检测模型`、`/模型静音` 和所有告警投递都依赖它，
+  而默认值 `astrbot` 是占位符、插件会主动跳过——不填就是「指令说没权限、告警一条收不到」，
+  这一条以前只写在代码注释里，用户侧无从得知。
+
 ## v1.3.3
 
 按用户纠正重做「实时监测」，并把监测页与档案页改成分组铺满一页。

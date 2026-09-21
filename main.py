@@ -3315,7 +3315,8 @@ class ModelPanelPlugin(Star):
             f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
             + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
 
-
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("模型静音")
     async def cmd_model_mute(self, event: AstrMessageEvent):
         """临时关闭某模型的告警推送：/模型静音 <名称> [时长]，或 /模型静音 取消 <名称>。
 
