@@ -24,7 +24,7 @@ from .monitor import (
     free_expiry_decisions,
     redact,
 )
-from .stats_reader import CallRecord, LiveStatsReader, summarize
+from .stats_reader import CallRecord, LiveStatsReader, percentile
 from .storage import (
     BILLING_TYPES,
     CHANNEL_KINDS,
@@ -350,6 +350,131 @@ def _flat_set_existing(cfg: Any, key: str, value: Any) -> None:
 
     if not update(cfg):
         cfg[key] = value
+
+
+def _empty_window() -> dict:
+    """模型在窗口内一次调用都没有时的空值。注意 success_rate 是 None 不是 100%——
+    「没数据」和「全成功」是两件事，显示成 100% 会误导换模型决策。"""
+    return {
+        "total": 0, "ok": 0, "fail": 0, "aborted": 0, "counted": 0,
+        "fail_rate": 0.0, "success_rate": None,
+        "avg_ttft_ms": None, "p95_ttft_ms": None, "ttft_samples": 0,
+        "avg_latency_ms": None, "p95_latency_ms": None, "latency_samples": 0,
+        "probe_avg_latency_ms": None, "probe_p95_latency_ms": None,
+        "probe_avg_ttft_ms": None, "probe_latency_samples": 0,
+        "tokens": 0, "chat": {"total": 0, "ok": 0, "fail": 0, "aborted": 0},
+        "probe": {"total": 0, "ok": 0, "fail": 0},
+    }
+
+
+def _probe_source(trigger: Any) -> str:
+    """把探测会话的 trigger 映射成展示用的调用来源标签。"""
+    t = str(trigger or "")
+    if t == "command":
+        return "command"
+    if t == "scheduled":
+        return "scheduled"
+    return "manual"  # single / all / stream 都是人在面板上点的
+
+
+def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
+    """把两个互不相通的记录处合并成「每个模型的调用台账」。
+
+    为什么必须两路都读：真实对话写在核心 provider_stats，
+    手动 / 指令 / 定时探测写在自己的 model_test_results。
+    只读前者就会出现「刚手动测过并且失败了，面板却显示正常」。
+
+    **成功率合并、延迟不合并**：探测是空载一句 PONG 的往返，和真实对话差一个数量级，
+    混在一起平均就失去意义（详见 docs/模型监测与配置规划.md 第五节）。
+    所以延迟/首字各留各的列，只有成败相加。
+    """
+    out: dict[str, dict] = {}
+
+    def bucket(pid: str) -> dict:
+        return out.setdefault(pid, {
+            "chat_rows": [], "probe_rows": [], "last": None,
+        })
+
+    for r in live_rows:
+        pid = str(getattr(r, "provider_id", "") or "") or "(unknown)"
+        b = bucket(pid)
+        b["chat_rows"].append(r)
+        ts = int(getattr(r, "started_at", 0) or 0)
+        cand = {
+            "ts": ts, "source": "chat",
+            "ok": bool(getattr(r, "ok", False)),
+            "aborted": bool(getattr(r, "aborted", False)),
+            "latency_ms": getattr(r, "latency_ms", None),
+            "ttft_ms": getattr(r, "ttft_ms", None),
+            "error_code": "",
+        }
+        if b["last"] is None or ts >= b["last"]["ts"]:
+            b["last"] = cand
+
+    for r in probe_rows:
+        pid = str(r.get("provider_id") or "") or "(unknown)"
+        b = bucket(pid)
+        b["probe_rows"].append(r)
+        ts = int(r.get("checked_at") or 0)
+        cand = {
+            "ts": ts, "source": _probe_source(r.get("trigger")),
+            "ok": bool(r.get("ok")), "aborted": False,
+            "latency_ms": r.get("latency_ms"), "ttft_ms": r.get("ttft_ms"),
+            "error_code": str(r.get("error_code") or ""),
+        }
+        if b["last"] is None or ts >= b["last"]["ts"]:
+            b["last"] = cand
+
+    merged: dict[str, dict] = {}
+    for pid, b in out.items():
+        chats, probes = b["chat_rows"], b["probe_rows"]
+        c_total = len(chats)
+        c_aborted = sum(1 for r in chats if getattr(r, "aborted", False))
+        c_fail = sum(1 for r in chats if not getattr(r, "ok", False) and not getattr(r, "aborted", False))
+        c_ok = c_total - c_aborted - c_fail
+        p_total = len(probes)
+        p_fail = sum(1 for r in probes if not r.get("ok"))
+        p_ok = p_total - p_fail
+        # 探测路没有 aborted 概念，也不产出 token
+        counted = (c_total - c_aborted) + p_total
+        fail = c_fail + p_fail
+        lat = [r.latency_ms for r in chats if getattr(r, "latency_ms", None)]
+        ttft = [r.ttft_ms for r in chats if getattr(r, "ttft_ms", None)]
+        p_lat = [r.get("latency_ms") for r in probes if r.get("latency_ms")]
+        p_ttft = [r.get("ttft_ms") for r in probes if r.get("ttft_ms")]
+        last = b["last"]
+        if last is not None and last["source"] != "chat":
+            last = dict(last)
+            last["aborted"] = False
+        merged[pid] = {
+            "last": last,
+            "window": {
+                "total": c_total + p_total,
+                "ok": c_ok + p_ok,
+                "fail": fail,
+                "aborted": c_aborted,
+                "counted": counted,
+                "fail_rate": round(fail / counted, 4) if counted else 0.0,
+                "success_rate": round(1 - (fail / counted), 4) if counted else None,
+                # 延迟按来源分列，绝不跨来源平均
+                "avg_ttft_ms": round(sum(ttft) / len(ttft), 1) if ttft else None,
+                "p95_ttft_ms": percentile(ttft, 95),
+                "ttft_samples": len(ttft),
+                "avg_latency_ms": round(sum(lat) / len(lat), 1) if lat else None,
+                "p95_latency_ms": percentile(lat, 95),
+                "latency_samples": len(lat),
+                "probe_avg_latency_ms": round(sum(p_lat) / len(p_lat), 1) if p_lat else None,
+                "probe_p95_latency_ms": percentile(p_lat, 95),
+                "probe_avg_ttft_ms": round(sum(p_ttft) / len(p_ttft), 1) if p_ttft else None,
+                "probe_latency_samples": len(p_lat),
+                "tokens": sum(int(getattr(r, "token_input", 0) or 0)
+                              + int(getattr(r, "token_cached", 0) or 0)
+                              + int(getattr(r, "token_output", 0) or 0) for r in chats),
+                "chat": {"total": c_total, "ok": c_ok, "fail": c_fail, "aborted": c_aborted},
+                "probe": {"total": p_total, "ok": p_ok, "fail": p_fail},
+            },
+        }
+    return merged
 
 
 @register("astrbot_plugin_model_panel", "local", "模型管理与检测面板", "0.1.0")
@@ -1807,25 +1932,28 @@ class ModelPanelPlugin(Star):
         now = int(time.time())
         profiles: dict = {}
         scopes: dict = {}
-        probes: dict = {}
         mstates: dict = {}
         alerts: list = []
         if self.storage:
             try:
                 profiles = await self.storage.get_all_profiles()
                 scopes = await self.storage.get_detect_scopes()
-                probes = await self.storage.latest_per_provider()
                 mstates = await self.storage.get_model_states()
                 alerts = await self.storage.open_alerts()
             except Exception as e:
                 logger.warning(f"[ModelPanel] 读取档案/范围/探测历史失败: {e}")
-        live: dict = {}
         live_available = self.live_stats.available
         truncated = False
         records: list = []
+        probe_rows: list = []
         if live_available:
             records, truncated = await self.live_stats.fetch_window(days=days)
-            live = summarize(records)
+        if self.storage:
+            try:
+                probe_rows = await self.storage.probe_window(days=days)
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取探测明细失败: {e}")
+        ledger = _merge_ledger(records, probe_rows)
         default_id = await self._default_provider_id()
         items = []
         for p in self._chat_providers():
@@ -1836,10 +1964,13 @@ class ModelPanelPlugin(Star):
                 "manual": True, "scheduled": False, "command": True,
                 "billing_type": "unknown", "explicit": {},
             }
-            l = live.get(pid) or {}
-            pr = probes.get(pid) or {}
+            entry = ledger.get(pid) or {}
+            w = entry.get("window") or _empty_window()
+            last = entry.get("last")
             ms = mstates.get(pid) or {}
-            state, reason = _derive_state(l, pr)
+            state, reason = _derive_state(w, {"ok": (last or {}).get("ok"),
+                                              "error_code": (last or {}).get("error_code") or ""}
+                                          if last else {})
             # 巡检状态机优先：它带连续失败计数与静音语义，而 _derive_state 只是按需现算的
             # 近似值。两边各给一个结论而不统一的话，面板显示的和告警发出去的会各说各话。
             persisted = str(ms.get("state") or "")
@@ -1876,27 +2007,8 @@ class ModelPanelPlugin(Star):
                     "command": bool(scope.get("command")),
                     "explicit": scope.get("explicit") or {},
                 },
-                "live": {
-                    "total": int(l.get("total") or 0),
-                    "counted": int(l.get("counted") or 0),
-                    "ok": int(l.get("ok") or 0),
-                    "fail": int(l.get("fail") or 0),
-                    "aborted": int(l.get("aborted") or 0),
-                    "fail_rate": float(l.get("fail_rate") or 0.0),
-                    "avg_ttft_ms": l.get("avg_ttft_ms"),
-                    "p95_ttft_ms": l.get("p95_ttft_ms"),
-                    "ttft_samples": int(l.get("ttft_samples") or 0),
-                    "avg_latency_ms": l.get("avg_latency_ms"),
-                    "p95_latency_ms": l.get("p95_latency_ms"),
-                    "latency_samples": int(l.get("latency_samples") or 0),
-                    "tokens": int(l.get("tokens") or 0),
-                },
-                "probe": {
-                    "ok": bool(pr.get("ok")) if pr else None,
-                    "latency_ms": pr.get("latency_ms"),
-                    "error_code": pr.get("error_code") or "",
-                    "checked_at": int(pr.get("checked_at") or 0),
-                },
+                "window": w,
+                "last": last,
                 "state": state,
                 "reason": reason,
                 "muted": muted_until > now,
@@ -1925,7 +2037,7 @@ class ModelPanelPlugin(Star):
             "days": days,
             "live_available": live_available,
             "truncated": truncated,
-            "samples": len(records),
+            "samples": sum(int((it.get("window") or {}).get("total") or 0) for it in items),
             "alerts": open_alerts,
             "muted_count": sum(1 for it in items if it.get("muted")),
             "enums": {
@@ -2587,10 +2699,23 @@ class ModelPanelPlugin(Star):
             label = f"{label} {'已到期' if left < 0 else f'剩 {left} 天'}" if label else ""
         return label
 
+    _SOURCE_LABELS = {"chat": "对话", "manual": "手动检测",
+                      "command": "指令检测", "scheduled": "定时探测"}
+
+    def _last_label(self, last: dict) -> str:
+        """最新一次调用：成败 + 延迟 + 来源。"""
+        if not last:
+            return "-"
+        verdict = "正常" if last.get("ok") else ("打断" if last.get("aborted") else "失败")
+        src = self._SOURCE_LABELS.get(str(last.get("source") or ""), "")
+        lat = _fmt_ms(last.get("ttft_ms") or last.get("latency_ms"))
+        return (f"{verdict} {lat}".strip()) + (f"·{src}" if src else "")
+
     def _row_sub(self, item: dict) -> str:
-        """行副标题：角色 · 计费 · 备注 · （无实时样本时的）探测情况。"""
+        """行副标题：角色 · 计费 · 备注 · （窗口内无调用时的）最近一次结果。"""
         billing = item.get("billing") or {}
-        live = item.get("live") or {}
+        w = item.get("window") or {}
+        last = item.get("last") or {}
         parts = []
         role = str(billing.get("role") or "unknown")
         if role not in ("unknown", ""):
@@ -2601,10 +2726,11 @@ class ModelPanelPlugin(Star):
             parts.append(bl)
         if billing.get("note"):
             parts.append(str(billing["note"])[:24])
-        probe = item.get("probe") or {}
-        if not int(live.get("counted") or 0) and probe.get("checked_at"):
-            verdict = f"探测 {_fmt_ms(probe.get('latency_ms'))}" if probe.get("ok") \
-                else f"探测失败 {probe.get('error_code') or ''}"
+        if not int(w.get("counted") or 0) and last:
+            if last.get("ok"):
+                verdict = f"最近 {_fmt_ms(last.get('latency_ms'))}"
+            else:
+                verdict = f"最近失败 {last.get('error_code') or ''}"
             parts.append(verdict.strip())
         if item.get("is_default"):
             parts.insert(0, "默认模型")
@@ -2619,28 +2745,30 @@ class ModelPanelPlugin(Star):
             items,
             key=lambda it: (
                 self._STATE_ORDER.get(str(it.get("state")), 9),
-                -int((it.get("live") or {}).get("total") or 0),
+                -int((it.get("window") or {}).get("total") or 0),
             ),
         )
         shown = ordered[: self.CARD_MAX_ROWS]
         rows = []
         for it in shown:
-            live = it.get("live") or {}
-            counted = int(live.get("counted") or 0)
+            w = it.get("window") or {}
+            last = it.get("last") or {}
+            counted = int(w.get("counted") or 0)
             if detailed:
                 cells = [
-                    _fmt_ms(live.get("avg_ttft_ms")),
-                    _fmt_ms(live.get("p95_ttft_ms")),
-                    _fmt_ms(live.get("avg_latency_ms")),
-                    _fmt_success(live.get("fail_rate")) if counted else "-",
-                    f"{int(live.get('fail') or 0)}/{counted}",
+                    _fmt_ms(w.get("avg_ttft_ms")),
+                    _fmt_ms(w.get("p95_ttft_ms")),
+                    _fmt_ms(w.get("avg_latency_ms")),
+                    _fmt_success(w.get("fail_rate")) if counted else "-",
+                    f"{int(w.get('fail') or 0)}/{counted}",
                 ]
             else:
+                # 默认看最新一次结果，窗口平均值放后面
                 cells = [
-                    _fmt_ms(live.get("avg_ttft_ms")),
-                    _fmt_ms(live.get("avg_latency_ms")),
-                    _fmt_success(live.get("fail_rate")) if counted else "-",
-                    f"n={int(live.get('total') or 0)}",
+                    self._last_label(last),
+                    _fmt_ms(w.get("avg_ttft_ms")),
+                    _fmt_success(w.get("fail_rate")) if counted else "-",
+                    f"n={int(w.get('total') or 0)}",
                 ]
             rows.append({
                 "state": it.get("state"),
@@ -2658,9 +2786,11 @@ class ModelPanelPlugin(Star):
         if detailed:
             # 明细模式看的就是单个模型的数字，顶部再放全局计数只是噪音
             stats = []
-        columns = ["首字", "首字P95", "整轮", "成功率", "失败"] if detailed else ["首字", "整轮", "成功率", "样本"]
+        columns = (["首字", "首字P95", "整轮", "成功率", "失败"] if detailed
+                   else ["最新结果", "平均首字", "成功率", "样本"])
         # 脚注是口径纪律落到界面上的地方：探测值和真实对话值绝不能被读成同一个东西
-        notes = ["口径：首字=真实对话首字延迟，整轮=含工具的多步总耗时，都不是空载探测值"]
+        notes = ["口径：成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）；"
+                 "「平均首字」只统计真实对话，不含探测"]
         if not view.get("live_available"):
             notes.append("实时监测不可用（核心表读不到），数值留空，副标题是最近一次探测结果")
         elif view.get("truncated"):

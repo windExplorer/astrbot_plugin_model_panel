@@ -617,30 +617,46 @@ export interface HealthScope {
   explicit: Record<"manual" | "scheduled" | "command", boolean>;
 }
 
-export interface HealthLive {
+export type CallSource = "chat" | "manual" | "command" | "scheduled";
+
+/** 一次调用的最新结果。来源可能是对话，也可能是三种探测入口。 */
+export interface LastCall {
+  ts: number;
+  source: CallSource;
+  ok: boolean;
+  aborted?: boolean;
+  latency_ms: number | null;
+  ttft_ms: number | null;
+  error_code: string;
+}
+
+/**
+ * 窗口内的调用台账。成败是「所有来源合并」的（这才是"每次调用是否正常"），
+ * 但延迟按来源分列：探测是空载一句 PONG 的往返，和真实对话差一个数量级，
+ * 跨来源平均出来的数字没有意义。
+ */
+export interface HealthWindow {
   total: number;
-  counted: number;
   ok: number;
   fail: number;
   aborted: number;
+  counted: number;
   fail_rate: number;
-  /** 真实对话首字延迟。null 表示没测到（非流式调用不产出该值），不是 0 */
+  /** null 表示窗口内一次调用都没有 —— 不是 0% 也不是 100% */
+  success_rate: number | null;
   avg_ttft_ms: number | null;
   p95_ttft_ms: number | null;
   ttft_samples: number;
-  /** 一轮对话总耗时，含工具执行与多步 agent 循环 */
   avg_latency_ms: number | null;
   p95_latency_ms: number | null;
   latency_samples: number;
+  probe_avg_latency_ms: number | null;
+  probe_p95_latency_ms: number | null;
+  probe_avg_ttft_ms: number | null;
+  probe_latency_samples: number;
   tokens: number;
-}
-
-export interface HealthProbe {
-  /** null 表示从未探测过 */
-  ok: boolean | null;
-  latency_ms: number | null;
-  error_code: string;
-  checked_at: number;
+  chat: { total: number; ok: number; fail: number; aborted: number };
+  probe: { total: number; ok: number; fail: number };
 }
 
 export interface HealthItem {
@@ -651,8 +667,8 @@ export interface HealthItem {
   is_default: boolean;
   billing: HealthBilling;
   scope: HealthScope;
-  live: HealthLive;
-  probe: HealthProbe;
+  window: HealthWindow;
+  last: LastCall | null;
   state: HealthState;
   reason: string;
   muted: boolean;

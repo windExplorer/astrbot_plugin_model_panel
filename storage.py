@@ -422,6 +422,29 @@ class Storage:
             "latest_session": latest,
         }
 
+    async def probe_window(self, days: float = 7.0, limit: int = 5000) -> list[dict[str, Any]]:
+        """取最近 N 天的**探测**明细，带上会话来源。
+
+        实时监测要的是「每一次 LLM 调用」，而调用有两个互不相通的记录处：
+        真实对话在核心 provider_stats，手动/指令/定时探测在我们自己的
+        model_test_results。少读一边就会把「刚手动测过且失败」的模型显示成正常。
+        trigger 列就是区分三种探测入口的唯一依据。
+        """
+        await self.init()
+        since = int(time.time() - max(0.0, float(days)) * 86400)
+        sql = """SELECT r.provider_id, r.provider_model, r.ok, r.latency_ms, r.ttft_ms,
+                        r.error_code, r.error_message, r.checked_at, s.trigger
+                 FROM model_test_results r
+                 JOIN test_sessions s ON s.id = r.session_id
+                 WHERE r.checked_at >= ?
+                 ORDER BY r.checked_at DESC, r.id DESC
+                 LIMIT ?"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, (since, int(limit)))
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def cleanup_older_than(self, days: int) -> int:
         """清理 days 天前的已完成会话。返回受影响行数。"""
         if days <= 0:

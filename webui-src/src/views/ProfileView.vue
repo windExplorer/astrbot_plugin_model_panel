@@ -38,20 +38,29 @@
       </n-space>
     </div>
 
-    <n-data-table
-      :columns="columns"
-      :data="shown"
-      :loading="loading"
-      :row-key="(r: HealthItem) => r.id"
-      size="small"
-      striped
-      :scroll-x="1120"
-      :pagination="pagination"
-    >
-      <template #empty>
-        <span class="p-empty">{{ t('profile.empty') }}</span>
-      </template>
-    </n-data-table>
+    <n-empty v-if="!loading && !groups.length" :description="t('profile.empty')" class="p-empty" />
+
+    <!-- 与监测页同样按供应商分组铺满一页，不分页：档案是要成批填的，
+         分页会让「把这家全标成付费」这种操作跨页丢失上下文 -->
+    <section v-for="g in groups" :key="g.name" class="group-block">
+      <header class="group-head">
+        <span class="group-name">{{ g.name }}</span>
+        <span class="group-count">{{ g.items.length }} {{ t('monitor.units') }}</span>
+        <n-button size="tiny" tertiary :disabled="!batchBilling" @click="applyBatchTo(g.name)">
+          {{ t('profile.applyHere') }}
+        </n-button>
+      </header>
+      <n-data-table
+        :columns="columns"
+        :data="g.items"
+        :row-key="(r: HealthItem) => r.id"
+        size="small"
+        :pagination="false"
+        :bordered="true"
+        :single-line="false"
+        :scroll-x="1120"
+      />
+    </section>
 
     <div v-if="dirtyCount" class="p-savebar">
       <span class="save-hint">{{ t('profile.dirtyCount', { n: dirtyCount }) }}</span>
@@ -150,7 +159,7 @@
 import { computed, h, onMounted, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import {
-  NAlert, NButton, NDataTable, NDatePicker, NDivider, NDrawer, NDrawerContent, NForm, NFormItem,
+  NAlert, NButton, NDataTable, NDatePicker, NDivider, NDrawer, NDrawerContent, NEmpty, NForm, NFormItem,
   NInput, NInputNumber, NSelect, NSpace, NSwitch, NTooltip, useMessage,
 } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
@@ -182,7 +191,6 @@ const drawerOpen = ref(false);
 const editing = ref<HealthItem | null>(null);
 /** 草稿表：provider_id -> 被改动的字段。未保存前不落库。 */
 const drafts = reactive<Record<string, any>>({});
-const pagination = { pageSize: 20, showSizePicker: true, pageSizes: [20, 50, 100] };
 
 const items = computed<HealthItem[]>(() => data.value?.items ?? []);
 
@@ -258,22 +266,42 @@ function resetScope(id: string, channel: string) {
   draft(id)["scope_" + channel] = null;
 }
 
+const groups = computed(() => {
+  const map = new Map<string, HealthItem[]>();
+  for (const it of shown.value) {
+    const key = it.name || t("profile.ungrouped");
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(it);
+  }
+  return [...map.entries()]
+    .map(([name, list]) => ({ name, items: list }))
+    .sort((a, b) => b.items.length - a.items.length || a.name.localeCompare(b.name, "zh"));
+});
+
 const dirtyList = computed(() =>
   Object.keys(drafts).filter((id) => Object.keys(drafts[id]).length > 0));
 const dirtyCount = computed(() => dirtyList.value.length);
+
+function applyBillingTo(list: HealthItem[], billing: string, who: string) {
+  list.forEach((it) => setVal(it, "billing_type", billing));
+  message.success(t("profile.batchDone", {
+    vendor: who, billing: t("monitor.billing." + billing), n: list.length,
+  }));
+}
 
 function applyBatch() {
   const vendor = batchVendor.value;
   const billing = batchBilling.value;
   if (!vendor || !billing) return;
-  let n = 0;
-  items.value.forEach((it) => {
-    if ((it.name || it.id) !== vendor) return;
-    setVal(it, "billing_type", billing);
-    n += 1;
-  });
-  message.success(t("profile.batchDone", { vendor, billing: t("monitor.billing." + billing), n }));
+  applyBillingTo(items.value.filter((it) => (it.name || it.id) === vendor), billing, vendor);
   batchBilling.value = null;
+}
+
+/** 组头按钮：直接作用到当前分组，省掉「先在下拉里找这家」那一步 */
+function applyBatchTo(vendor: string) {
+  applyBillingTo(
+    shown.value.filter((it) => (it.name || it.id) === vendor),
+    batchBilling.value || "free", vendor);
 }
 
 function discard() {
@@ -428,6 +456,14 @@ onMounted(() => load());
 .p-note { font-size: 12px; line-height: 1.6; opacity: .9; }
 .p-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
 .p-empty { display: block; padding: 24px; text-align: center; opacity: .6; }
+.group-block { margin-bottom: 10px; }
+.group-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 8px 8px 0 0;
+  background: rgba(139, 92, 246, .10); border-left: 3px solid #8b5cf6;
+}
+.group-name { font-size: 14px; font-weight: 600; }
+.group-count { margin-right: auto; font-size: 12px; opacity: .55; }
 .p-savebar {
   position: sticky; bottom: 0; z-index: 5;
   display: flex; justify-content: space-between; align-items: center;
