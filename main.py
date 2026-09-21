@@ -24,7 +24,7 @@ from .monitor import (
     free_expiry_decisions,
     redact,
 )
-from .stats_reader import LiveStatsReader, summarize
+from .stats_reader import CallRecord, LiveStatsReader, summarize
 from .storage import (
     BILLING_TYPES,
     CHANNEL_KINDS,
@@ -2657,6 +2657,8 @@ class ModelPanelPlugin(Star):
         pruned = await self.storage.cleanup_alerts(cfg.alert_retention_days)
         if pruned:
             logger.info(f"[ModelPanel] 清理已结告警事件 {pruned} 条")
+        # 探测放在最后：它可能耗时几分钟（串行 × 超时），别拖累实时监测的判定节奏
+        await self._maybe_probe(cfg, now)
 
     async def _dispatch_alerts(self, decisions, names, now: int, cfg: MonitorConfig) -> None:
         """按告警类型合并投递，并重试上一轮没送达的事件。
@@ -2746,6 +2748,131 @@ class ModelPanelPlugin(Star):
         lines = [title] + [f"{names.get(d.provider_id) or d.provider_id} · {redact(d.reason)}" for d in group]
         lines.append(notes[0])
         return MessageChain([Plain("\n".join(lines))])
+
+    async def _maybe_probe(self, cfg: MonitorConfig, now: int) -> None:
+        """定时探测的调度闸门：开了、到点、没撞上手动手测，才真跑。"""
+        if not cfg.probe_enabled:
+            return
+        try:
+            nxt = int(await self.storage.get_state_value("probe_next_at", "0") or 0)
+        except (TypeError, ValueError):
+            nxt = 0
+        if now < nxt:
+            return
+        # 手动检测优先。撞车时定时让路并顺延，不排队——
+        # 排着队等来的探测结果已经没有时效价值，还白占一次额度。
+        if self._test_all_lock.locked() or self.sessions.is_busy():
+            await self.storage.set_state_value("probe_next_at", str(now + 120))
+            return
+        await self.storage.set_state_value("probe_next_at", str(now + cfg.probe_interval_min * 60))
+        await self._probe_round(cfg, now)
+
+    async def _probe_round(self, cfg: MonitorConfig, now: int) -> None:
+        """跑一轮定时探测，并把结果喂进与实时监测同一套状态机与告警链路。
+
+        探测结果刻意复用 ``monitor.evaluate``：把探测输出包成 CallRecord 再走同一个引擎，
+        这样「连续失败几次算故障」「冷却」「恢复需连续成功」只有一份实现，
+        不会出现手动检测和定时检测两套判定互相打脸。
+        """
+        day = time.strftime("%Y%m%d", time.localtime(now))
+        used_key = f"probe_used_{day}"
+        try:
+            used = int(await self.storage.get_state_value(used_key, "0") or 0)
+        except (TypeError, ValueError):
+            used = 0
+        scopes = await self.storage.get_detect_scopes()
+        profiles = await self.storage.get_all_profiles()
+        targets = []
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = str(d.get("id") or "")
+            if not pid or not (scopes.get(pid) or {}).get("scheduled"):
+                continue
+            billing = str((profiles.get(pid) or {}).get("billing_type") or "unknown")
+            targets.append((pid, d, billing, p))
+        if not targets:
+            return
+        if cfg.probe_daily_budget > 0:
+            left = max(0, cfg.probe_daily_budget - used)
+            if left <= 0:
+                logger.info(f"[ModelPanel] 定时探测已达当日预算（{cfg.probe_daily_budget} 次），本轮跳过")
+                return
+            if left < len(targets):
+                logger.info(f"[ModelPanel] 当日预算剩余 {left}，本轮只测前 {left}/{len(targets)} 个")
+                targets = targets[:left]
+
+        tcfg = self._test_config()
+        timeout = float(tcfg["test_timeout"])
+        sem = asyncio.Semaphore(max(1, cfg.probe_concurrency))
+
+        async def one(item):
+            pid, d, billing, provider = item
+            async with sem:
+                t = dict(tcfg)
+                # 付费/试用/超额类不重试：重试等于双倍花钱，而探测一次就足够定性
+                if billing in ("paid", "paid_overage", "trial"):
+                    t["test_retry_count"] = 0
+                try:
+                    r = await self._test_one(provider, timeout, t)
+                except Exception as e:
+                    code, msg = _normalize_error(e)
+                    r = {"ok": False, "latency_ms": None, "error_code": code,
+                         "error": msg, "retry_count": 0}
+                r.update({"id": pid, "name": d.get("name") or "", "model": d.get("model") or "",
+                          "skipped": False, "checked_at": int(time.time())})
+                return r
+
+        started = time.monotonic()
+        results = list(await asyncio.gather(*[one(x) for x in targets]))
+        ok_n = sum(1 for r in results if r.get("ok"))
+        logger.info(
+            f"[ModelPanel] 定时探测完成：{len(results)} 个模型，成功 {ok_n}，"
+            f"耗时 {time.monotonic() - started:.1f}s"
+        )
+        try:
+            session = await self.storage.create_session("scheduled", len(results))
+            for r in results:
+                await self.storage.insert_result(session["id"], r)
+            await self.storage.finish_session(session["id"], ok_n, len(results) - ok_n, 0)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 定时探测写历史失败: {e}")
+
+        records = [
+            CallRecord(
+                id=i, provider_id=str(r.get("id") or ""), provider_model=str(r.get("model") or ""),
+                status="completed" if r.get("ok") else "error",
+                started_at=float(r.get("checked_at") or now),
+                latency_ms=r.get("latency_ms"), ttft_ms=None,
+                token_input=0, token_cached=0, token_output=0,
+            )
+            for i, r in enumerate(results)
+        ]
+        states = await self.storage.get_model_states()
+        notified = await self.storage.last_notified_map()
+
+        def cooling(pid: str, kind: str) -> bool:
+            return notified.get((pid, kind), 0) + cfg.cooldown_sec > int(time.time())
+
+        decisions = evaluate_monitor(records, states, cfg, int(time.time()), cooling)
+        # 只有探测路知道 error_code，补进状态里，面板和告警才说得出「为什么坏的」
+        code_of = {str(r.get("id")): str(r.get("error_code") or "") for r in results}
+        for d in decisions:
+            prev = states.get(d.provider_id) or {}
+            await self.storage.save_model_state(d.provider_id, {
+                "state": d.state,
+                "consecutive_fail": d.consecutive_fail,
+                "consecutive_ok": d.consecutive_ok,
+                "last_error_code": code_of.get(d.provider_id, "") if d.state == "down" else "",
+                "last_change_at": now if d.action else int(prev.get("last_change_at") or 0),
+                "muted_until": int(prev.get("muted_until") or 0),
+                "samples_total": int(prev.get("samples_total") or 0) + d.samples,
+            })
+        names = {pid: (d.get("display_model") or d.get("model") or pid) for pid, d, _b, _p in targets}
+        await self._dispatch_alerts(decisions, names, int(time.time()), cfg)
+        try:
+            await self.storage.set_state_value(used_key, str(used + len(results)))
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 记录探测预算失败: {e}")
 
     async def _notify_admins(self, chain) -> int:
         """主动投递给管理员。

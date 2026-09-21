@@ -45,7 +45,7 @@ _SECRET_PATTERNS = (
 
 @dataclass
 class MonitorConfig:
-    """巡检与告警参数。全部有安全默认值，配置缺失时不会炸。"""
+    """巡检、告警与定时探测参数。全部有安全默认值，配置缺失时不会炸。"""
 
     enabled: bool = True
     notify_enabled: bool = True
@@ -54,6 +54,11 @@ class MonitorConfig:
     cooldown_sec: int = 1800
     alert_retention_days: int = 30
     free_alert_days: int = 3
+    # 定时探测会真的打模型、真的花钱，所以默认关闭，要用户显式打开。
+    probe_enabled: bool = False
+    probe_interval_min: int = 30
+    probe_daily_budget: int = 500
+    probe_concurrency: int = 3
 
     @classmethod
     def from_config(cls, cfg: Any) -> "MonitorConfig":
@@ -70,6 +75,12 @@ class MonitorConfig:
             out.cooldown_sec = max(60, int(get("alert_cooldown_min") or 0) * 60) or out.cooldown_sec
             out.alert_retention_days = max(0, int(get("alert_retention_days") or out.alert_retention_days))
             out.free_alert_days = max(0, int(get("free_expiry_alert_days") or 0))
+            out.probe_enabled = bool(get("probe_enabled", False))
+            out.probe_interval_min = max(5, int(get("probe_interval_min") or out.probe_interval_min))
+            raw_budget = get("probe_daily_budget")
+            # 0 = 不限，沿用本仓库 history_retention_days 的既有约定
+            out.probe_daily_budget = max(0, int(raw_budget)) if raw_budget is not None else out.probe_daily_budget
+            out.probe_concurrency = max(1, min(8, int(get("probe_concurrency") or out.probe_concurrency)))
         except (TypeError, ValueError):
             return cls()
         return out
