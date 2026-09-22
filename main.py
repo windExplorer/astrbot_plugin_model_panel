@@ -4280,10 +4280,14 @@ class ModelPanelPlugin(Star):
         联动方一次可能要点十几个模型（它默认不限量），得能告诉用户「最坏等多久」，
         而并发数与超时都是本插件定的，它猜不到也不该猜 —— 两边猜的数字迟早对不上。
         """
-        return {"plugin": "astrbot_plugin_model_panel", "api": 2,
+        return {"plugin": "astrbot_plugin_model_panel", "api": 3,
                 "trigger": self.EXTERNAL_TRIGGER,
                 "probe_concurrency": self.probe_parallelism(),
-                "probe_timeout": self.probe_timeout_default()}
+                "probe_timeout": self.probe_timeout_default(),
+                # 此刻有没有检测在跑：联动方在调 external_detect **之前**就能知道，
+                # 于是可以干脆不发「检测中」那张卡（发完再说「其实没跑」是自相矛盾的）。
+                # 这只是一个瞬时快照，真正开跑时仍可能撞车 —— 所以对面还得处理 busy 返回值。
+                "busy": self._test_all_lock.locked()}
 
     def probe_parallelism(self) -> int:
         """一次探测同时打几个模型。
