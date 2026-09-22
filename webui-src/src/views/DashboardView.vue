@@ -161,8 +161,31 @@
     </n-card>
 
     <n-card :title="t('dashboard.historyTitle')" size="small" class="mt-3">
-      <template v-if="overview?.history && (overview.history.sessions_total || 0) > 0">
-        <n-space vertical>
+      <n-space vertical>
+        <!-- 调用次数：与「实时监测」同一份数据源（llm_calls 逐次埋点）。
+             这里有别于下面的「检测统计」：它数的是**所有** LLM 调用 ——
+             AstrBot 后台的「提供商测试」、WebChat 聊天界面、其它插件直调 provider 都算。 -->
+        <n-space align="center" wrap>
+          <n-tag type="info" round size="medium">
+            {{ t("dashboard.callsTitle") }} {{ overview?.calls?.all_total ?? 0 }}
+          </n-tag>
+          <n-tag type="success" round size="medium">
+            ✓ {{ t("dashboard.callsOk") }} {{ overview?.calls?.all_ok ?? 0 }}
+          </n-tag>
+          <n-tag :type="(overview?.calls?.all_fail ?? 0) > 0 ? 'error' : 'default'" round size="medium">
+            ✗ {{ t("dashboard.callsFail") }} {{ overview?.calls?.all_fail ?? 0 }}
+          </n-tag>
+          <n-text depth="3">
+            {{ t("dashboard.callsToday", {
+              total: overview?.calls?.today_total ?? 0,
+              ok: overview?.calls?.today_ok ?? 0,
+              fail: overview?.calls?.today_fail ?? 0,
+            }) }}
+          </n-text>
+        </n-space>
+        <n-text depth="3" class="hint">{{ t("dashboard.callsHint") }}</n-text>
+
+        <template v-if="overview?.history && (overview.history.sessions_total || 0) > 0">
           <n-space align="center" wrap>
             <n-tag
               :type="overview.history.latest_session && overview.history.latest_session.alive_rate >= 80 ? 'success' : 'warning'"
@@ -190,9 +213,11 @@
               {{ t("dashboard.goModels") }} →
             </n-button>
           </div>
-        </n-space>
-      </template>
-      <n-text v-else depth="3">{{ t("dashboard.noSession") }}</n-text>
+        </template>
+        <!-- 没有任何检测记录时也要给一句说明（调用次数在上面已经显示了） -->
+        <n-text v-if="!(overview?.history && (overview.history.sessions_total || 0) > 0)"
+                depth="3">{{ t("dashboard.noSession") }}</n-text>
+      </n-space>
     </n-card>
   </div>
 </template>

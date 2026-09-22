@@ -1028,6 +1028,54 @@ class Storage:
         out = [dict(r) for r in rows]
         return out, int(out[-1]["id"])
 
+    async def calls_window(self, since_ts: int, limit: int = 20000) -> list[dict]:
+        """一段时间内的**原始**逐次调用行（给调用台账合并用）。
+
+        台账要把 llm_calls 当成与核心 provider_stats 同级的来源（见 ``_merge_ledger``），
+        需要一行行原始记录 —— 算 P95、找最近一次，聚合值给不了。
+        """
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id, ts, provider_id, provider_model, ok, aborted,
+                          latency_ms, ttft_ms, error_code
+                   FROM llm_calls WHERE ts >= ? ORDER BY ts ASC LIMIT ?""",
+                (int(since_ts), int(limit)),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def calls_totals(self) -> dict[str, int]:
+        """llm_calls 的**累计**次数统计：所有调用，含 AstrBot 后台的「提供商测试」与 WebChat。
+
+        用户原话：「次数统计应该要算上所有调用的次数，和实时监测里面用的应该是一样的，
+        可以细化一下，成功次数和失败次数。」—— 所以不给时间窗、全表累计；
+        「今日」那一组另给，前端想把口径收窄时有得用。
+        """
+        await self.init()
+        day = time.strftime("%Y-%m-%d")
+        sql = ("SELECT COUNT(*) AS total, "
+               "COALESCE(SUM(CASE WHEN aborted = 1 THEN 1 ELSE 0 END), 0) AS aborted, "
+               "COALESCE(SUM(CASE WHEN aborted = 0 AND ok = 1 THEN 1 ELSE 0 END), 0) AS ok, "
+               "COALESCE(SUM(CASE WHEN aborted = 0 AND ok = 0 THEN 1 ELSE 0 END), 0) AS fail "
+               "FROM llm_calls{where}")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql.format(where=""))
+            all_row = await cur.fetchone()
+            cur = await db.execute(sql.format(where=" WHERE day = ?"), (day,))
+            day_row = await cur.fetchone()
+
+        def pick(r: Any) -> dict[str, int]:
+            return {"total": int(r["total"] or 0), "ok": int(r["ok"] or 0),
+                    "fail": int(r["fail"] or 0), "aborted": int(r["aborted"] or 0)}
+
+        out: dict[str, int] = {}
+        for prefix, row in (("all", all_row), ("today", day_row)):
+            for key, value in pick(row).items():
+                out[f"{prefix}_{key}"] = value
+        return out
+
     async def calls_stats(self, since_ts: int, until_ts: Optional[int] = None) -> dict[str, dict]:
         """按 provider 聚合一段时间的逐次调用：成败、延迟、首字、最近一次。
 

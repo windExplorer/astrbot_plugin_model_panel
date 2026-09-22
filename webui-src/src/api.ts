@@ -212,6 +212,19 @@ export interface OverviewHistory {
   } | null;
 }
 
+/** 调用次数统计：来源与「实时监测」相同（llm_calls 逐次埋点），
+    覆盖所有调用 —— AstrBot 后台的「提供商测试」、WebChat、其它插件直调都算。 */
+export interface CallsTotals {
+  all_total: number;
+  all_ok: number;
+  all_fail: number;
+  all_aborted: number;
+  today_total: number;
+  today_ok: number;
+  today_fail: number;
+  today_aborted: number;
+}
+
 export interface UsageToday {
   total: number;
   input: number;
@@ -251,6 +264,8 @@ export interface Overview {
   companion_provider_count: number;
   history?: OverviewHistory;
   latest_results?: Record<string, TestResult>;
+  /** 调用次数统计（llm_calls 累计 + 今日；与实时监测同一来源） */
+  calls?: CallsTotals;
   /** LLM 用量统计（插件未记录到数据时为 null） */
   usage?: UsageStats | null;
   cost?: CostTotals | null;

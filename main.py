@@ -743,28 +743,46 @@ def _probe_source(trigger: Any) -> str:
     return "manual"  # single / all / stream 都是人在面板上点的
 
 
-def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
-    """把两个互不相通的记录处合并成「每个模型的调用台账」。
+def _merge_ledger(live_rows: list, probe_rows: list,
+                  call_rows: Optional[list] = None) -> dict[str, dict]:
+    """把三个互不相通的记录处合并成「每个模型的调用台账」。
 
-    为什么必须两路都读：真实对话写在核心 provider_stats，
-    手动 / 指令 / 定时探测写在自己的 model_test_results。
-    只读前者就会出现「刚手动测过并且失败了，面板却显示正常」。
+    三路来源与谁说了算：
+
+    - ``call_rows``（llm_calls，本插件埋的）：**每次 ``provider.text_chat`` 尝试**一行。
+      覆盖面最广的一份 —— AstrBot 后台的「提供商测试」、WebChat 聊天界面、其它插件直调
+      provider，只要走了 provider 就都在这里；而核心 provider_stats 只在 agent 对话轮
+      结束时写一条。所以**只要有它的数据，次数与最近一次就以它为准** ——
+      否则 AstrBot 侧的调用会被整个漏掉（用户提过）。
+    - ``live_rows``（核心 provider_stats）：llm_calls 还没有任何数据时的兜底；
+      它的另一项独有数据是 **token 用量**（llm_calls 不记 token），所以 token 始终从它算。
+    - ``probe_rows``（model_test_results）：探测与真实对话的延迟量级不同，
+      只并成败与最近一次。
+
+    两路**不能相加**：正常的一轮 agent 对话，provider_stats 记一条、llm_calls 也记一条，
+    描述的是同一次调用 —— 两边都算就是双倍计数。所以 llm_calls 有数据时，
+    次数全部改从它出（口径也和「每次尝试」一致），provider_stats 只贡献 token。
 
     **成功率合并、延迟不合并**：探测是空载一句 PONG 的往返，和真实对话差一个数量级，
     混在一起平均就失去意义（详见 docs/模型监测与配置规划.md 第五节）。
     所以延迟/首字各留各的列，只有成败相加。
     """
     out: dict[str, dict] = {}
+    call_rows = call_rows or []
 
     def bucket(pid: str) -> dict:
         return out.setdefault(pid, {
-            "chat_rows": [], "probe_rows": [], "last": None,
+            "chat_rows": [], "call_rows": [], "probe_rows": [], "last": None,
         })
 
     for r in live_rows:
         pid = str(getattr(r, "provider_id", "") or "") or "(unknown)"
         b = bucket(pid)
         b["chat_rows"].append(r)
+        # 「最近一次」只在 llm_calls 没有数据时才由 provider_stats 决定：
+        # 同一次调用两边都有记录、时间戳又差着几秒，都参与比较只会让结果抖动。
+        if call_rows:
+            continue
         ts = int(getattr(r, "started_at", 0) or 0)
         cand = {
             "ts": ts, "source": "chat",
@@ -773,6 +791,20 @@ def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
             "latency_ms": getattr(r, "latency_ms", None),
             "ttft_ms": getattr(r, "ttft_ms", None),
             "error_code": "",
+        }
+        if b["last"] is None or ts >= b["last"]["ts"]:
+            b["last"] = cand
+
+    for r in call_rows:
+        pid = str(r.get("provider_id") or "") or "(unknown)"
+        b = bucket(pid)
+        b["call_rows"].append(r)
+        ts = int(r.get("ts") or 0)
+        cand = {
+            "ts": ts, "source": "chat",
+            "ok": bool(r.get("ok")), "aborted": bool(r.get("aborted")),
+            "latency_ms": r.get("latency_ms"), "ttft_ms": r.get("ttft_ms"),
+            "error_code": str(r.get("error_code") or ""),
         }
         if b["last"] is None or ts >= b["last"]["ts"]:
             b["last"] = cand
@@ -793,10 +825,23 @@ def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
 
     merged: dict[str, dict] = {}
     for pid, b in out.items():
-        chats, probes = b["chat_rows"], b["probe_rows"]
-        c_total = len(chats)
-        c_aborted = sum(1 for r in chats if getattr(r, "aborted", False))
-        c_fail = sum(1 for r in chats if not getattr(r, "ok", False) and not getattr(r, "aborted", False))
+        probes = b["probe_rows"]
+        if b["call_rows"]:
+            # 每次尝试一行：这才是「这个模型今天到底被调了多少次、成了几次」
+            chats = b["call_rows"]
+            c_total = len(chats)
+            c_aborted = sum(1 for r in chats if r.get("aborted"))
+            c_fail = sum(1 for r in chats if not r.get("ok") and not r.get("aborted"))
+            lat = [r.get("latency_ms") for r in chats if r.get("latency_ms")]
+            ttft = [r.get("ttft_ms") for r in chats if r.get("ttft_ms")]
+        else:
+            chats = b["chat_rows"]
+            c_total = len(chats)
+            c_aborted = sum(1 for r in chats if getattr(r, "aborted", False))
+            c_fail = sum(1 for r in chats if not getattr(r, "ok", False)
+                         and not getattr(r, "aborted", False))
+            lat = [r.latency_ms for r in chats if getattr(r, "latency_ms", None)]
+            ttft = [r.ttft_ms for r in chats if getattr(r, "ttft_ms", None)]
         c_ok = c_total - c_aborted - c_fail
         p_total = len(probes)
         p_fail = sum(1 for r in probes if not r.get("ok"))
@@ -804,8 +849,6 @@ def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
         # 探测路没有 aborted 概念，也不产出 token
         counted = (c_total - c_aborted) + p_total
         fail = c_fail + p_fail
-        lat = [r.latency_ms for r in chats if getattr(r, "latency_ms", None)]
-        ttft = [r.ttft_ms for r in chats if getattr(r, "ttft_ms", None)]
         p_lat = [r.get("latency_ms") for r in probes if r.get("latency_ms")]
         p_ttft = [r.get("ttft_ms") for r in probes if r.get("ttft_ms")]
         last = b["last"]
@@ -833,9 +876,12 @@ def _merge_ledger(live_rows: list, probe_rows: list) -> dict[str, dict]:
                 "probe_p95_latency_ms": percentile(p_lat, 95),
                 "probe_avg_ttft_ms": round(sum(p_ttft) / len(p_ttft), 1) if p_ttft else None,
                 "probe_latency_samples": len(p_lat),
+                # token 只有 provider_stats 有（llm_calls 不记），所以始终从它算 ——
+                # 即使次数已经改由 llm_calls 说了算。
                 "tokens": sum(int(getattr(r, "token_input", 0) or 0)
                               + int(getattr(r, "token_cached", 0) or 0)
-                              + int(getattr(r, "token_output", 0) or 0) for r in chats),
+                              + int(getattr(r, "token_output", 0) or 0)
+                              for r in b["chat_rows"]),
                 "chat": {"total": c_total, "ok": c_ok, "fail": c_fail, "aborted": c_aborted},
                 "probe": {"total": p_total, "ok": p_ok, "fail": p_fail},
             },
@@ -1885,6 +1931,15 @@ class ModelPanelPlugin(Star):
                 usage = await self.storage.usage_stats(days=7, top_models=5)
         except Exception as e:
             logger.warning(f"[ModelPanel] 用量统计失败: {e}")
+        # 调用次数统计：与「实时监测」同一份来源（llm_calls，逐次埋点），
+        # 覆盖所有调用 —— AstrBot 后台的「提供商测试」、WebChat、其它插件直调都算。
+        # 下面的 history 只统计「检测」（probe），两件事不能混在一个数里。
+        calls_totals: dict = {}
+        try:
+            if self.storage:
+                calls_totals = await self.storage.calls_totals()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 调用次数统计失败: {e}")
         # 花费是「用量 × 人工填的单价/倍率」，没填价的模型估不出来，
         # 所以总额只含有价模型；unpriced_models 让前端能说明「这不是全量」。
         cost = (await self._cost_rollup(displays)).get("totals") or {}
@@ -1899,6 +1954,7 @@ class ModelPanelPlugin(Star):
             "latest_results": latest_results,
             "usage": usage,
             "cost": cost,
+            "calls": calls_totals,
         }
 
     async def api_list_providers(self) -> dict:
@@ -2475,7 +2531,16 @@ class ModelPanelPlugin(Star):
                 calls = await self.storage.calls_stats(int(now - days * 86400))
             except Exception as e:
                 logger.warning(f"[ModelPanel] 读取逐次调用统计失败: {e}")
-        ledger = _merge_ledger(records, probe_rows)
+        # 原始行也给台账一份：llm_calls 的覆盖面比 provider_stats 广
+        # （AstrBot 后台的「提供商测试」、WebChat、其它插件直调 provider 都只在这里），
+        # 有它的数据时次数与「最后一次调用」就该以它为准。
+        call_rows: list = []
+        if self.storage:
+            try:
+                call_rows = await self.storage.calls_window(int(now - days * 86400))
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取逐次调用明细失败: {e}")
+        ledger = _merge_ledger(records, probe_rows, call_rows)
         default_id = await self._default_provider_id()
         displays = []
         for p in self._chat_providers():
