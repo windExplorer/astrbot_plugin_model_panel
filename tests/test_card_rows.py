@@ -181,7 +181,7 @@ def main() -> None:
     check(ago(int(now - 86400 * 3), now) == "3 天前", "3 天前")
     check(ago(0, now) == "-" and ago(None, now) == "-", "没有时间戳时给 -，不编「刚刚」")
     check("失败 2 次" in row["note"], "副标题里写明失败次数（旧版看不见的那个数）")
-    check(row["state"] == "degraded", "状态透传给渲染器（决定色点颜色）")
+    check(row["state"] == "degraded", "状态透传给渲染器（决定那行的行底渐变）")
 
     print("[计数汇总]")
     stats = plug._counts_stats({"counts": {"healthy": 2, "degraded": 1, "down": 1}})

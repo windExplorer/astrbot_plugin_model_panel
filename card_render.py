@@ -9,15 +9,19 @@
     │ ● 正常 9   ● 降级 1   ● 故障 2   ● 无数据 │    ││     汇总点用状态色，一眼看出量级
     ├────────────────────────────────────────────────┤  ← 直边对接（不带圆角）
     │                            延迟        成功率  │  ← 列头（右对齐，与小格对齐）
-    │ ╭────────────────────────────────────────────╮ │  ← 身体：白底，行是浅灰圆角块
+    │ ╭────────────────────────────────────────────╮ │  ← 身体：白底，行是圆角块
     │ │ ① OpenAI · 3 个模型                        │ │  ← 分组行：描边序号 + 组名 + 计数
     │ │ ╭────────────────────────────────────────╮ │ │
-    │ │ │ ② ● gpt-4o     [默认]     812ms   99.2%│ │ │  ← 实心序号 + 状态色点 + 名称 + 数字
+    │ │ │ ② gpt-4o       [默认]     812ms   99.2%│ │ │  ← 实心序号 + 名称 + 数字
     │ │ ╰────────────────────────────────────────╯ │ │
     │ ╰────────────────────────────────────────────╯ │
     ├────────────────────────────────────────────────┤  ← 直边对接
     │ ● 延迟为最近一次调用耗时 · 09-22 12:30  模型控制台│  ← 脚：浅色底，下两角圆角
     ╰────────────────────────────────────────────────╯
+
+**行底不是纯色**：每行是「**左端掺状态色 → 右端回到中性底**」的横向渐变
+（正常几乎看不出来、降级琥珀、故障红、无数据灰 —— 浓度见 :data:`STATE_TINT`）。
+状态不再用小圆点：点只有 10px，扫一眼分不出「正常 / 降级」，整行带色才会在滚动里跳出来。
 
 为什么改成这个版面（改回去之前先读）：
 
@@ -28,7 +32,7 @@
   编号必须一处生成。模型行与分组行**共用同一个数字空间**
   （① OpenAI、② gpt-4o、③ gpt-4o-mini、④ 硅基流动…），用户不必先判断这个数字是组还是模型。
 - **一行一个块，不折栏**：窄栏里模型名会被截得看不出差别，而且两栏读起来要来回扫。
-- **状态色只在两处出现**：行首的状态点、头部的汇总点。一行塞三个彩色胶囊就会显得廉价。
+- **状态色只出现在两处**：行底的横向渐变、头部的汇总点。一行塞三个彩色胶囊就会显得廉价。
 - 分组行用**描边**序号、模型行用**实心**序号：不靠颜色也能区分「这一行是组」。
 - 三段之间必须是**直边**：头的下沿、脚的上沿都是直角，只有最外侧那圈的上下四角是圆角。
   整卡一个圆角矩形再往里头贴色块，接缝处会出现「两段圆弧互啃」的缺口。
@@ -37,9 +41,10 @@
 
 - **不引入新依赖**：AstrBot 核心自身已依赖 ``pillow>=11.2.1``，所以这里可以直接用。
 - **不用 emoji、不用 fontTools**：那两者不是核心依赖（只有资料卡这类插件自己声明）。
-  卡片里的状态一律用自绘的色点表达，不依赖 emoji 字形。
+  卡片里的状态用**行底渐变**表达（左端状态色 → 右端中性底），不依赖 emoji 字形。
 - **往 RGBA 图上画带 alpha 的颜色是替换像素、不是叠加**：在白卡上画 ``(*color, 46)``
-  会得到一个近乎透明的窟窿。要淡色就先用 ``_mix`` 和白底混成不透明色（见 ``_state_dot``）。
+  会得到一个近乎透明的窟窿。要淡色就先用 ``_mix`` 和白底混成不透明色
+  （见 ``_row_left`` / ``_state_dot``）；行底渐变则整个用 ``alpha_composite`` 贴。
 - 中文字体只从系统里找（候选见 ``_font_candidates``），**不往插件包里塞几十 MB 字体**；
   找不到可用字体时返回 ``None``，由调用方降级发纯文本 —— 宁可丑，不可空白图。
 - 渲染是 CPU 密集的，**必须用 ``asyncio.to_thread`` 包起来调用**，别在事件循环里直接跑。
@@ -65,8 +70,8 @@ except Exception:  # pragma: no cover - 仅在没有 Pillow 的环境
     ImageFont = None  # type: ignore
 
 # ---------------- 版面 ----------------
-CARD_W = 940          # 卡片本体默认宽度（不含四周的阴影留白）
-CARD_W_MAX = 1160     # 自适应上限：再宽发出去就不像一张卡了
+CARD_W = 1080          # 卡片本体默认宽度（不含四周的阴影留白）
+CARD_W_MAX = 1340      # 自适应上限：再宽发出去就不像一张卡了
 SHADOW_PAD = 26       # 卡片四周的阴影留白（画布会比卡片大这么多）
 PAD = 40              # 卡片内左右边距
 RADIUS = 30           # 外轮廓圆角（只有最外侧四角用它）
@@ -174,6 +179,18 @@ STATE_COLORS = {
     "muted": (150, 145, 165),
     "skipped": (150, 145, 165),
 }
+
+# 行底渐变的「左端浓度」：状态色掺进底色的比例（1.0 = 完全等于底色，看不见）。
+# 健康那档故意只掺一点 —— 整屏都是彩条等于没有重点，异常的那几行才该跳出来。
+STATE_TINT = {
+    "healthy": 0.90,
+    "degraded": 0.66,
+    "down": 0.60,
+    "unknown": 0.88,
+    "muted": 0.92,
+    "skipped": 0.92,
+}
+DEFAULT_TINT = 0.90
 
 # ---------------- 字号 ----------------
 F_LABEL = 20    # 头部小标签（如「模型状态」）
@@ -425,7 +442,11 @@ def _card_mask(size: tuple[int, int], radius: int) -> Any:
 
 
 def _state_dot(draw, cx: int, cy: int, color: tuple) -> None:
-    """状态点外圈一层淡色晕：单个小点在浅底上偏弱，晕一圈才有「这行有问题」的注意力。
+    """状态点外圈一层淡色晕（**只用于头部汇总点那一行图例**）。
+
+    v1.3.17 起模型行的状态改用「行底渐变」表达（见 :func:`_row_bg`）——
+    10px 的小点扫一眼分不出「正常 / 降级」，得一个个读；整行带淡色才会在滚动里跳出来。
+    头部那行是**图例**（「● 正常 9」），保留小点更合适。
 
     不能直接用带 alpha 的颜色 —— ImageDraw 在 RGBA 图上是替换像素而不是混合，
     白底上会挖出个半透明窟窿。所以先把状态色和白底混成不透明淡色。
@@ -434,6 +455,43 @@ def _state_dot(draw, cx: int, cy: int, color: tuple) -> None:
     halo = r + 4
     draw.ellipse([cx - halo, cy - halo, cx + halo, cy + halo], fill=_mix(color, CARD_BG, 0.72))
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+
+
+def _hgradient(size: tuple[int, int], left: tuple, right: tuple) -> Any:
+    """横向渐变图层（``left`` → ``right``）。
+
+    只铺 96 个色阶再放大：逐列画竖线（一行 1080 次 ``line``）在一张卡上要跑几十次，
+    而过渡早就在视觉上平滑了 —— 多铺的色阶纯属浪费（放大用 BILINEAR，不会有色带）。
+    """
+    w, h = size
+    steps = max(2, min(96, max(2, int(w))))
+    strip = Image.new("RGBA", (steps, 1))
+    d = ImageDraw.Draw(strip)
+    for i in range(steps):
+        d.point((i, 0), fill=_mix(left, right, i / (steps - 1)) + (255,))
+    return strip.resize((max(1, w), max(1, h)), Image.BILINEAR)
+
+
+def _row_left(state: str, base: tuple) -> tuple:
+    """状态色按 :data:`STATE_TINT` 掺进底色 → 渐变的左端色。"""
+    key = str(state or "")
+    color = STATE_COLORS.get(key, STATE_COLORS["unknown"])
+    return _mix(color, base, STATE_TINT.get(key, DEFAULT_TINT))
+
+
+def _row_bg(w: int, h: int, radius: int, left: tuple, right: tuple) -> Any:
+    """一行行底：**左端状态色 → 右端中性底**的横向渐变，四角圆。
+
+    为什么左深右浅（而不是整行一个色）：右边是模型名与数字，底色越接近中性越清楚；
+    而左边是序号与状态的落点，多一点颜色正好给人「扫一眼就知道哪几行有事」。
+    健康那档只掺一点点（见 :data:`STATE_TINT`）：整屏都是彩条等于没有重点。
+
+    贴图必须用 ``alpha_composite``（不是 ``draw.rounded_rectangle``）——
+    圆角处的透明要参与混合，直接画会在白底上留下四个直角。
+    """
+    layer = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
+    layer.paste(_hgradient((w, h), left, right), (0, 0), _card_mask((w, h), radius))
+    return layer
 
 
 def _index_badge(draw, fonts: "_Fonts", x: int, cy: int, n: Any, *, style: str,
@@ -674,8 +732,13 @@ def render_card(
         body_l, body_r = ox + PAD, ox + card_w - PAD
         for ridx, r in enumerate(rows):
             if r.get("kind") == "group":
-                draw.rounded_rectangle([body_l, y, body_r, y + GROUP_H], 16,
-                                       fill=_mix(c["accent"], CARD_BG, 0.94) + (255,))
+                # 分组行也走同一套横向渐变（左端稍浓的强调色 → 极淡），
+                # 与下面的状态渐变行视觉上才是一家的
+                gbase = _mix(c["accent"], CARD_BG, 0.96)
+                img.alpha_composite(
+                    _row_bg(body_r - body_l, GROUP_H, 16,
+                            _mix(c["accent"], CARD_BG, 0.87), gbase),
+                    (body_l, y))
                 cy = y + GROUP_H // 2
                 name_x = body_l + 16
                 if numbered:
@@ -695,22 +758,20 @@ def render_card(
                 continue
 
             cy = y + ROW_H // 2
-            # 行底跟着主题走（不是中性灰）：卡片整体才是一个色系，不会出现「粉卡 + 蓝灰块」
-            draw.rounded_rectangle(
-                [body_l, y, body_r, y + ROW_H], ROW_RADIUS,
-                fill=((c["soft"] if r.get("highlight") else _mix(c["soft"], CARD_BG, 0.45))
-                      + (255,)),
-            )
+            # 行底跟着主题走（不是中性灰）：卡片整体才是一个色系，不会出现「粉卡 + 蓝灰块」；
+            # 左端再掺进状态色 —— 状态靠**这一整行的颜色**表达，不再靠行首那个小点。
+            state = str(r.get("state") or "")
+            base = c["soft"] if r.get("highlight") else _mix(c["soft"], CARD_BG, 0.45)
+            img.alpha_composite(
+                _row_bg(body_r - body_l, ROW_H, ROW_RADIUS,
+                        _row_left(state, base) if state else base, base),
+                (body_l, y))
             x = body_l + 18
             if numbered:
                 _index_badge(draw, fonts, x, cy, r.get("index", ridx + 1),
                              style="solid" if r.get("highlight") else "tint",
                              accent=c["accent"], ink=c["ink"])
                 x += BADGE + 16
-            state = str(r.get("state") or "")
-            if state:
-                _state_dot(draw, x + 6, cy, STATE_COLORS.get(state, STATE_COLORS["unknown"]))
-                x += 20
             label_x = x
             # 名字的可用宽度 = 到第一个数值列（没有数值列就到卡片右沿）再减去小胶囊
             right_limit = (anchors[0][0] - FIT_PAD) if anchors else (body_r - CELL_PAD)

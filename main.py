@@ -3501,7 +3501,7 @@ class ModelPanelPlugin(Star):
                 lines.append(f"— {r.get('label')} —")
                 continue
             idx = f"{r.get('index')}. " if r.get("index") else ""
-            # 图上状态是色点，纯文本里没有颜色，得把状态词补回来（否则看不出谁坏了）
+            # 图上状态是行底渐变的颜色，纯文本里没有颜色，得把状态词补回来（否则看不出谁坏了）
             state = _STATE_LABELS.get(str(r.get("state") or ""), "")
             mark = f"[{state}] " if state else ""
             tail = " / ".join(str(x) for x in (r.get("cells") or []))
@@ -3772,7 +3772,7 @@ class ModelPanelPlugin(Star):
         badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
         png = await self._card_png(
             title=title, badge=badge, stats=stats, columns=columns, rows=rows, notes=notes,
-            headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=1000,
+            headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=1040,
         )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
@@ -4357,7 +4357,8 @@ class ModelPanelPlugin(Star):
             title=title, badge="详情",
             columns=["首字", "首字P95", "整轮", "成功率", "失败", "更新"],
             rows=rows, notes=notes, headline=headline, meta=self._card_meta("今天"),
-            width=1080,
+            # 明细卡有六个数值列，比总览卡还要挤；给足宽度，别把模型名截成「…-mini」
+            width=1160,
         )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])

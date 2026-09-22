@@ -52,17 +52,24 @@ def load_card_render():
     return mod
 
 
-def ink_bands(img, threshold: int = 600):
+def ink_bands(img, ratio: float = 0.62, bg_x: int = 0):
     """逐行扫深色墨迹，返回 [(y0, y1, left, right)]。
 
-    阈值 600 把所有背景都挡在门外：渐变头（约 727）、行底（约 747）、描边（约 682）
-    都亮于它，只有文字（正文/表头/序号）会留下墨迹。
+    阈值**不能写死**：v1.3.17 起行底按状态做「左深右浅」的渐变，
+    「故障」那行左半边本来就偏暗（实测亮度已经贴近旧阈值 600），
+    写死的数只要再浓一档就会把整行背景当成墨迹 —— 那时它仍会「通过」，
+    只是量的东西已经不是文字了。所以改成**按该行自己的背景**算比例：
+    在 ``bg_x``（卡片右内侧，渐变在那里已经淡回底色）取参考色。
+
+    文字（正文 ~196 / 表头 ~370）远低于任何背景（~590 起），
+    0.62 这条线正好落在中间。
     """
     px = img.load()
     w, h = img.size
     bands, cur = [], None
     for y in range(h):
-        xs = [x for x in range(w) if sum(px[x, y][:3]) < threshold]
+        thr = sum(px[bg_x, y][:3]) * ratio
+        xs = [x for x in range(w) if sum(px[x, y][:3]) < thr]
         if xs:
             if cur is None:
                 cur = [y, y, min(xs), max(xs)]
@@ -106,12 +113,35 @@ def main() -> int:
         if not png:
             continue
         img = Image.open(io.BytesIO(png)).convert("RGB")
+        # 参考背景取卡片右内侧（渐变在那里已经淡回底色）
+        bg_x = img.size[0] - cr.SHADOW_PAD - 14
         # 只看右半边的墨迹带：分组行没有数值列（它的墨迹在左边），会被这一步滤掉
-        bands = [b for b in ink_bands(img) if b[3] > img.size[0] * 0.6]
+        bands = [b for b in ink_bands(img, bg_x=bg_x) if b[3] > img.size[0] * 0.6]
         check(len(bands) == 4, f"[{theme}] 表头 + 三个数值行（实得 {len(bands)} 段）")
         if len(bands) != 4:
             continue
         header, data = bands[0], bands[1:]
+
+        # 状态靠**行底渐变的颜色**表达（v1.3.17 去掉了行首那颗小圆点）：
+        # 这里直接量像素。这条要是坏了，卡片看起来完全正常，
+        # 只是「哪几行有事」再也看不出来 —— 而那正是这张卡存在的理由。
+        def row_bg(band):
+            y = (band[0] + band[1]) // 2
+            return img.getpixel((cr.SHADOW_PAD + cr.PAD + 8, y))
+
+        health_bg, degraded_bg, down_bg = row_bg(data[0]), row_bg(data[1]), row_bg(data[2])
+        check(health_bg[1] >= health_bg[0] + 3,
+              f"[{theme}] 正常那行底色偏绿（{health_bg}）")
+        check(degraded_bg[0] >= degraded_bg[1] + 25,
+              f"[{theme}] 降级那行底色偏琥珀（{degraded_bg}）")
+        check(down_bg[0] >= down_bg[1] + 45,
+              f"[{theme}] 故障那行底色偏红（{down_bg}）")
+        # 右端要淡回底色：否则整行一片彩底，模型名反而看不清（渐变的意义就在这）
+        px = img.load()
+        y_down = (data[2][0] + data[2][1]) // 2
+        far = px[img.size[0] - cr.SHADOW_PAD - cr.PAD - 10, y_down]
+        check(sum(far) > sum(down_bg) and (far[0] - far[1]) < (down_bg[0] - down_bg[1]),
+              f"[{theme}] 故障行「左深右浅」（左 {down_bg} → 右 {far}）")
         spread = max(b[3] for b in bands) - min(b[3] for b in bands)
         check(spread <= 2,
               f"[{theme}] 表头与数值列右边缘对齐（最大偏差 {spread}px，表头 {header[3]}，"
