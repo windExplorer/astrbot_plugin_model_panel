@@ -130,6 +130,33 @@ def main() -> int:
     eq(kinds(M.evaluate(call_rows("p7", [False, False]), {}, c, now)), [],
        "未达连败阈值不告警")
 
+    print("[失败原因跟着判定一起出来]")
+    # 告警卡片要显示「为什么坏」，所以判定里就必须带上原因，不能等发卡片时再回头查
+    rows = call_rows("p8", [False, False, False])
+    for r in rows:
+        r["error_message"] = "HTTP 502 Bad Gateway from upstream"
+    d = M.evaluate(rows, {}, c, now)[0]
+    eq(d.detail.get("error_codes"), {"timeout": 3}, "错误码分布按出现次数统计")
+    eq(d.detail.get("last_error_code"), "timeout", "最近一次失败的错误码")
+    eq(d.detail.get("last_error_message"), "HTTP 502 Bad Gateway from upstream",
+       "最近一次失败的原始短文本")
+    eq(d.last_error_code, "timeout", "down 状态下 last_error_code 用本批的码（不用上一轮的）")
+
+    print("[核心表没有原因时不编造]")
+    d2 = M.evaluate(record_rows("p9", [False] * 3), {}, c, now)[0]
+    eq(d2.detail.get("error_codes"), {}, "核心表没有 error 字段 → 不产生错误码")
+    eq(d2.detail.get("last_error_message"), "", "拿不到原文就留空，卡片写「原因未知」而不是猜一个")
+    eq(d2.last_error_code, "", "本批没有码、上一轮也没有 → 保持空")
+
+    print("[错误原文里的凭据必须抹掉]")
+    # 告警是发到聊天软件里的，异常串完全可能把请求头/带凭据的 URL 回显出来
+    leak = [{**r, "error_message": "api_key=sk-abcdef123456 rejected"} for r in call_rows("p10", [False] * 3)]
+    d3 = M.evaluate(leak, {}, c, now)[0]
+    check("sk-abcdef123456" not in d3.detail.get("last_error_message", ""),
+          "错误原文里的 api_key 被脱敏")
+    check("api_key=sk" not in d3.detail.get("last_error_message", ""),
+          "连 key=value 这种形态也一起抹掉")
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项：")

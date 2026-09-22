@@ -169,6 +169,63 @@ def _error_label(code) -> str:
     return _ERROR_LABELS.get(str(code or "").strip(), "异常")
 
 
+def _alert_code(decision) -> str:
+    """告警卡片「错误码」那一列：优先最近一次失败的码，其次本批出现最多的码。
+
+    返回内部码会看不懂（``rate_limit``），所以一律过 :func:`_error_label` 说人话。
+    拿不到就返回 ``-``：宁可空着，也不要编一个「未知异常」骗人。
+    """
+    det = getattr(decision, "detail", None) or {}
+    code = str(det.get("last_error_code") or getattr(decision, "last_error_code", "") or "")
+    if code:
+        return _error_label(code)
+    codes = det.get("error_codes") or {}
+    if codes:
+        return _error_label(max(codes.items(), key=lambda kv: kv[1])[0])
+    return "-"
+
+
+def _alert_cause(decision) -> str:
+    """告警里「为什么坏」那一段：错误码分布 + 最近一次的原始短文本。
+
+    为什么必须带上：收到「连续失败 3 次」的人第一反应是「它怎么坏的」——
+    是中转站 502、key 被限流，还是模型名写错了，处置方式完全不同。
+
+    核心 ``provider_stats`` 只记 status 不记原因，所以真实对话路径**常常拿不到**；
+    这时返回空串，由调用方在卡片上写「原因未知」并提示用 ``/模型检测`` 复测拿具体报错。
+    """
+    det = getattr(decision, "detail", None) or {}
+    codes = det.get("error_codes") or {}
+    code = str(det.get("last_error_code") or getattr(decision, "last_error_code", "") or "")
+    msg = str(det.get("last_error_message") or "")
+    parts: list[str] = []
+    if codes:
+        top = sorted(codes.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:3]
+        parts.append(" ".join(
+            f"{_error_label(c)}{'' if int(n or 0) < 2 else f'×{int(n)}'}" for c, n in top))
+    elif code:
+        parts.append(_error_label(code))
+    # 原文只截 90 字且已脱敏（见 monitor.redact），重复时不再贴第二遍
+    if msg and msg not in parts:
+        parts.append(msg)
+    return " · ".join(p for p in parts if p)
+
+
+def _alert_distribution(group) -> str:
+    """把一组告警里的错误码汇总成「超时×2 · 鉴权失败×1」，给卡片脚注用。
+
+    一家供应商挂 10 个模型时，每一行都写「超时」不如一句话说清「这波是什么在坏」。
+    """
+    total: dict[str, int] = {}
+    for d in group or []:
+        for code, n in ((getattr(d, "detail", None) or {}).get("error_codes") or {}).items():
+            total[str(code)] = total.get(str(code), 0) + int(n or 0)
+    if not total:
+        return ""
+    top = sorted(total.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+    return " · ".join(f"{_error_label(c)}×{n}" for c, n in top)
+
+
 # 错误短消息最长字符数（防止 200 字符堆栈塞满前端）
 ERROR_MESSAGE_MAX = 80
 
@@ -3527,8 +3584,14 @@ class ModelPanelPlugin(Star):
         for kind, group in groups.items():
             events = []
             for d in group:
+                # 存进事件里的是「原因 + 为什么坏」：补发那条纯文本消息直接读它，
+                # 只存一句「连续失败 3 次」的话，补发出去的消息同样说不清问题。
+                detail = redact(d.reason)
+                cause = _alert_cause(d)
+                if kind == KIND_FAIL and cause:
+                    detail = f"{detail}（{cause}）"
                 events.append((d, await self.storage.open_alert(
-                    d.provider_id, kind, redact(d.reason), now, now + cfg.cooldown_sec)))
+                    d.provider_id, kind, detail, now, now + cfg.cooldown_sec)))
             chain = await self._alert_chain(kind, group, names, max(1, cfg.cooldown_sec // 60))
             if chain is None or not await self._notify_admins(chain):
                 # 不写 notified_at → 冷却不启动，且该事件会被下一轮 pending_alerts 捞出来
@@ -3556,10 +3619,15 @@ class ModelPanelPlugin(Star):
             logger.info(f"[ModelPanel] 补发历史未送达告警 ×{len(pending)}")
 
     async def _alert_chain(self, kind: str, group, names: dict[str, str], cooldown_min: int):
-        """把一组同类告警拼成一条消息：能出图就出图，没字体就退回文本。"""
+        """把一组同类告警拼成一条消息：能出图就出图，没字体就退回文本。
+
+        故障告警必须带上**失败原因**：只写「连续失败 3 次」等于让收到的人自己去翻日志，
+        而这条消息的唯一用途就是让他决定「要不要现在处理」。错误码单独占一列、
+        原始短文本跟在原因后面，一行就能看明白是中转站 5xx、限流还是模型名写错了。
+        """
         title = self._ALERT_TITLES.get(kind, "模型告警")
         if kind == KIND_FAIL:
-            columns, stats = ["连续失败", "成功/样本"], [
+            columns, stats = ["连续失败", "成功/样本", "错误码"], [
                 {"label": "故障", "value": str(len(group)), "state": "down"}]
         elif kind == KIND_RECOVER:
             columns, stats = ["连续成功", "成功/样本"], [
@@ -3568,24 +3636,42 @@ class ModelPanelPlugin(Star):
             columns, stats = ["剩余天数"], [
                 {"label": "临期", "value": str(len(group)), "state": "degraded"}]
         rows = []
+        unknown_cause = 0
         for d in group:
             det = d.detail or {}
             ok_n, fail_n = int(det.get("ok") or 0), int(det.get("fail") or 0)
             ratio = f"{ok_n}/{ok_n + fail_n + int(det.get('aborted') or 0)}"
+            cause = _alert_cause(d)
             if kind == KIND_FAIL:
-                cells = [str(d.consecutive_fail), ratio]
+                cells = [str(d.consecutive_fail), ratio, _alert_code(d)]
+                if not cause:
+                    unknown_cause += 1
+                note = "｜".join(x for x in (redact(d.reason), cause or "原因未知") if x)
             elif kind == KIND_RECOVER:
                 cells = [str(d.consecutive_ok), ratio]
+                note = redact(d.reason)
             else:
                 cells = [str(det.get("days_left", "?"))]
+                note = redact(d.reason)
             rows.append({
                 "state": "down" if kind == KIND_FAIL else ("degraded" if kind == KIND_FREE_EXPIRING else "healthy"),
                 "label": names.get(d.provider_id) or d.provider_id,
-                "note": redact(d.reason),
+                "note": note,
                 "cells": cells,
             })
         notes = []
         if kind == KIND_FAIL:
+            dist = _alert_distribution(group)
+            if dist:
+                notes.append(f"错误分布：{dist}")
+            # 拿不到原因时要说清「不是没查，是这张表本来不记」，并给出下一步动作；
+            # 「一个都拿不到」和「只差一两个」是两回事，别用同一句话糊过去
+            if not unknown_cause:
+                notes.append("错误文本已脱敏截断，完整堆栈见 AstrBot 日志")
+            elif unknown_cause >= len(group):
+                notes.append("核心统计表不记失败原因；发 /模型检测 可复测拿到具体报错")
+            else:
+                notes.append(f"{unknown_cause} 个模型拿不到原因（核心表不记）；发 /模型检测 可复测")
             notes.append(f"冷却 {cooldown_min} 分钟内不重复推送 · /模型静音 可关掉全部告警")
         elif kind == KIND_RECOVER:
             notes.append("恢复通知与故障告警共用同一冷却，避免抖动时来回发")
@@ -3594,12 +3680,16 @@ class ModelPanelPlugin(Star):
         badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
         png = await self._card_png(
             title=title, badge=badge, stats=stats, columns=columns, rows=rows, notes=notes,
-            headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=960,
+            headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=1000,
         )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
-        lines = [title] + [f"{names.get(d.provider_id) or d.provider_id} · {redact(d.reason)}" for d in group]
-        lines.append(notes[0])
+        lines = [title]
+        for d in group:
+            cause = _alert_cause(d)
+            lines.append(f"{names.get(d.provider_id) or d.provider_id} · {redact(d.reason)}"
+                         + (f"（{cause}）" if cause else ""))
+        lines.extend(notes[:2])
         return MessageChain([Plain("\n".join(lines))])
 
     async def _maybe_probe(self, cfg: MonitorConfig, now: int) -> None:
@@ -3708,7 +3798,18 @@ class ModelPanelPlugin(Star):
             return notified.get((pid, kind), 0) + cfg.cooldown_sec > int(time.time())
 
         decisions = evaluate_monitor(records, states, cfg, int(time.time()), cooling)
-        # 只有探测路知道 error_code，补进状态里，面板和告警才说得出「为什么坏的」
+        # 探测路才知道 error_code 与错误原文（上面那批 CallRecord 是硬凑出来的，没有这两个字段），
+        # 所以这里把它们补进 decision 的 detail —— 告警卡片的「错误码」列与「失败原因」都读它。
+        err_of = {str(r.get("id")): (str(r.get("error_code") or ""), str(r.get("error") or ""))
+                  for r in results}
+        for d in decisions:
+            code, msg = err_of.get(d.provider_id) or ("", "")
+            if code or msg:
+                d.detail["error_codes"] = {code or "unknown": 1}
+                d.detail["last_error_code"] = code
+                d.detail["last_error_message"] = redact(msg, 90)
+                if d.state == "down" and code:
+                    d.last_error_code = code
         code_of = {str(r.get("id")): str(r.get("error_code") or "") for r in results}
         for d in decisions:
             prev = states.get(d.provider_id) or {}
@@ -3812,12 +3913,17 @@ class ModelPanelPlugin(Star):
         for i, r in enumerate(results, start=1):
             pid = str(r.get("id") or "")
             ok = bool(r.get("ok"))
+            if ok:
+                note = f"重试 {r.get('retry_count')} 次" if r.get("retry_count") else ""
+            else:
+                # 失败的行必须写清「怎么坏的」：具体报错比错误码更能直接定位问题
+                note = " · ".join(x for x in (_error_label(r.get("error_code")),
+                                              redact(r.get("error"), 90)) if x)
             rows.append({
                 "index": i,
                 "state": "healthy" if ok else "down",
                 "label": names.get(pid) or pid,
-                "note": (f"重试 {r.get('retry_count')} 次" if ok and r.get("retry_count")
-                         else (_error_label(r.get("error_code")) if not ok else "")),
+                "note": note,
                 "cells": [_fmt_ms(r.get("latency_ms")),
                           time.strftime("%H:%M:%S",
                                         time.localtime(int(r.get("checked_at") or time.time())))],

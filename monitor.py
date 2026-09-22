@@ -88,7 +88,16 @@ class MonitorConfig:
 
 @dataclass
 class Decision:
-    """一个模型这一轮的判定结果。"""
+    """一个模型这一轮的判定结果。
+
+    ``detail`` 里与「为什么坏」有关的键（告警卡片直接读它们，改名前先看 main._alert_cause）：
+
+    - ``error_codes``：本批调用里各错误码的出现次数 ``{code: n}``，用于「超时 ×2 / 鉴权失败 ×1」
+      这种分布描述。核心 provider_stats 只有 status、没有原因，所以这一项可能为空。
+    - ``last_error_code`` / ``last_error_message``：本批里**最近一次失败**的错误码与原始短文本
+      （已脱敏、截断）。取的是这一批的真实记录，不是上一轮存下来的码 ——
+      第一轮就告警时，上一轮状态里的码往往是空的。
+    """
 
     provider_id: str
     state: str
@@ -169,6 +178,10 @@ def evaluate(
         fail_streak = int(prev.get("consecutive_fail") or 0)
         ok_streak = int(prev.get("consecutive_ok") or 0)
         fails = oks = aborted = 0
+        # 「为什么坏」要跟着判定一起出来，不能等告警时再去猜：这批记录里就有错误码与原文，
+        # 而告警卡片的读者第一句话永远是「它是怎么坏的」。
+        err_codes: dict[str, int] = {}
+        last_err_code = last_err_msg = ""
         for r in sorted(rows, key=lambda x: _field(x, "started_at", 0) or 0):
             if _field(r, "aborted", False):
                 aborted += 1
@@ -181,6 +194,17 @@ def evaluate(
                 fails += 1
                 ok_streak = 0
                 fail_streak += 1
+                # 按时间序推进，循环结束时留下的就是最近一次失败的原因。
+                # 核心 provider_stats 路径这两个字段恒为空（表里只记 status），
+                # 那就保持空串，由调用方在卡片上写「原因未知」而不是编一个。
+                code = str(_field(r, "error_code", "") or "")
+                msg = str(_field(r, "error_message", "") or "")
+                if code:
+                    err_codes[code] = err_codes.get(code, 0) + 1
+                elif msg:
+                    err_codes["unknown"] = err_codes.get("unknown", 0) + 1
+                if code or msg:
+                    last_err_code, last_err_msg = code, msg
 
         counted = oks + fails
         rate = (fails / counted) if counted else 0.0
@@ -204,8 +228,16 @@ def evaluate(
             consecutive_ok=ok_streak,
             samples=counted,
             fails=fails,
-            last_error_code="" if state != STATE_DOWN else str(prev.get("last_error_code") or ""),
-            detail={"aborted": aborted, "ok": oks, "fail": fails, "fail_rate": round(rate, 4), "before": before},
+            # 优先用**本批**记录里的码；本批没有（核心表不记原因）才回落到上一轮存下来的
+            last_error_code="" if state != STATE_DOWN else (last_err_code or str(prev.get("last_error_code") or "")),
+            detail={
+                "aborted": aborted, "ok": oks, "fail": fails,
+                "fail_rate": round(rate, 4), "before": before,
+                "error_codes": err_codes,
+                "last_error_code": last_err_code,
+                # 原文可能把请求头/带凭据的 URL 回显出来，而告警是发到聊天软件里的 —— 必须先脱敏
+                "last_error_message": redact(last_err_msg, 90),
+            },
         )
         if state == STATE_DOWN and before != STATE_DOWN:
             d.action, d.kind = "alert", KIND_FAIL
