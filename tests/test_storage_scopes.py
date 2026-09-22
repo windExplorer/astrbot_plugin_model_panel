@@ -101,6 +101,28 @@ async def main() -> None:
     check(sc.get("scheduled") is True and sc.get("explicit", {}).get("scheduled"),
           "显式开过的定时通道不受计费改动影响")
 
+    # 6) 状态机：last_error_code 存的是**错误码**（timeout / auth / unknown…），
+    #    而 get_model_states 曾经对所有非 state 列一把梭 int() ——
+    #    只要有一个模型进过 down，之后每次读都抛 `int('unknown')`；
+    #    偏偏 save_model_state 必须先读再写，于是状态机从此完全写不进去，
+    #    面板永远停在最后一次成功的结论上（「刚测出故障、面板还是绿的」的元凶）。
+    await st.save_model_state("p_d", {
+        "state": "down", "consecutive_fail": 3, "consecutive_ok": 0,
+        "last_error_code": "unknown", "last_change_at": 1700000000,
+        "muted_until": 0, "samples_total": 3,
+    })
+    row = (await st.get_model_states()).get("p_d") or {}
+    check(row.get("state") == "down", "down 状态写得进去")
+    check(row.get("last_error_code") == "unknown", "错误码原样读回（不被 int() 吃掉）")
+    check(row.get("consecutive_fail") == 3, "数字列照旧是 int（3 而不是 '3'）")
+    check(row.get("last_change_at") == 1700000000, "时间戳原样读回")
+    # 再写一次：旧版连这一步都到不了（读的那一步先炸了）
+    await st.save_model_state("p_d", {"state": "healthy", "consecutive_ok": 2})
+    row = (await st.get_model_states()).get("p_d") or {}
+    check(row.get("state") == "healthy", "有错误码的行仍能被后续写入更新")
+    check(row.get("last_error_code") == "unknown" and row.get("muted_until") == 0,
+          "没写的字段保持原值（整行 upsert 的读-改-写语义）")
+
     await st.close()
     print()
     if _failures:

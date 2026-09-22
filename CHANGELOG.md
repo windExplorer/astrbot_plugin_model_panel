@@ -1,5 +1,51 @@
 # 更新日志
 
+## v1.3.18
+
+修 `get_model_states()`：状态机一旦写出错误码就再也读不出来（`/切换模型检测` 报
+`invalid literal for int() with base 10: 'unknown'`）。
+
+### 现象
+
+权限控制台发 `/切换模型检测`，回一句：
+
+```
+检测失败：invalid literal for int() with base 10: 'unknown'
+```
+
+### 根因（`storage.get_model_states`）
+
+```python
+for c in cols:
+    d[c] = r[c] if c == "state" else int(r[c] or 0)   # ← cols 里有 last_error_code
+```
+
+`model_state` 的七列里，`state` 与 **`last_error_code` 都是 TEXT**（后者存的是
+`timeout` / `auth` / `unknown` 这种码），其余才是整数。这一行却只把 `state` 排除了，
+于是只要**任何一行**的 `last_error_code` 非空，`int('unknown')` 就抛。
+
+**而 `save_model_state` 是先读后写的** —— 于是第一次写入错误码之后，
+状态机就再也写不进任何东西：面板永远停在最后一次成功的结论上。
+这正是 v1.3.15 想解释的那个「刚测出故障、面板还是绿的」的**真正元凶**
+（当时我只补了「外部检测也要喂状态机」，没发现喂进去的写入本身会炸）。
+
+为什么一直没人看见：定时巡检这条路把异常吞在自己的 `try` 里，只在日志留一行
+warning；而这次 `/切换模型检测` 是**同步调用**，异常被原样顶到了用户面前。
+
+### 修法
+
+- 按列区分类型：`state` / `last_error_code` 读成字符串（`None` → `''`），
+  其余走新的 `_as_int()`（转不了给默认值 —— 面板是观测工具，一列坏值不该让它整个打不开）；
+- 写入侧不动：`save_model_state` 的读-改-写语义本来就是对的。
+
+### 自检
+
+`tests/test_storage_scopes.py` 新增「状态机往返」：写入 down + `last_error_code='unknown'`
+再读回（错误码原样、数字列仍是 int），并**再写一次**（旧版连这一步都到不了）。
+
+已验证这条自检能抓到旧代码：把修复 stash 掉后它立刻报
+`ValueError: invalid literal for int() with base 10: 'unknown'`。
+
 ## v1.3.17
 
 卡片加宽 + 状态改用「行底横向渐变」（去掉行首小圆点）。

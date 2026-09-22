@@ -53,6 +53,22 @@ except ImportError as e:  # pragma: no cover - 由 AstrBot 启动时保证已安
     ) from e
 
 
+# model_state 里哪几列是**文本**（其余都是整数）。见 get_model_states 的注释。
+_STATE_TEXT_COLS = ("state", "last_error_code")
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """尽量转 int；转不了就给默认值。
+
+    只用在「读自己写的库」这种地方（面板是观测工具，一列坏值不该让它整个打不开）。
+    注意别拿它做语义纠偏：``''`` 与 ``None`` 都算「没有值」，一律落到 ``default``。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS test_sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1147,7 +1163,15 @@ class Storage:
         for r in rows:
             d = {"provider_id": r["provider_id"]}
             for c in cols:
-                d[c] = r[c] if c == "state" else int(r[c] or 0)
+                # 列分两类：state / last_error_code 是**文本**（后者存的是
+                # timeout / auth / unknown 这种码），其余才是整数。
+                #
+                # 这里曾经一把梭 ``int()``，于是只要有一个模型进过 down（写入了非空错误码），
+                # 之后**每一次**读都会抛 `invalid literal for int() with base 10: 'unknown'`；
+                # 而 save_model_state 必须先读再写 —— 状态机从此再也写不进去，
+                # 面板永远停在最后一次成功的结论上：表现就是「刚测出故障、面板还是绿的」，
+                # 而报错只出现在调用方（v1.3.18 由 /切换模型检测 把它顶到了用户面前）。
+                d[c] = str(r[c] or "") if c in _STATE_TEXT_COLS else _as_int(r[c])
             out[r["provider_id"]] = d
         return out
 
