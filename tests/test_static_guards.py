@@ -26,7 +26,7 @@ MAIN_PY = ROOT / "main.py"
 # 指令清单：方法名 → (指令名, 期望权限)。权限 None 表示不声明 permission_type，即全员。
 EXPECTED_COMMANDS = {
     "cmd_companion_affinity": ("陪伴分数", None),
-    # v1.4.0 起正名为「模型检测」；旧名「检测模型」必须留在 alias 里，否则老用户突然失灵
+    # v1.3.10 起正名为「模型检测」；旧名「检测模型」必须留在 alias 里，否则老用户突然失灵
     "cmd_model_probe": ("模型检测", "ADMIN"),
     "cmd_model_mute": ("模型静音", "ADMIN"),
     "cmd_model_status": ("模型状态", "ADMIN"),

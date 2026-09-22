@@ -523,7 +523,7 @@ def _cmd_args(event: AstrMessageEvent) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-# v1.4.0 起 /模型静音 只做全局开关，逐模型静音连带它的时长解析一并下线
+# v1.3.10 起 /模型静音 只做全局开关，逐模型静音连带它的时长解析一并下线
 # （状态机里的 muted_until 仍然保留：将来要在 WebUI 上做单模型静音时是现成的）。
 
 
@@ -4216,7 +4216,7 @@ class ModelPanelPlugin(Star):
     async def cmd_model_mute(self, event: AstrMessageEvent):
         """告警推送的**全局**开关：``/模型静音`` 切换，``/模型静音 开|关`` 明确指定。
 
-        v1.4.0 起改口径：不再针对单个模型，而是「所有模型的告警推送」一起开关。
+        v1.3.10 起改口径：不再针对单个模型，而是「所有模型的告警推送」一起开关。
         理由是同一个人被多家供应商的告警刷屏时，真正想按的是总闸；
         而关掉之后状态照常采集、面板照常显示 —— 静音的是通知，不是监测。
         开关落回插件配置 ``alert_notify_enabled``（与 WebUI 上那一项是同一个值），
