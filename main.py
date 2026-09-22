@@ -35,6 +35,9 @@ from .storage import (
     SCHEDULED_DEFAULT_ON,
     STREAM_FLAGS,
     Storage,
+    VENDOR_FIELDS,
+    estimate_cost,
+    resolve_pricing,
 )
 from .session_manager import SessionManager
 from .plugin_models import PluginModelScanner
@@ -995,6 +998,7 @@ class ModelPanelPlugin(Star):
             ("/panel/providers/history", self.api_test_history, ["GET"]),
             ("/panel/health", self.api_health, ["GET"]),
             ("/panel/profile", self.api_profile_set, ["POST"]),
+            ("/panel/vendor", self.api_vendor_set, ["POST"]),
             ("/panel/scope", self.api_scope_set, ["POST"]),
             ("/panel/preferences", self.api_get_preferences, ["GET"]),
             ("/panel/preferences", self.api_set_preferences, ["POST"]),
@@ -1503,6 +1507,9 @@ class ModelPanelPlugin(Star):
                 usage = await self.storage.usage_stats(days=7, top_models=5)
         except Exception as e:
             logger.warning(f"[ModelPanel] 用量统计失败: {e}")
+        # 花费是「用量 × 人工填的单价/倍率」，没填价的模型估不出来，
+        # 所以总额只含有价模型；unpriced_models 让前端能说明「这不是全量」。
+        cost = (await self._cost_rollup(displays)).get("totals") or {}
         return {
             "total": len(providers),
             "default_provider_id": default_id,
@@ -1513,6 +1520,7 @@ class ModelPanelPlugin(Star):
             "history": stats,
             "latest_results": latest_results,
             "usage": usage,
+            "cost": cost,
         }
 
     async def api_list_providers(self) -> dict:
@@ -1949,6 +1957,90 @@ class ModelPanelPlugin(Star):
         left = int((until - time.time()) // 86400)
         return left, left <= 3
 
+    _PRICE_FIELDS = ("price_input_per_m", "price_output_per_m",
+                     "price_cached_per_m", "price_per_call")
+
+    async def _cost_rollup(self, displays: list[dict]) -> dict:
+        """把 llm_usage 的原始量按档案单价折算成金额：逐模型、逐供应商、全局。
+
+        金额一律是**估算**：token 数来自 provider 上报的 usage，不上报的就没有；
+        单价与倍率靠人工填。所以估不出来时返回 None，前端显示 –，
+        绝不能显示 0.00 —— 那会被读成「这个模型真没花钱」。
+
+        每日次数限制是供应商级的，所以「今日已用次数」也按供应商汇总。
+        注意这里的次数只含真实对话（llm_usage 由 on_llm_response 写），
+        不含定时探测与手动检测 —— 供应商那边的计数器是两者一起算的，
+        所以显示的是下限而不是精确值。
+        """
+        empty = {"by_provider": {}, "by_vendor": {}, "totals": {}}
+        if not self.storage:
+            return empty
+        try:
+            today_u = await self.storage.usage_aggregate(days=1)
+            week_u = await self.storage.usage_aggregate(days=7)
+            profiles = await self.storage.get_all_profiles()
+            vendors = await self.storage.get_all_vendor_profiles()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 花费统计失败: {e}")
+            return empty
+
+        vendor_of = {str(d.get("id") or ""): str(d.get("name") or "").strip() for d in displays}
+        # 用量表里可能有已删除 provider 的孤儿行，也要计入全局总额，
+        # 否则「今日花费」会悄悄比真实支出少一截
+        pids = set(vendor_of) | set(today_u) | set(week_u)
+        by_provider: dict[str, dict] = {}
+        by_vendor: dict[str, dict] = {}
+        tot_today = tot_week = 0.0
+        priced = 0
+        for pid in pids:
+            vname = vendor_of.get(pid) or "未归组供应商"
+            prof = profiles.get(pid) or {}
+            pricing = resolve_pricing(prof, vendors.get(vname))
+            prices = {f: prof.get(f) for f in self._PRICE_FIELDS}
+            btype = str(prof.get("billing_type") or "unknown")
+            c_today = estimate_cost(btype, prices, today_u.get(pid) or {}, pricing["multiplier"])
+            c_week = estimate_cost(btype, prices, week_u.get(pid) or {}, pricing["multiplier"])
+            by_provider[pid] = {
+                "currency": pricing["currency"],
+                "multiplier": pricing["multiplier"],
+                "multiplier_from_group": pricing["multiplier_from_group"],
+                "today": c_today,
+                "week": c_week,
+                "calls_today": int((today_u.get(pid) or {}).get("requests") or 0),
+                "billable": c_week is not None or c_today is not None,
+            }
+            v = by_vendor.setdefault(vname, {
+                "name": vname,
+                "currency": pricing["currency"],
+                "rate_multiplier": (vendors.get(vname) or {}).get("rate_multiplier"),
+                "daily_call_limit": pricing["daily_call_limit"],
+                "note": (vendors.get(vname) or {}).get("note") or "",
+                "calls_today": 0,
+                "today": 0.0,
+                "week": 0.0,
+                "priced": False,
+            })
+            v["calls_today"] += by_provider[pid]["calls_today"]
+            if c_today is not None:
+                v["today"] += c_today
+                tot_today += c_today
+                v["priced"] = True
+                priced += 1
+            if c_week is not None:
+                v["week"] += c_week
+                tot_week += c_week
+        for v in by_vendor.values():
+            v["today"] = round(v["today"], 4)
+            v["week"] = round(v["week"], 4)
+            limit = v.get("daily_call_limit")
+            v["limit_ratio"] = (round(v["calls_today"] / limit, 4) if limit else None)
+        return {
+            "by_provider": by_provider,
+            "by_vendor": by_vendor,
+            "totals": {"today": round(tot_today, 4), "week": round(tot_week, 4),
+                       "priced_models": priced, "unpriced_models": len(pids) - priced},
+        }
+
     async def _health_view(self, days: float = 7.0) -> dict:
         """把四份数据拼成一张视图表：档案 / 三通道范围 / 最近探测 / 真实对话监测。
 
@@ -1982,9 +2074,16 @@ class ModelPanelPlugin(Star):
                 logger.warning(f"[ModelPanel] 读取探测明细失败: {e}")
         ledger = _merge_ledger(records, probe_rows)
         default_id = await self._default_provider_id()
-        items = []
+        displays = []
         for p in self._chat_providers():
-            d = self._provider_display(p)
+            try:
+                displays.append(self._provider_display(p))
+            except Exception:
+                continue
+        costs = await self._cost_rollup(displays)
+        cost_of = costs.get("by_provider") or {}
+        items = []
+        for d in displays:
             pid = d["id"]
             prof = profiles.get(pid) or {}
             scope = scopes.get(pid) or {
@@ -2022,12 +2121,16 @@ class ModelPanelPlugin(Star):
                     "price_input_per_m": prof.get("price_input_per_m"),
                     "price_output_per_m": prof.get("price_output_per_m"),
                     "price_cached_per_m": prof.get("price_cached_per_m"),
+                    "price_per_call": prof.get("price_per_call"),
+                    # 模型级倍率原样回显（NULL = 跟随分组），effective 值在 cost.multiplier 里
+                    "rate_multiplier": prof.get("rate_multiplier"),
                     "channel_kind": str(prof.get("channel_kind") or "unknown"),
                     "role": str(prof.get("role") or "unknown"),
                     "supports_streaming": str(prof.get("supports_streaming") or "unknown"),
                     "probe_mode": str(prof.get("probe_mode") or "non_stream"),
                     "note": prof.get("note") or "",
                 },
+                "cost": cost_of.get(pid) or {},
                 "scope": {
                     "manual": bool(scope.get("manual")),
                     "scheduled": bool(scope.get("scheduled")),
@@ -2062,6 +2165,8 @@ class ModelPanelPlugin(Star):
             "items": items,
             "counts": counts,
             "days": days,
+            "vendors": costs.get("by_vendor") or {},
+            "cost_totals": costs.get("totals") or {},
             "live_available": live_available,
             "truncated": truncated,
             "samples": sum(int((it.get("window") or {}).get("total") or 0) for it in items),
@@ -2091,6 +2196,36 @@ class ModelPanelPlugin(Star):
         except Exception as e:
             logger.warning(f"[ModelPanel] /panel/health 失败: {e}")
             return {"items": [], "counts": {}, "live_available": False, "error": str(e)}
+
+    async def api_vendor_set(self) -> dict:
+        """POST /panel/vendor：保存一个供应商分组（倍率 / 每日限额 / 币种 / 备注）。
+
+        分组档案只按供应商名存，键不是 provider_id。同样拒绝野名字，
+        否则改一次供应商源 ID 就会在表里留下一堆没人看的旧分组。
+        """
+        payload = await self._json_payload()
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "缺少分组名"}
+        patch = payload.get("patch")
+        if not isinstance(patch, dict):
+            patch = {k: v for k, v in payload.items() if k in VENDOR_FIELDS}
+        if not patch:
+            return {"ok": False, "error": "没有可保存的字段"}
+        unknown = [k for k in patch if k not in VENDOR_FIELDS]
+        if unknown:
+            return {"ok": False, "error": f"未知字段: {', '.join(unknown)}"}
+        known = {str(self._provider_display(p).get("name") or "") for p in self._chat_providers()}
+        if known and name not in known:
+            return {"ok": False, "error": "该供应商分组当前不存在"}
+        if not self.storage:
+            return {"ok": False, "error": "存储未就绪"}
+        try:
+            saved = await self.storage.upsert_vendor_profile(name, patch)
+            return {"ok": True, "vendor": saved}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] /panel/vendor 保存失败: {e}")
+            return {"ok": False, "error": str(e)}
 
     async def api_profile_set(self) -> dict:
         """POST /panel/profile：保存一个 provider 的档案补丁。

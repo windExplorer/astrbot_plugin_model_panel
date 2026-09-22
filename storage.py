@@ -108,10 +108,12 @@ CREATE TABLE IF NOT EXISTS model_profile (
     provider_id        TEXT PRIMARY KEY,
     billing_type       TEXT    NOT NULL DEFAULT 'unknown',
     free_until         INTEGER,               -- 限时免费到期日，可空，仅展示
-    currency           TEXT    NOT NULL DEFAULT '',
+    currency           TEXT    NOT NULL DEFAULT '',  -- 留空 = 跟随该供应商的分组币种
     price_input_per_m  REAL,                  -- 单价一律「每百万 token」
     price_output_per_m REAL,
     price_cached_per_m REAL,                  -- 缓存命中价，DeepSeek 类折扣很大
+    price_per_call     REAL,                  -- 按次计费的单次单价
+    rate_multiplier    REAL,                  -- 倍率；NULL = 跟随分组倍率
     channel_kind       TEXT    NOT NULL DEFAULT 'unknown',
     role               TEXT    NOT NULL DEFAULT 'unknown',
     supports_streaming TEXT    NOT NULL DEFAULT 'unknown',  -- true/false/unknown
@@ -119,6 +121,18 @@ CREATE TABLE IF NOT EXISTS model_profile (
     note               TEXT    NOT NULL DEFAULT '',
     model_name         TEXT    NOT NULL DEFAULT '',  -- 快照，provider 删除后仍可回显
     updated_at         INTEGER NOT NULL DEFAULT 0
+);
+
+-- 供应商（分组）级档案。倍率与每日次数限制天然是「一家一个值」，
+-- 逐个模型填十遍既累又容易填得不一致，所以放在这一层；模型侧只留可选覆盖。
+-- 键是供应商名（_provider_display 的 name，即 provider_source_id），不是 provider_id。
+CREATE TABLE IF NOT EXISTS vendor_profile (
+    name              TEXT PRIMARY KEY,
+    currency          TEXT    NOT NULL DEFAULT '',
+    rate_multiplier   REAL,                   -- 分组倍率；NULL = 未设置（按 1.0 计）
+    daily_call_limit  INTEGER,                -- 每日次数限制；NULL = 不限
+    note              TEXT    NOT NULL DEFAULT '',
+    updated_at        INTEGER NOT NULL DEFAULT 0
 );
 
 -- LLM 调用用量统计：由 on_llm_response 钩子写入，每行一次调用。
@@ -181,7 +195,9 @@ CREATE INDEX IF NOT EXISTS idx_alert_provider ON alert_events(provider_id, kind,
 
 # ---------------- 档案枚举与取值约束 ----------------
 # paid_overage 单独一类：它平时表现为「免费」，额度用完当天才变红，是最容易漏的预算炸弹。
-BILLING_TYPES = ("unknown", "free", "temp_free", "trial", "paid_overage", "paid", "subscription")
+# per_request 是另一套计价单位（按次而非按 token），有的站点对部分模型就是这么收的。
+BILLING_TYPES = ("unknown", "free", "temp_free", "trial", "paid_overage", "paid",
+                 "subscription", "per_request")
 # 来源渠道决定告警口径（中转站 5xx 是常态，阈值应比官方宽松）与成本语义。
 CHANNEL_KINDS = ("unknown", "official", "aggregator", "reseller", "self_hosted")
 # primary 有特权：它是正在服务用户的那个，标红时和观察模型标红完全不是一回事。
@@ -204,9 +220,27 @@ _ENUM_FIELDS = {
     "probe_mode": PROBE_MODES,
 }
 _INT_FIELDS = ("free_until",)
-_FLOAT_FIELDS = ("price_input_per_m", "price_output_per_m", "price_cached_per_m")
+_FLOAT_FIELDS = ("price_input_per_m", "price_output_per_m", "price_cached_per_m",
+                 "price_per_call", "rate_multiplier")
 _TEXT_FIELDS = ("currency", "note", "model_name")
 PROFILE_FIELDS = tuple(_ENUM_FIELDS) + _INT_FIELDS + _FLOAT_FIELDS + _TEXT_FIELDS
+
+# 分组（供应商）级档案：倍率与每日次数限制天然是一家一个值。
+VENDOR_INT_FIELDS = ("daily_call_limit",)
+VENDOR_FLOAT_FIELDS = ("rate_multiplier",)
+VENDOR_TEXT_FIELDS = ("currency", "note")
+VENDOR_FIELDS = VENDOR_INT_FIELDS + VENDOR_FLOAT_FIELDS + VENDOR_TEXT_FIELDS
+
+# 只有这几列接受 "YYYY-MM-DD" 字符串（前端日期选择器给的），其余整型列不接受，
+# 否则「每日限额」填了个带连字符的怪值会被当成日期悄悄存成时间戳。
+_DATE_FIELDS = ("free_until",)
+
+_SPECS = {
+    "profile": {"enums": _ENUM_FIELDS, "ints": _INT_FIELDS, "floats": _FLOAT_FIELDS,
+                "texts": _TEXT_FIELDS},
+    "vendor": {"enums": {}, "ints": VENDOR_INT_FIELDS, "floats": VENDOR_FLOAT_FIELDS,
+               "texts": VENDOR_TEXT_FIELDS},
+}
 
 
 def scheduled_default_for(billing_type: str) -> bool:
@@ -214,29 +248,99 @@ def scheduled_default_for(billing_type: str) -> bool:
     return billing_type in SCHEDULED_DEFAULT_ON
 
 
-def _coerce_profile(field: str, value: Any) -> Any:
+def _coerce(kind: str, field: str, value: Any) -> Any:
     """把前端传来的档案值收敛成合法类型。非法枚举值退回 unknown，不抛异常。"""
-    if field in _ENUM_FIELDS:
+    spec = _SPECS[kind]
+    if field in spec["enums"]:
         raw = str(value or "").strip()
-        return raw if raw in _ENUM_FIELDS[field] else "unknown"
+        return raw if raw in spec["enums"][field] else "unknown"
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
-        if field in _INT_FIELDS:
-            # 前端日期选择器给的是 "YYYY-MM-DD"，按本地零点存成 epoch；直接给数字则当 epoch
-            if isinstance(value, str) and "-" in value:
+        if field in spec["ints"]:
+            if field in _DATE_FIELDS and isinstance(value, str) and "-" in value:
                 day = date.fromisoformat(value.strip()[:10])
                 return int(datetime(day.year, day.month, day.day).timestamp())
-            return int(float(value))
-        if field in _FLOAT_FIELDS:
+            n = int(float(value))
+            return n if n > 0 else None      # 限额/日期填 0 或负数等于「没填」，落成 NULL
+        if field in spec["floats"]:
             price = float(value)
-            # 负单价没有意义；0 是合法值（免费额度内、订阅内含）
+            # 负单价/负倍率没有意义；0 是合法值（免费额度内、订阅内含、倍率 0 = 不计费）
             return price if price >= 0 else 0.0
         if field == "currency":
             return str(value).strip().upper()[:8]
         return str(value).strip()[:200]
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_profile(field: str, value: Any) -> Any:
+    return _coerce("profile", field, value)
+
+
+def _coerce_vendor(field: str, value: Any) -> Any:
+    return _coerce("vendor", field, value)
+
+
+def resolve_pricing(prof: dict, vendor: Optional[dict]) -> dict:
+    """把模型档案与分组档案合成「这个模型实际按什么计价」。
+
+    倍率的优先级是 模型覆盖 → 分组 → 1.0；币种是 模型 → 分组 → 空。
+    模型级倍率留 NULL 就永远跟着分组走，改一处十来个模型都跟着变 —— 这正是
+    「倍率一般是整个分组都是这个倍率」想要的效果。
+    """
+    vendor = vendor or {}
+    own = prof.get("rate_multiplier")
+    group = vendor.get("rate_multiplier")
+    if own is not None:
+        mult, from_group = float(own), False
+    elif group is not None:
+        mult, from_group = float(group), True
+    else:
+        mult, from_group = 1.0, True
+    currency = str(prof.get("currency") or "").strip() or str(vendor.get("currency") or "").strip()
+    return {
+        "multiplier": mult,
+        "multiplier_from_group": from_group,
+        "currency": currency,
+        "daily_call_limit": vendor.get("daily_call_limit"),
+    }
+
+
+def estimate_cost(billing_type: str, prices: dict, usage: dict, multiplier: float = 1.0) -> Optional[float]:
+    """按档案单价估算一段用量花掉多少钱；单价没填就返回 None（估不出来不等于 0）。
+
+    token 口径按 AstrBot 的 usage 拆法来：``input_other`` 与 ``input_cached`` 是**互斥**的
+    两部分（total = input + cached + output），所以缓存部分单独按缓存价计，
+    不能再混进 input 里重复收费。缓存价没填时退回输入价，而不是当 0 ——
+    当 0 会把成本系统性低估，而 DeepSeek 这类缓存命中价只是便宜、不是免费。
+    """
+    if str(billing_type or "") == "free":
+        return 0.0
+    try:
+        mult = float(multiplier)
+    except (TypeError, ValueError):
+        mult = 1.0
+    if mult < 0:
+        mult = 1.0
+    reqs = max(0, int(usage.get("requests") or 0))
+    if str(billing_type or "") == "per_request":
+        per_call = prices.get("price_per_call")
+        if per_call is None:
+            return None
+        return round(float(per_call) * reqs * mult, 6)
+    p_in, p_out = prices.get("price_input_per_m"), prices.get("price_output_per_m")
+    if p_in is None and p_out is None:
+        return None
+    p_in = float(p_in or 0.0)
+    p_out = float(p_out or 0.0)
+    p_cached = prices.get("price_cached_per_m")
+    p_cached = p_in if p_cached is None else float(p_cached)
+    inp = max(0, int(usage.get("input") or 0))
+    cached = max(0, int(usage.get("cached") or 0))
+    outp = max(0, int(usage.get("output") or 0))
+    raw = (inp * p_in + cached * p_cached + outp * p_out) / 1_000_000.0
+    return round(raw * mult, 6)
 
 
 
@@ -280,6 +384,12 @@ class Storage:
         cols = {row[1] for row in await cur.fetchall()}
         if cols and "ttft_ms" not in cols:
             await db.execute("ALTER TABLE model_test_results ADD COLUMN ttft_ms REAL")
+        cur = await db.execute("PRAGMA table_info(model_profile)")
+        cols = {row[1] for row in await cur.fetchall()}
+        # 按次单价与模型级倍率覆盖是 v1.3.8 加的；漏了的话档案页一读就是 "no such column"
+        for col, decl in (("price_per_call", "REAL"), ("rate_multiplier", "REAL")):
+            if cols and col not in cols:
+                await db.execute(f"ALTER TABLE model_profile ADD COLUMN {col} {decl}")
 
     async def close(self) -> None:
         # aiosqlite 没有常驻连接，无需显式 close。
@@ -758,6 +868,87 @@ class Storage:
                 await db.commit()
         cur_row = await self.get_all_profiles()
         return cur_row.get(provider_id, {"provider_id": provider_id, **merged})
+
+    # ---------- 供应商（分组）档案 ----------
+    async def get_all_vendor_profiles(self) -> dict[str, dict[str, Any]]:
+        await self.init()
+        cols = ", ".join(VENDOR_FIELDS)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(f"SELECT name, {cols}, updated_at FROM vendor_profile")
+            rows = await cur.fetchall()
+        return {
+            r["name"]: {
+                "name": r["name"],
+                **{f: r[f] for f in VENDOR_FIELDS},
+                "updated_at": int(r["updated_at"] or 0),
+            }
+            for r in rows
+        }
+
+    async def upsert_vendor_profile(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """写入/更新某个供应商分组的档案。name 是面板上的分组名（供应商源 ID）。"""
+        name = str(name or "").strip()[:120]
+        if not name:
+            return {}
+        await self.init()
+        clean = {f: _coerce_vendor(f, patch.get(f)) for f in VENDOR_FIELDS if f in patch}
+        now = int(time.time())
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM vendor_profile WHERE name = ?", (name,))
+                row = await cur.fetchone()
+                merged = {f: row[f] for f in VENDOR_FIELDS} if row else {}
+                merged.update(clean)
+                if not merged:
+                    # 补丁里一个合法字段都没有：不写空行，原样返回现有档案
+                    return (await self.get_all_vendor_profiles()).get(name) or {"name": name}
+                cols = list(merged)
+                placeholders = ", ".join("?" for _ in cols)
+                updates = ", ".join(f"{c}=excluded.{c}" for c in cols)
+                await db.execute(
+                    f"""INSERT INTO vendor_profile (name, {", ".join(cols)}, updated_at)
+                        VALUES (?, {placeholders}, ?)
+                        ON CONFLICT(name) DO UPDATE SET {updates}, updated_at=excluded.updated_at""",
+                    [name] + [merged[c] for c in cols] + [now],
+                )
+                await db.commit()
+        return (await self.get_all_vendor_profiles()).get(name) or {"name": name, **merged}
+
+    # ---------- 用量聚合（给花费估算用） ----------
+    async def usage_aggregate(self, days: int = 1) -> dict[str, dict[str, int]]:
+        """按 provider_id 聚合最近 N 天的 token 用量与调用次数。
+
+        这里只取原始量：单价与倍率在档案表里，合成规则在 ``resolve_pricing``，
+        存储层掺进去的话两处口径会互相打脸。
+        """
+        await self.init()
+        days = max(1, int(days or 1))
+        today = date.fromisoformat(time.strftime("%Y-%m-%d", time.localtime()))
+        since = (today - timedelta(days=days - 1)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT provider_id,
+                          COALESCE(SUM(input_tokens), 0)  AS inp,
+                          COALESCE(SUM(cached_tokens), 0) AS cached,
+                          COALESCE(SUM(output_tokens), 0) AS outp,
+                          COUNT(*)                        AS reqs
+                   FROM llm_usage WHERE day >= ?
+                   GROUP BY provider_id""",
+                (since,),
+            )
+            rows = await cur.fetchall()
+        return {
+            str(r["provider_id"] or ""): {
+                "input": int(r["inp"] or 0),
+                "cached": int(r["cached"] or 0),
+                "output": int(r["outp"] or 0),
+                "requests": int(r["reqs"] or 0),
+            }
+            for r in rows
+        }
 
     # ---------- 全局小状态（provider_stats 游标等） ----------
     async def get_state_value(self, key: str, default: str = "") -> str:

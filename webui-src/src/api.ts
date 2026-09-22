@@ -253,6 +253,7 @@ export interface Overview {
   latest_results?: Record<string, TestResult>;
   /** LLM 用量统计（插件未记录到数据时为 null） */
   usage?: UsageStats | null;
+  cost?: CostTotals | null;
 }
 
 export interface CompanionSummaryItem {
@@ -587,7 +588,8 @@ export async function startTestAllStream(
 
 // ---------- 模型监测 / 档案 / 三通道范围 ----------
 export type BillingType =
-  | "unknown" | "free" | "temp_free" | "trial" | "paid_overage" | "paid" | "subscription";
+  | "unknown" | "free" | "temp_free" | "trial" | "paid_overage" | "paid"
+  | "subscription" | "per_request";
 export type ChannelKind = "unknown" | "official" | "aggregator" | "reseller" | "self_hosted";
 export type ModelRole =
   | "unknown" | "primary" | "backup" | "fallback" | "dedicated" | "watch" | "retired";
@@ -602,6 +604,9 @@ export interface HealthBilling {
   price_input_per_m: number | null;
   price_output_per_m: number | null;
   price_cached_per_m: number | null;
+  price_per_call: number | null;
+  /** 模型级倍率覆盖；null = 跟随分组倍率。真正生效的值在 cost.multiplier */
+  rate_multiplier: number | null;
   channel_kind: ChannelKind;
   role: ModelRole;
   supports_streaming: "unknown" | "true" | "false";
@@ -659,6 +664,45 @@ export interface HealthWindow {
   probe: { total: number; ok: number; fail: number };
 }
 
+/**
+ * 单个模型的预估花费。金额是「用量 × 人工填的单价/倍率」，
+ * null 表示**估不出来**（没填价或 provider 不上报 usage），不是 0 ——
+ * 显示成 0.00 会被读成「这个模型真没花钱」。
+ */
+export interface ModelCost {
+  currency: string;
+  /** 生效倍率：模型覆盖 → 分组 → 1.0 */
+  multiplier: number;
+  multiplier_from_group: boolean;
+  today: number | null;
+  week: number | null;
+  /** 今日对话调用数。不含定时探测与手动检测，是供应商计数器的下限 */
+  calls_today: number;
+  billable: boolean;
+}
+
+/** 供应商分组档案 + 该组的用量汇总。 */
+export interface VendorProfile {
+  name: string;
+  currency: string;
+  rate_multiplier: number | null;
+  daily_call_limit: number | null;
+  note: string;
+  calls_today: number;
+  today: number;
+  week: number;
+  priced: boolean;
+  /** 今日已用 / 限额，无限额时 null */
+  limit_ratio: number | null;
+}
+
+export interface CostTotals {
+  today: number;
+  week: number;
+  priced_models: number;
+  unpriced_models: number;
+}
+
 export interface HealthItem {
   id: string;
   name: string;
@@ -666,6 +710,7 @@ export interface HealthItem {
   display_model: string;
   is_default: boolean;
   billing: HealthBilling;
+  cost: ModelCost;
   scope: HealthScope;
   window: HealthWindow;
   last: LastCall | null;
@@ -704,6 +749,9 @@ export interface HealthResponse {
   samples: number;
   alerts: HealthAlert[];
   muted_count: number;
+  /** 供应商分组档案与汇总，键为分组名 */
+  vendors?: Record<string, VendorProfile>;
+  cost_totals?: CostTotals;
   enums?: HealthEnums;
   error?: string;
 }
@@ -716,6 +764,12 @@ export async function apiGetHealth(days: number): Promise<HealthResponse> {
 export async function apiSetProfile(id: string, patch: Partial<HealthBilling>) {
   return apiPost<{ ok: boolean; error?: string; profile?: HealthBilling }>(
     "/panel/profile", { id, patch }, 15000
+  );
+}
+
+export async function apiSetVendor(name: string, patch: Partial<VendorProfile>) {
+  return apiPost<{ ok: boolean; error?: string; vendor?: VendorProfile }>(
+    "/panel/vendor", { name, patch }, 15000
   );
 }
 
@@ -745,4 +799,21 @@ export function fmtMs(v: number | null | undefined): string {
 export function fmtSuccess(counted: number, failRate: number): string {
   if (!counted) return "–";
   return ((1 - failRate) * 100).toFixed(1) + "%";
+}
+
+const CUR_SYMBOL: Record<string, string> = { CNY: "¥", USD: "$", EUR: "€" };
+
+/**
+ * 金额格式化。null / undefined 返回 – ，**不是 ￥0.00**。
+ * 花费是「用量 × 人工填的单价」，没填价时估不出来；显示 0.00 会被读成「这模型真没花钱」，
+ * 而免费模型本来就该走计费类型标注，不靠一个 0 来表达。
+ * 小额按量级放宽小数位，否则一次调用几厘钱的成本会被四舍五入成 0.00。
+ */
+export function fmtMoney(v: number | null | undefined, currency = ""): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "–";
+  const sym = CUR_SYMBOL[(currency || "").toUpperCase()] || (currency ? currency + " " : "¥");
+  const n = Math.abs(v);
+  // 0 就是 0，不该因为「小额多给几位小数」的规则显示成 ¥0.0000
+  const digits = n === 0 ? 2 : n >= 100 ? 0 : n >= 1 ? 2 : n >= 0.01 ? 3 : 4;
+  return sym + v.toFixed(digits);
 }

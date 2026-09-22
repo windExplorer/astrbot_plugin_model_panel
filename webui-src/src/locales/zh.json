@@ -52,7 +52,7 @@
     "totalChecks": "累计检测条数",
     "totalSessions": "累计会话",
     "lastCheckAt": "最近检测时间",
-    "goDetect": "前往检测",
+    "goModels": "前往模型管理",
     "statTokens": "今日 Token",
     "usageTitle": "Token 用量",
     "usageToday": "今日用量",
@@ -64,7 +64,12 @@
     "usageTrend": "近 7 天用量",
     "usageTopModels": "今日模型用量",
     "usageNoData": "暂无用量数据",
-    "usageHint": "由插件在每次 LLM 调用后记录用量，仅统计启用本功能之后的数据"
+    "usageHint": "由插件在每次 LLM 调用后记录用量，仅统计启用本功能之后的数据",
+    "costToday": "今日预估花费",
+    "costWeek": "近 7 天",
+    "costPriced": "{n} 个模型可估价",
+    "costHint": "花费 = 实际 token 用量 × 模型档案里的单价 × 倍率，是估算值不是账单。",
+    "costUnpriced": "另有 {n} 个模型未填单价，未计入上面的总额。"
   },
   "detect": {
     "title": "检测操作",
@@ -391,7 +396,8 @@
       "trial": "试用额度",
       "paid_overage": "额度+超额付费",
       "paid": "按量付费",
-      "subscription": "订阅内含"
+      "subscription": "订阅内含",
+      "per_request": "按次计费"
     },
     "scope": {
       "manual": "手动检测",
@@ -465,8 +471,13 @@
     "fPriceInput": "输入单价",
     "fPriceOutput": "输出单价",
     "fPriceCached": "缓存命中单价",
+    "fPricePerCall": "单次单价",
+    "fRateMultiplier": "倍率覆盖",
+    "rateHint": "留空 = 跟随该供应商分组的倍率；填了则以本模型为准。倍率乘在算好的总价上，1.0 表示原价。",
+    "perCallHint": "按次计费时填这一项（每次调用多少钱），token 单价就不参与了。",
     "priceGroup": "计费明细",
     "perMillion": "元/百万 token",
+    "perCall": "元/次",
     "priceHint": "单价一律按「每百万 token」填，缓存价留空则按输入价计算。DeepSeek 一类缓存命中价低很多，不填会明显高估成本。",
     "curNone": "不设置",
     "scopeGroup": "参与哪些检测",
@@ -495,6 +506,23 @@
     "sortStatus": "问题优先",
     "setGroupBilling": "本组计费",
     "scheduledTip": "定时巡检会真的打模型并产生费用，默认只对不产生单次费用的计费类型开放",
-    "scopeHint": "「跟随默认」只对定时巡检有意义：它的默认值由计费类型推导。手动检测与指令检测的默认就是参与，没有第三态。"
+    "scopeHint": "「跟随默认」只对定时巡检有意义：它的默认值由计费类型推导。手动检测与指令检测的默认就是参与，没有第三态。",
+    "groupRate": "分组倍率",
+    "groupLimit": "每日次数",
+    "groupCurrency": "分组币种",
+    "groupVendorHint": "倍率与每日次数限制属于整个供应商分组，改一次本组所有模型都跟着变；单个模型要例外就在抽屉里填倍率覆盖。",
+    "groupApplied": "已把「{vendor}」的分组设置保存",
+    "callsOfLimit": "{used} / {limit}",
+    "limitUnset": "未设限额",
+    "limitNear": "已用到 {pct}%",
+    "colCost": "预估花费",
+    "costWeekTip": "按档案里的单价 × 倍率 × 实际 token 估算，只统计真实对话（不含探测）。显示 – 表示没填单价、估不出来，不是没花钱。",
+    "costNone": "未填单价",
+    "multiplierTag": "倍率 ×{n}",
+    "groupMultiplierTag": "跟随分组 ×{n}",
+    "costToday": "今日",
+    "costWeek": "近 7 天",
+    "costPriced": "{n} 个模型可估价",
+    "costUnpriced": "另有 {n} 个未填单价"
   }
 }

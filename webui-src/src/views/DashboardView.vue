@@ -74,6 +74,30 @@
           </n-tag>
         </div>
 
+        <!-- 花费是「用量 × 人工填的单价/倍率」，只有填了价的模型参与求和，
+             所以必须同时说出「另有多少个没填」，否则这个数会被当成全部支出。 -->
+        <div v-if="cost" class="cost-row mt-2">
+          <div>
+            <span class="cost-big">{{ fmtMoney(cost.today) }}</span>
+            <span class="usage-sub">{{ t("dashboard.costToday") }}</span>
+          </div>
+          <div>
+            <span class="cost-big muted">{{ fmtMoney(cost.week) }}</span>
+            <span class="usage-sub">{{ t("dashboard.costWeek") }}</span>
+          </div>
+          <n-tooltip :delay="400">
+            <template #trigger>
+              <n-tag size="small" round :bordered="false">
+                {{ t("dashboard.costPriced", { n: cost.priced_models }) }}
+              </n-tag>
+            </template>
+            {{ t("dashboard.costHint") }}
+            <template v-if="cost.unpriced_models">
+              {{ t("dashboard.costUnpriced", { n: cost.unpriced_models }) }}
+            </template>
+          </n-tooltip>
+        </div>
+
         <div class="mt-3">
           <div class="section-title">{{ t("dashboard.usageTrend") }}</div>
           <div class="bars">
@@ -161,8 +185,9 @@
             {{ t("dashboard.failCount") }} {{ overview.history.results_fail }}）
           </n-text>
           <div>
-            <n-button text type="primary" tag="a" href="#/detect">
-              {{ t("dashboard.goDetect") }} →
+            <!-- v1.3.5 把 /detect 合进了 /models，这里曾长期指向已删除的路由（点了白屏） -->
+            <n-button text type="primary" tag="a" href="#/models">
+              {{ t("dashboard.goModels") }} →
             </n-button>
           </div>
         </n-space>
@@ -175,15 +200,16 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { NButton, NCard, NGrid, NGi, NSpace, NTag, NText } from "naive-ui";
+import { NButton, NCard, NGrid, NGi, NSpace, NTag, NText, NTooltip } from "naive-ui";
 
-import { apiGet, type Overview, type UsageStats } from "../api";
+import { apiGet, fmtMoney, type CostTotals, type Overview, type UsageStats } from "../api";
 
 const { t } = useI18n();
 const overview = ref<Overview | null>(null);
 const refreshing = ref(false);
 
 const usage = computed<UsageStats | null>(() => overview.value?.usage ?? null);
+const cost = computed<CostTotals | null>(() => overview.value?.cost ?? null);
 
 /** 大数字缩写：12345 -> 12.3k，1234567 -> 1.2M */
 function fmt(n: number): string {
@@ -300,6 +326,28 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+.cost-row {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(255, 126, 178, 0.08), rgba(150, 110, 235, 0.08));
+}
+.cost-row > div {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.cost-big {
+  font-size: 22px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.cost-row .usage-sub {
+  margin-top: 0;
 }
 .section-title {
   font-size: 13px;

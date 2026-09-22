@@ -17,14 +17,13 @@ NULL 就是 NULL，SQL 原样交给 sqlite3 跑，所以它测的是真实表结
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import sys
 import tempfile
-import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _failures: list[str] = []
 
@@ -35,72 +34,9 @@ def check(cond: bool, label: str) -> None:
         _failures.append(label)
 
 
-# ------------------------------------------------------------------ aiosqlite 薄壳
-class _Cursor:
-    def __init__(self, cur: sqlite3.Cursor):
-        self._cur = cur
+import _aiosqlite_stub  # noqa: E402
 
-    def __await__(self):
-        return iter(lambda: self._cur)  # type: ignore[misc]
-
-    def __iter__(self):
-        return iter([self._cur])
-
-    def __getattr__(self, name):
-        return getattr(self._cur, name)
-
-    async def fetchall(self):
-        return self._cur.fetchall()
-
-    async def fetchone(self):
-        return self._cur.fetchone()
-
-
-class _Conn:
-    def __init__(self, path: str):
-        self._db = sqlite3.connect(path)
-
-    # storage.py 是「先进上下文、后设 row_factory」，所以必须在赋值那一刻就透给 sqlite3，
-    # 不能等到 __aenter__ 才读 —— 那时还没设上，取出来的行就是普通 tuple。
-    @property
-    def row_factory(self):
-        return self._db.row_factory
-
-    @row_factory.setter
-    def row_factory(self, value):
-        self._db.row_factory = value
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        self._db.close()
-        return False
-
-    async def execute(self, sql, params=()):
-        return _Cursor(self._db.execute(sql, params))
-
-    async def executemany(self, sql, seq):
-        return _Cursor(self._db.executemany(sql, seq))
-
-    async def executescript(self, sql):
-        return _Cursor(self._db.executescript(sql))
-
-    async def commit(self):
-        self._db.commit()
-
-    async def close(self):
-        self._db.close()
-
-
-def install_fake_aiosqlite() -> None:
-    mod = types.ModuleType("aiosqlite")
-    mod.Row = sqlite3.Row
-    mod.connect = lambda path, **kw: _Conn(path)
-    sys.modules["aiosqlite"] = mod
-
-
-install_fake_aiosqlite()
+_aiosqlite_stub.install()
 import storage as S  # noqa: E402
 
 

@@ -34,7 +34,8 @@ IMPORT_RE = re.compile(r"import\s*\{([^}]*)\}\s*from", re.S)
 # 新增枚举值时必须同步这里，否则漏键只能靠人肉点界面发现。
 DYNAMIC = {
     "monitor.scope.": ["manual", "scheduled", "command"],
-    "monitor.billing.": ["unknown", "free", "temp_free", "trial", "paid_overage", "paid", "subscription"],
+    "monitor.billing.": ["unknown", "free", "temp_free", "trial", "paid_overage", "paid",
+                         "subscription", "per_request"],
     "monitor.role.": ["unknown", "primary", "backup", "fallback", "dedicated", "watch", "retired"],
     "monitor.channel.": ["unknown", "official", "aggregator", "reseller", "self_hosted"],
     "monitor.stream.": ["unknown", "true", "false"],
@@ -91,6 +92,19 @@ def check_view(path: Path) -> None:
 
 for view in sorted((SRC / "views").glob("*.vue")) + [SRC / "App.vue"]:
     check_view(view)
+
+# 6) 手写 hash 链接必须指向真实路由。v1.3.5 合并页面后首页的「前往检测」还指着
+#    已删除的 #/detect，点了直接白屏 —— 路由删了但字符串链接不会编译报错。
+routes_src = (SRC / "main.ts").read_text(encoding="utf-8")
+defined = set(re.findall(r'path:\s*"(/[^"]*)"', routes_src))
+for vue in sorted((SRC / "views").glob("*.vue")) + [SRC / "App.vue"]:
+    text = vue.read_text(encoding="utf-8")
+    for href in re.findall(r'href="#(/[^"]*)"', text):
+        if href not in defined:
+            fails.append(f"{vue.name}: 链接指向不存在的路由 #{href}（已定义：{sorted(defined)}）")
+    for to in re.findall(r'to:\s*"(/[^"]*)"', text):
+        if to not in defined:
+            fails.append(f"{vue.name}: 导航项指向不存在的路由 {to}")
 
 for prefix, keys in DYNAMIC.items():
     for k in keys:

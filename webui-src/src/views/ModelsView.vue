@@ -82,6 +82,35 @@
         >
           {{ t("monitor.scope." + c) }} {{ channelTally(g, c).on }}/{{ g.items.length }}
         </n-button>
+
+        <!-- 分组级计费设置：倍率与每日次数限制天然是一家一个值，
+             逐个模型填十遍既累又容易填得不一致。留空即「未设置」。 -->
+        <n-tooltip :delay="400">
+          <template #trigger>
+            <n-input-number
+              :value="vendorVal(g.name, 'rate_multiplier')"
+              size="tiny"
+              :show-button="false"
+              :min="0"
+              :step="0.1"
+              :placeholder="t('models.groupRate')"
+              style="width: 96px"
+              @update:value="(v: number | null) => setVendorVal(g.name, 'rate_multiplier', v)"
+            />
+          </template>
+          {{ t("models.groupVendorHint") }}
+        </n-tooltip>
+        <n-input-number
+          :value="vendorVal(g.name, 'daily_call_limit')"
+          size="tiny"
+          :show-button="false"
+          :min="1"
+          :step="100"
+          :placeholder="t('models.groupLimit')"
+          style="width: 104px"
+          @update:value="(v: number | null) => setVendorVal(g.name, 'daily_call_limit', v)"
+        />
+        <span class="limit-chip" :class="limitClass(g.name)">{{ limitText(g.name) }}</span>
         <span class="group-spacer" />
         <n-button
           size="tiny"
@@ -101,7 +130,7 @@
         :pagination="false"
         :bordered="true"
         :single-line="false"
-        :scroll-x="1150"
+        :scroll-x="1258"
       />
     </section>
 
@@ -202,14 +231,32 @@
               @update:value="(v: number | null) => setVal(editing!, p.key, v)"
               size="small"
               :min="0"
-              :step="0.5"
+              :step="p.step"
+              :precision="p.precision"
               clearable
               style="width: 100%"
             >
-              <template #suffix>{{ t("profile.perMillion") }}</template>
+              <template #suffix>{{ t(p.unitKey) }}</template>
             </n-input-number>
           </n-form-item>
           <div class="drawer-hint">{{ t("profile.priceHint") }}</div>
+          <div class="drawer-hint">{{ t("profile.perCallHint") }}</div>
+
+          <n-form-item :label="t('profile.fRateMultiplier')">
+            <n-input-number
+              :value="val(editing, 'rate_multiplier')"
+              @update:value="(v: number | null) => setVal(editing!, 'rate_multiplier', v)"
+              size="small"
+              :min="0"
+              :step="0.1"
+              :precision="2"
+              clearable
+              style="width: 100%"
+            >
+              <template #suffix>× {{ effectiveMultiplier(editing) }}</template>
+            </n-input-number>
+            <div class="drawer-hint">{{ t("profile.rateHint") }}</div>
+          </n-form-item>
 
           <n-divider>{{ t("profile.scopeGroup") }}</n-divider>
           <div v-for="c in CHANNELS" :key="c" class="scope-line">
@@ -267,9 +314,9 @@ import {
 import type { DataTableColumns } from "naive-ui";
 
 import {
-  apiGet, apiPost, apiGetHealth, apiSetProfile, apiSetScope, startTestAllStream,
-  fmtMs,
-  type HealthItem, type HealthResponse, type TestResult,
+  apiGet, apiPost, apiGetHealth, apiSetProfile, apiSetScope, apiSetVendor, startTestAllStream,
+  fmtMs, fmtMoney,
+  type HealthItem, type HealthResponse, type TestResult, type VendorProfile,
 } from "../api";
 
 const { t } = useI18n();
@@ -278,12 +325,22 @@ const message = useMessage();
 const CHANNELS = ["manual", "scheduled", "command"] as const;
 type Channel = (typeof CHANNELS)[number];
 
-const BILLING = ["unknown", "free", "temp_free", "trial", "paid_overage", "paid", "subscription"];
+// 兜底枚举；后端 /panel/health 的 enums.billing_type 才是权威，
+// 加新计费类型时只改后端的话这里不会漏（billingOptions 优先用后端那份）。
+const BILLING = ["unknown", "free", "temp_free", "trial", "paid_overage", "paid",
+                 "subscription", "per_request"];
 const ROLES = ["unknown", "primary", "backup", "fallback", "dedicated", "watch", "retired"];
+// 单价一律「每百万 token」，只有按次单价是每次 —— 单位必须分开标，
+// 否则按次的人会把 0.002 填进 token 价里，算出来的花费差六个数量级。
 const PRICE_FIELDS = [
-  { key: "price_input_per_m", label: (tr: any) => tr("profile.fPriceInput") },
-  { key: "price_output_per_m", label: (tr: any) => tr("profile.fPriceOutput") },
-  { key: "price_cached_per_m", label: (tr: any) => tr("profile.fPriceCached") },
+  { key: "price_input_per_m", label: (tr: any) => tr("profile.fPriceInput"),
+    step: 0.5, precision: 4, unitKey: "profile.perMillion" },
+  { key: "price_output_per_m", label: (tr: any) => tr("profile.fPriceOutput"),
+    step: 0.5, precision: 4, unitKey: "profile.perMillion" },
+  { key: "price_cached_per_m", label: (tr: any) => tr("profile.fPriceCached"),
+    step: 0.1, precision: 4, unitKey: "profile.perMillion" },
+  { key: "price_per_call", label: (tr: any) => tr("profile.fPricePerCall"),
+    step: 0.001, precision: 6, unitKey: "profile.perCall" },
 ] as const;
 
 const data = ref<HealthResponse | null>(null);
@@ -306,6 +363,51 @@ const editing = ref<HealthItem | null>(null);
 
 /** 草稿表：provider_id -> 被改动的字段。未保存前不落库。 */
 const drafts = reactive<Record<string, any>>({});
+/** 分组（供应商）级草稿：分组名 -> 被改动的字段。与行草稿共用同一条保存栏。 */
+const vendorDrafts = reactive<Record<string, any>>({});
+
+const vendors = computed<Record<string, VendorProfile>>(() => data.value?.vendors || {});
+
+function vendorDraft(name: string) {
+  if (!vendorDrafts[name]) vendorDrafts[name] = {};
+  return vendorDrafts[name];
+}
+
+function vendorVal(name: string, key: string): any {
+  const d = vendorDrafts[name] || {};
+  if (key in d) return d[key];
+  return (vendors.value[name] as any)?.[key] ?? null;
+}
+
+function setVendorVal(name: string, key: string, v: any) {
+  vendorDraft(name)[key] = v;
+}
+
+/** 抽屉里实时回显「这个模型最终按几倍计」，让「留空跟随分组」不是句空话。 */
+function effectiveMultiplier(it: HealthItem): number {
+  const own = val(it, "rate_multiplier");
+  if (own !== null && own !== undefined && own !== "") return Number(own);
+  const group = vendorVal(it.name || "", "rate_multiplier");
+  if (group !== null && group !== undefined && group !== "") return Number(group);
+  return 1;
+}
+
+/** 今日调用数按供应商汇总。注意它只含真实对话，不含探测，是供应商计数器的下限。 */
+function limitText(name: string): string {
+  const v = vendors.value[name];
+  const used = Number(v?.calls_today ?? 0);
+  const limit = vendorVal(name, "daily_call_limit");
+  return limit ? t("models.callsOfLimit", { used, limit }) : t("models.costToday") + " " + used;
+}
+
+function limitClass(name: string): string {
+  const limit = Number(vendorVal(name, "daily_call_limit") || 0);
+  if (!limit) return "limit-none";
+  const ratio = Number(vendors.value[name]?.calls_today || 0) / limit;
+  if (ratio >= 1) return "limit-over";
+  if (ratio >= 0.8) return "limit-near";
+  return "limit-ok";
+}
 
 const items = computed<HealthItem[]>(() => data.value?.items ?? []);
 
@@ -357,10 +459,13 @@ function resetScope(id: string, channel: Channel) {
 
 const dirtyList = computed(() =>
   Object.keys(drafts).filter((id) => Object.keys(drafts[id]).length > 0));
-const dirtyCount = computed(() => dirtyList.value.length);
+const dirtyVendorList = computed(() =>
+  Object.keys(vendorDrafts).filter((n) => Object.keys(vendorDrafts[n]).length > 0));
+const dirtyCount = computed(() => dirtyList.value.length + dirtyVendorList.value.length);
 
 function discard() {
   Object.keys(drafts).forEach((k) => delete drafts[k]);
+  Object.keys(vendorDrafts).forEach((k) => delete vendorDrafts[k]);
 }
 
 // ---------------------------------------------------------------- 分组
@@ -403,7 +508,9 @@ const groups = computed<Group[]>(() => {
 function opts(values: string[], ns: string) {
   return values.map((v) => ({ label: t(`${ns}.${v}`), value: v }));
 }
-const billingOptions = computed(() => opts(BILLING, "monitor.billing"));
+const billingOptions = computed(() =>
+  opts(data.value?.enums?.billing_type?.length ? data.value.enums.billing_type : BILLING,
+       "monitor.billing"));
 const roleOptions = computed(() => opts(ROLES, "monitor.role"));
 const channelOptions = computed(() =>
   opts(["unknown", "official", "aggregator", "reseller", "self_hosted"], "monitor.channel"));
@@ -576,7 +683,8 @@ function testGroup(g: Group) {
 // ---------------------------------------------------------------- 保存
 async function saveAll() {
   const ids = dirtyList.value;
-  if (!ids.length) return;
+  const vnames = dirtyVendorList.value;
+  if (!ids.length && !vnames.length) return;
   saving.value = true;
   let ok = 0;
   const errors: string[] = [];
@@ -601,6 +709,17 @@ async function saveAll() {
       ok += 1;
     } catch (e: any) {
       errors.push(`${id}: ${e?.message || e}`);
+    }
+  }
+  for (const name of vnames) {
+    const patch = { ...vendorDrafts[name] };
+    try {
+      const r = await apiSetVendor(name, patch);
+      if (r && r.ok === false) throw new Error(r.error || t("profile.saveFailed"));
+      delete vendorDrafts[name];
+      ok += 1;
+    } catch (e: any) {
+      errors.push(`${name}: ${e?.message || e}`);
     }
   }
   saving.value = false;
@@ -638,9 +757,15 @@ async function load(keepDrafts = false) {
     const next = await apiGetHealth(7);
     const snapshot: Record<string, any> = {};
     Object.keys(drafts).forEach((k) => (snapshot[k] = { ...drafts[k] }));
+    const vsnap: Record<string, any> = {};
+    Object.keys(vendorDrafts).forEach((k) => (vsnap[k] = { ...vendorDrafts[k] }));
     data.value = next;
     Object.keys(drafts).forEach((k) => delete drafts[k]);
-    if (keepDrafts) Object.keys(snapshot).forEach((k) => (drafts[k] = snapshot[k]));
+    Object.keys(vendorDrafts).forEach((k) => delete vendorDrafts[k]);
+    if (keepDrafts) {
+      Object.keys(snapshot).forEach((k) => (drafts[k] = snapshot[k]));
+      Object.keys(vsnap).forEach((k) => (vendorDrafts[k] = vsnap[k]));
+    }
     if (editing.value) {
       editing.value = next.items.find((x) => x.id === editing.value?.id) || null;
     }
@@ -727,6 +852,26 @@ const columns = computed<DataTableColumns<HealthItem>>(() => [
       }),
     ]),
   },
+  {
+    title: t("models.colCost"), key: "cost", width: 104, align: "right" as const,
+    render: (it) => {
+      const c = it.cost || ({} as any);
+      const week = c.week;
+      // 没填单价时是「估不出来」，显示 – 而不是 ¥0.00 —— 后者会被读成「真没花钱」
+      const main = week === null || week === undefined
+        ? h(NText, { depth: 3 }, () => t("models.costNone"))
+        : h("span", { class: "cost-num" }, fmtMoney(week, c.currency));
+      const tag = h("div", { class: "cost-sub" },
+        c.multiplier && c.multiplier !== 1
+          ? t(c.multiplier_from_group ? "models.groupMultiplierTag" : "models.multiplierTag",
+              { n: c.multiplier })
+          : t("models.costToday") + " " + fmtMoney(c.today ?? null, c.currency));
+      return h(NTooltip, { trigger: "hover" }, {
+        default: () => t("models.costWeekTip"),
+        trigger: () => h("div", { class: "cost-cell" }, [main, tag]),
+      });
+    },
+  },
   ...CHANNELS.map<DataTableColumns<HealthItem>[number]>((c) => ({
     // 三通道各占一列并把列名写全：合并成一列「三通道」后要靠 tooltip 猜哪个开关是谁
     title: t("monitor.scope." + c), key: "scope_" + c, width: 76, align: "center",
@@ -802,6 +947,16 @@ function onVisibility() {
 .group-count { font-size: 12px; opacity: .6; margin-right: 6px; }
 .group-spacer { flex: 1 1 auto; }
 .chip-mixed { border-style: dashed !important; }
+.limit-chip {
+  font-size: 11px; padding: 1px 8px; border-radius: 9px;
+  background: rgba(148, 163, 184, .14); color: var(--muted); white-space: nowrap;
+}
+.limit-near { background: rgba(229, 154, 43, .18); color: var(--warn); }
+.limit-over { background: rgba(239, 77, 104, .18); color: var(--err); font-weight: 700; }
+.limit-none { opacity: .6; }
+:deep(.cost-cell) { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+:deep(.cost-num) { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+:deep(.cost-sub) { font-size: 10px; opacity: .55; }
 .m-savebar {
   position: sticky; bottom: 0; z-index: 5;
   display: flex; justify-content: space-between; align-items: center;
