@@ -15,6 +15,7 @@ from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
 from .card_render import render_card
+from .call_recorder import install as install_call_recorder, suppressed as suppress_call_recording, wrapped_classes as recorder_wrapped_classes
 from .monitor import (
     KIND_FAIL,
     KIND_FREE_EXPIRING,
@@ -244,6 +245,31 @@ def _fmt_ms(value) -> str:
         return f"{minutes}分{seconds}秒"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}时{minutes}分"
+
+
+def _today_days(now: Optional[float] = None) -> float:
+    """「今天」折算成滚动窗口的天数：从本地零点到现在。
+
+    为什么不新增一个 today 分支贯穿整条链路：窗口计算本来就是 ``now - days*86400``，
+    把本地零点差值折成小数天数就能复用全部现有逻辑（含 provider_stats 的
+    created_at 字符串比较），改动面从三个文件缩到一个函数。
+    凌晨刚过时窗口极短，所以留 0.05 天（约 72 分钟）的下限，避免零点后立刻什么都查不到。
+    """
+    ts = now if now is not None else time.time()
+    lt = time.localtime(ts)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return max(0.05, (ts - midnight) / 86400.0)
+
+
+def _parse_days(raw) -> float:
+    """把 days 查询参数解析成天数。``today`` 表示本地零点到现在。"""
+    text = str(raw or "").strip().lower()
+    if text in ("today", "今天"):
+        return _today_days()
+    try:
+        return max(0.5, min(90.0, float(text)))
+    except (TypeError, ValueError):
+        return _today_days()
 
 
 def _fmt_success(fail_rate) -> str:
@@ -555,6 +581,16 @@ class ModelPanelPlugin(Star):
                 logger.info(f"[ModelPanel] 清理用量记录 {deleted_usage} 条（> 90 天）")
         except Exception as e:
             logger.warning(f"[ModelPanel] 清理用量记录失败: {e}")
+        # 逐次调用记录是这张表里增长最快的一份（每轮对话可能好几行），保留 30 天
+        try:
+            deleted_calls = await self.storage.cleanup_calls_older_than(30)
+            if deleted_calls:
+                logger.info(f"[ModelPanel] 清理逐次调用记录 {deleted_calls} 条（> 30 天）")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 清理逐次调用记录失败: {e}")
+        # 装上逐次调用埋点。核心 provider_stats 是「每轮一条且归属最终模型」，
+        # 被备用模型救回来的失败在它那里根本没有记录，只能自己包一层才看得全。
+        self._install_call_recorder()
         # 探测核心 provider_stats 能否读（老版本 AstrBot 没这张表）。
         # 读不到就整块实时监测降级，原有的主动探测功能不受影响。
         try:
@@ -573,6 +609,38 @@ class ModelPanelPlugin(Star):
             self._monitor_task = asyncio.create_task(self._monitor_loop())
             logger.info(f"[ModelPanel] 巡检已启动：每 {cfg.interval_sec}s 一轮，告警通知={'开' if cfg.notify_enabled else '关'}")
         logger.info(f"[ModelPanel] 模型控制台插件已初始化（db={db_path}）")
+
+    def _install_call_recorder(self) -> None:
+        """给当前加载的 provider 类挂上逐次调用记录。幂等，可在巡检轮里重复调。
+
+        重复调是有意的：用户新加一种 provider 类型时它的类还没被包过，
+        而 install() 内部按类去重，代价只是几次集合查询。
+        """
+        try:
+            n = install_call_recorder(self._record_call, _normalize_error, self._chat_providers())
+            if n:
+                logger.info(f"[ModelPanel] 逐次调用埋点：本次新覆盖 {n} 个 provider 类，"
+                            f"累计 {len(recorder_wrapped_classes())} 个")
+        except Exception as e:
+            # 埋点装不上只是失去逐次数据，绝不能因此让插件起不来
+            logger.warning(f"[ModelPanel] 挂载逐次调用记录失败: {e}")
+
+    async def _has_calls(self) -> bool:
+        """逐次调用表里有没有过任何一行。
+
+        用来区分两种「逐次列是空的」：埋点根本没装上（要提示用户），
+        和今天确实还没人调用过（正常）。两者都显示空白会误导排查方向。
+        """
+        try:
+            return bool(self.storage) and (await self.storage.calls_count_all()) > 0
+        except Exception:
+            return False
+
+    async def _record_call(self, row: dict) -> None:
+        """call_recorder 的落库回调。"""
+        if self.storage is None:
+            return
+        await self.storage.insert_call(row)
 
     async def _reap_orphans(self) -> None:
         """回收 provider 已不存在的档案与检测范围行。"""
@@ -2042,7 +2110,7 @@ class ModelPanelPlugin(Star):
         }
 
     async def _health_view(self, days: float = 7.0) -> dict:
-        """把四份数据拼成一张视图表：档案 / 三通道范围 / 最近探测 / 真实对话监测。
+        """把五份数据拼成一张视图表：档案 / 三通道范围 / 最近探测 / 核心对话监测 / 逐次调用。
 
         刻意不合并成一个「平均延迟」：探测测的是空载非流式往返，监测记录的是真实对话
         首字与整轮耗时，数量级不同、语义不同，混起来统计就会骗人
@@ -2072,6 +2140,15 @@ class ModelPanelPlugin(Star):
                 probe_rows = await self.storage.probe_window(days=days)
             except Exception as e:
                 logger.warning(f"[ModelPanel] 读取探测明细失败: {e}")
+        # 逐次调用：本插件自己包的 provider.text_chat / text_chat_stream。
+        # 这是唯一能看见「主模型失败但被备用模型救回来」的数据源，
+        # 核心 provider_stats 在那种情况下把整轮记到了备用模型头上。
+        calls: dict = {}
+        if self.storage:
+            try:
+                calls = await self.storage.calls_stats(int(now - days * 86400))
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取逐次调用统计失败: {e}")
         ledger = _merge_ledger(records, probe_rows)
         default_id = await self._default_provider_id()
         displays = []
@@ -2131,6 +2208,7 @@ class ModelPanelPlugin(Star):
                     "note": prof.get("note") or "",
                 },
                 "cost": cost_of.get(pid) or {},
+                "calls": calls.get(pid) or {},
                 "scope": {
                     "manual": bool(scope.get("manual")),
                     "scheduled": bool(scope.get("scheduled")),
@@ -2168,6 +2246,8 @@ class ModelPanelPlugin(Star):
             "vendors": costs.get("by_vendor") or {},
             "cost_totals": costs.get("totals") or {},
             "live_available": live_available,
+            # 逐次埋点是否已经在跑。没装上时前端要说明「逐次列是空的」而不是让表格骗人
+            "calls_available": bool(calls) or (await self._has_calls()),
             "truncated": truncated,
             "samples": sum(int((it.get("window") or {}).get("total") or 0) for it in items),
             "alerts": open_alerts,
@@ -2183,14 +2263,15 @@ class ModelPanelPlugin(Star):
         }
 
     async def api_health(self) -> dict:
-        """GET /panel/health：监测页与档案页共用的数据源。"""
-        days = 7.0
+        """GET /panel/health：监测页与档案页共用的数据源。
+
+        ``days`` 接受 ``today``（本地零点到现在）或数字；缺省为今天 ——
+        看监测的人第一问题永远是「现在/今天怎么样」，默认给 7 天会把今天的故障摊平掉。
+        """
         try:
-            raw = request.args.get("days")
-            if raw:
-                days = max(0.5, min(90.0, float(raw)))
-        except (TypeError, ValueError):
-            pass
+            days = _parse_days(request.args.get("days"))
+        except Exception:
+            days = _today_days()
         try:
             return await self._health_view(days)
         except Exception as e:
@@ -2788,7 +2869,10 @@ class ModelPanelPlugin(Star):
         start = time.monotonic()
         gen = None
         try:
-            gen = provider.text_chat_stream(prompt=_STREAM_PROBE_PROMPT)
+            # 探测结果已经写进 model_test_results 了；不在这里关掉逐次埋点的话，
+            # 每轮探测会再往 llm_calls 记一行，今日调用次数和成本都会虚高。
+            with suppress_call_recording():
+                gen = provider.text_chat_stream(prompt=_STREAM_PROBE_PROMPT)
             if not hasattr(gen, "__anext__"):
                 # 个别实现不是异步生成器（返回协程），这里不猜，直接判不可用。
                 # 注意协程的 close() 是同步方法，await 它反而会抛 TypeError。
@@ -2943,7 +3027,8 @@ class ModelPanelPlugin(Star):
         for vendor, group in sorted(by_vendor.items(), key=lambda kv: (worst(kv[1]), kv[0])):
             for it in sorted(group, key=lambda it: (
                     self._STATE_ORDER.get(str(it.get("state")), 9),
-                    -int((it.get("window") or {}).get("total") or 0))):
+                    -int((it.get("calls") or {}).get("counted")
+                         or (it.get("window") or {}).get("total") or 0))):
                 row = {
                     "group": vendor,
                     "state": it.get("state"),
@@ -2951,22 +3036,43 @@ class ModelPanelPlugin(Star):
                 }
                 w = it.get("window") or {}
                 last = it.get("last") or {}
-                counted = int(w.get("counted") or 0)
+                # 有逐次埋点就以它为准：核心那张表在「主模型失败、备用救回来」时
+                # 会把整轮记到备用模型头上，于是面板报 100% 成功而日志里全是失败。
+                c = it.get("calls") or {}
+                c_counted = int(c.get("counted") or 0)
+                if c_counted:
+                    rate = c.get("fail_rate")
+                    cl = c.get("last") or {}
+                    lat = cl.get("ttft_ms") or cl.get("latency_ms") or c.get("avg_latency_ms")
+                    ok_flag = bool(cl.get("ok"))
+                    fail_n, total_n = int(c.get("fail") or 0), c_counted
+                else:
+                    rate = w.get("fail_rate")
+                    lat = last.get("ttft_ms") or last.get("latency_ms")
+                    ok_flag = bool(last.get("ok")) if last else True
+                    fail_n = int(w.get("fail") or 0)
+                    total_n = int(w.get("counted") or 0)
+                counted = total_n
                 if detailed:
                     row["sub"] = self._row_sub(it)
                     row["cells"] = [
-                        _fmt_ms(w.get("avg_ttft_ms")),
+                        _fmt_ms(c.get("avg_ttft_ms") if c_counted else w.get("avg_ttft_ms")),
                         _fmt_ms(w.get("p95_ttft_ms")),
-                        _fmt_ms(w.get("avg_latency_ms")),
-                        _fmt_success(w.get("fail_rate")) if counted else "-",
-                        f"{int(w.get('fail') or 0)}/{counted}",
+                        _fmt_ms(c.get("avg_latency_ms") if c_counted else w.get("avg_latency_ms")),
+                        _fmt_success(rate) if counted else "-",
+                        f"{fail_n}/{total_n}",
                     ]
                 else:
-                    # 总览只看最新一次：延迟 + 窗口成功率，样本数这类次要信息一律不进卡片
-                    row["sub"] = self._row_note(it)
+                    note = self._row_note(it)
+                    # 失败次数直接写进副标题：这正是之前看不见的那个数
+                    if fail_n:
+                        note = (f"失败 {fail_n} 次" + (f" · {note}" if note else ""))
+                    elif not ok_flag and last:
+                        note = (f"最近一次失败 · {note}" if note else "最近一次失败")
+                    row["sub"] = note
                     row["cells"] = [
-                        _fmt_ms(last.get("ttft_ms") or last.get("latency_ms")) if last else "-",
-                        _fmt_success(w.get("fail_rate")) if counted else "-",
+                        _fmt_ms(lat) if (lat or c_counted or last) else "-",
+                        _fmt_success(rate) if counted else "-",
                     ]
                 ordered.append(row)
         rows = ordered
@@ -3052,20 +3158,44 @@ class ModelPanelPlugin(Star):
         if not self.storage:
             return
         now = int(time.time())
-        cursor_raw = await self.storage.get_state_value("stats_cursor", "")
-        if cursor_raw == "":
-            # 首轮：把游标直接放到表尾。否则刚装上就会因为陈年历史里的失败立刻告警。
-            head = await self.live_stats.latest_id()
-            if head is None:
-                return
-            await self.storage.set_state_value("stats_cursor", str(head))
-            logger.info(f"[ModelPanel] 巡检游标已初始化（跳过历史 {head} 条）")
-            return
+        # 告警数据源优先用逐次调用（本插件自己埋的），因为它才看得见「主模型失败、
+        # 备用模型救回来」那一类 —— 核心 provider_stats 会把那一轮记到备用模型头上，
+        # 结果就是日志里失败一堆、告警一条不发。逐次表还是空的（刚装上、或埋点没挂上）
+        # 时才退回核心表，至少不丢告警能力。
+        rows: list = []
+        new_cursor = 0
+        use_calls = False
         try:
-            cursor = int(cursor_raw)
-        except (TypeError, ValueError):
-            cursor = 0
-        rows, new_cursor = await self.live_stats.fetch_since(cursor, limit=2000)
+            use_calls = (await self.storage.calls_count_all()) > 0
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 检查逐次调用表失败: {e}")
+        if use_calls:
+            cursor_raw = await self.storage.get_state_value("calls_cursor", "")
+            if cursor_raw == "":
+                head = await self.storage.calls_latest_id()
+                await self.storage.set_state_value("calls_cursor", str(head))
+                logger.info(f"[ModelPanel] 逐次巡检游标已初始化（跳过历史 {head} 条）")
+                return
+            try:
+                cursor = int(cursor_raw)
+            except (TypeError, ValueError):
+                cursor = 0
+            rows, new_cursor = await self.storage.calls_since(cursor, limit=2000)
+        else:
+            cursor_raw = await self.storage.get_state_value("stats_cursor", "")
+            if cursor_raw == "":
+                # 首轮：把游标直接放到表尾。否则刚装上就会因为陈年历史里的失败立刻告警。
+                head = await self.live_stats.latest_id()
+                if head is None:
+                    return
+                await self.storage.set_state_value("stats_cursor", str(head))
+                logger.info(f"[ModelPanel] 巡检游标已初始化（跳过历史 {head} 条）")
+                return
+            try:
+                cursor = int(cursor_raw)
+            except (TypeError, ValueError):
+                cursor = 0
+            rows, new_cursor = await self.live_stats.fetch_since(cursor, limit=2000)
         states = await self.storage.get_model_states()
         notified = await self.storage.last_notified_map()
 
@@ -3094,7 +3224,9 @@ class ModelPanelPlugin(Star):
                 "muted_until": int(prev.get("muted_until") or 0),
                 "samples_total": int(prev.get("samples_total") or 0) + d.samples,
             })
-        await self.storage.set_state_value("stats_cursor", str(new_cursor))
+        # 游标必须写回本次实际读的那个源，写错键的话下一轮会从头重读、告警重发
+        await self.storage.set_state_value(
+            "calls_cursor" if use_calls else "stats_cursor", str(new_cursor))
         await self._dispatch_alerts(decisions, names, now, cfg)
         pruned = await self.storage.cleanup_alerts(cfg.alert_retention_days)
         if pruned:
@@ -3551,7 +3683,7 @@ class ModelPanelPlugin(Star):
     async def cmd_model_status(self, event: AstrMessageEvent):
         """查询模型健康与延迟总览。只读已有记录，不请求模型、不产生任何费用。"""
         try:
-            view = await self._health_view(days=7.0)
+            view = await self._health_view(days=_today_days())
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型状态 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")
@@ -3577,7 +3709,7 @@ class ModelPanelPlugin(Star):
             yield event.plain_result("用法：/模型统计 <模型名关键词>，例如 /模型统计 deepseek")
             return
         try:
-            view = await self._health_view(days=7.0)
+            view = await self._health_view(days=_today_days())
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型统计 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")

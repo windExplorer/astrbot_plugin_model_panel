@@ -152,6 +152,30 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_usage_day   ON llm_usage(day);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON llm_usage(model);
 
+-- 逐次 LLM 调用记录，由本插件自己包装 provider.text_chat / text_chat_stream 写入。
+-- 为什么不能只用核心的 provider_stats：那是一张「每轮一条」的表，
+-- 主模型失败被备用模型救回来时，行的 provider_id 归属于**最后跑成功的那个**，
+-- 失败的那次尝试在核心里根本没有记录 —— 于是日志里失败一堆、面板却显示 100% 成功。
+-- 这张表按「每次尝试」记，失败的、被换掉的都在这里，才是模型真实的可靠性。
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             INTEGER NOT NULL,
+    day            TEXT    NOT NULL,
+    provider_id    TEXT    NOT NULL DEFAULT '',
+    provider_model TEXT    NOT NULL DEFAULT '',
+    ok             INTEGER NOT NULL DEFAULT 0,
+    aborted        INTEGER NOT NULL DEFAULT 0,
+    streamed       INTEGER NOT NULL DEFAULT 0,
+    latency_ms     REAL,
+    ttft_ms        REAL,
+    error_code     TEXT    NOT NULL DEFAULT '',
+    error_message  TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_calls_ts        ON llm_calls(ts);
+CREATE INDEX IF NOT EXISTS idx_calls_provider  ON llm_calls(provider_id, ts);
+CREATE INDEX IF NOT EXISTS idx_calls_day       ON llm_calls(day);
+
 -- 少量全局状态（目前只有 provider_stats 的增量读取游标）。
 -- 核心那张表只增不清，靠游标增量读才不会每次巡检都全表扫。
 CREATE TABLE IF NOT EXISTS panel_state (
@@ -949,6 +973,146 @@ class Storage:
             }
             for r in rows
         }
+
+    # ---------- 逐次 LLM 调用（本插件自埋点） ----------
+    async def insert_call(self, row: dict) -> None:
+        """写一行逐次调用记录。由 call_recorder 的回调调用。"""
+        await self.init()
+        ts = int(row.get("ts") or time.time())
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """INSERT INTO llm_calls
+                       (ts, day, provider_id, provider_model, ok, aborted, streamed,
+                        latency_ms, ttft_ms, error_code, error_message)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (ts, time.strftime("%Y-%m-%d", time.localtime(ts)),
+                     str(row.get("provider_id") or ""), str(row.get("provider_model") or ""),
+                     1 if row.get("ok") else 0, 1 if row.get("aborted") else 0,
+                     1 if row.get("streamed") else 0,
+                     row.get("latency_ms"), row.get("ttft_ms"),
+                     str(row.get("error_code") or ""), str(row.get("error_message") or "")[:200]),
+                )
+                await db.commit()
+
+    async def calls_since(self, last_id: int, limit: int = 2000) -> tuple[list[dict], int]:
+        """按主键游标增量读逐次调用，供告警状态机消费。"""
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id, provider_id, provider_model, ok, aborted, ts,
+                          latency_ms, ttft_ms, error_code, error_message
+                   FROM llm_calls WHERE id > ? ORDER BY id ASC LIMIT ?""",
+                (int(last_id), int(limit)),
+            )
+            rows = await cur.fetchall()
+        if not rows:
+            return [], int(last_id)
+        out = [dict(r) for r in rows]
+        return out, int(out[-1]["id"])
+
+    async def calls_stats(self, since_ts: int, until_ts: Optional[int] = None) -> dict[str, dict]:
+        """按 provider 聚合一段时间的逐次调用：成败、延迟、首字、最近一次。
+
+        ``aborted``（调用被取消）既不算成功也不算故障，和核心表那边的处理保持一致。
+        """
+        await self.init()
+        sql = """SELECT provider_id,
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN aborted = 1 THEN 1 ELSE 0 END) AS aborted,
+                        SUM(CASE WHEN aborted = 0 AND ok = 0 THEN 1 ELSE 0 END) AS fail,
+                        SUM(CASE WHEN aborted = 0 AND ok = 1 THEN 1 ELSE 0 END) AS ok,
+                        AVG(CASE WHEN ok = 1 AND aborted = 0 THEN latency_ms END) AS avg_lat,
+                        AVG(CASE WHEN ok = 1 AND aborted = 0 AND ttft_ms IS NOT NULL
+                                 THEN ttft_ms END) AS avg_ttft
+                 FROM llm_calls WHERE ts >= ?"""
+        params: list = [int(since_ts)]
+        if until_ts:
+            sql += " AND ts <= ?"
+            params.append(int(until_ts))
+        sql += " GROUP BY provider_id"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(sql, params)
+            agg_rows = await cur.fetchall()
+            cur = await db.execute(
+                """SELECT c.provider_id, c.ts, c.ok, c.aborted, c.latency_ms, c.ttft_ms,
+                          c.error_code, c.error_message
+                   FROM llm_calls c
+                   JOIN (SELECT provider_id, MAX(id) AS mid FROM llm_calls
+                         WHERE ts >= ? GROUP BY provider_id) t ON t.mid = c.id""",
+                (int(since_ts),),
+            )
+            last_rows = {r["provider_id"]: r for r in await cur.fetchall()}
+        out: dict[str, dict] = {}
+        for r in agg_rows:
+            pid = str(r["provider_id"] or "")
+            total = int(r["total"] or 0)
+            aborted = int(r["aborted"] or 0)
+            fail = int(r["fail"] or 0)
+            ok = int(r["ok"] or 0)
+            counted = total - aborted
+            last = last_rows.get(pid)
+            out[pid] = {
+                "total": total,
+                "ok": ok,
+                "fail": fail,
+                "aborted": aborted,
+                "counted": counted,
+                "fail_rate": round(fail / counted, 4) if counted else 0.0,
+                "avg_latency_ms": round(float(r["avg_lat"]), 1) if r["avg_lat"] is not None else None,
+                "avg_ttft_ms": round(float(r["avg_ttft"]), 1) if r["avg_ttft"] is not None else None,
+                "last": None if last is None else {
+                    "ts": int(last["ts"] or 0),
+                    "ok": bool(last["ok"]) and not bool(last["aborted"]),
+                    "aborted": bool(last["aborted"]),
+                    "latency_ms": last["latency_ms"],
+                    "ttft_ms": last["ttft_ms"],
+                    "error_code": str(last["error_code"] or ""),
+                },
+            }
+        return out
+
+    async def calls_errors_since(self, since_ts: int, limit: int = 20) -> list[dict]:
+        """最近的失败调用明细，给「今天到底哪儿错了」看原因用。"""
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT provider_id, provider_model, ts, latency_ms, error_code, error_message
+                   FROM llm_calls WHERE ok = 0 AND aborted = 0 AND ts >= ?
+                   ORDER BY id DESC LIMIT ?""",
+                (int(since_ts), int(limit)),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def calls_count_all(self) -> int:
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM llm_calls")
+            row = await cur.fetchone()
+        return int(row[0] or 0)
+
+    async def calls_latest_id(self) -> int:
+        """当前表尾主键。首轮巡检用它把游标放到最后，跳过装上插件之前的陈年失败。"""
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT COALESCE(MAX(id), 0) FROM llm_calls")
+            row = await cur.fetchone()
+        return int(row[0] or 0)
+
+    async def cleanup_calls_older_than(self, days: int) -> int:
+        """清理 days 天前的逐次调用记录。返回受影响行数。"""
+        if days <= 0:
+            return 0
+        await self.init()
+        cutoff = int(time.time()) - int(days) * 86400
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute("DELETE FROM llm_calls WHERE ts < ?", (cutoff,))
+                await db.commit()
+                return cur.rowcount or 0
 
     # ---------- 全局小状态（provider_stats 游标等） ----------
     async def get_state_value(self, key: str, default: str = "") -> str:

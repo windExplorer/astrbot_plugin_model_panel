@@ -145,9 +145,21 @@ def evaluate(
         cooldown_active: ``(provider_id, kind) -> bool``，由调用方接数据库实现；
             不传表示不做冷却判定（测试或首次启动时用）。
     """
+    def _field(r: Any, name: str, default: Any = None) -> Any:
+        """同时吃核心的 CallRecord 和本插件 llm_calls 的 dict 行。
+
+        两个数据源字段名不一样（``started_at`` vs ``ts``），而状态机只有一份实现这点
+        不能破 —— 否则「连续失败几次算故障」在对话路和逐次路上会给出不同结论。
+        """
+        if isinstance(r, dict):
+            if name == "started_at":
+                return r.get("ts", default)
+            return r.get(name, default)
+        return getattr(r, name, default)
+
     grouped: dict[str, list[Any]] = {}
     for r in records:
-        pid = str(getattr(r, "provider_id", "") or "") or "(unknown)"
+        pid = str(_field(r, "provider_id", "") or "") or "(unknown)"
         grouped.setdefault(pid, []).append(r)
 
     out: list[Decision] = []
@@ -157,11 +169,11 @@ def evaluate(
         fail_streak = int(prev.get("consecutive_fail") or 0)
         ok_streak = int(prev.get("consecutive_ok") or 0)
         fails = oks = aborted = 0
-        for r in sorted(rows, key=lambda x: getattr(x, "started_at", 0) or 0):
-            if getattr(r, "aborted", False):
+        for r in sorted(rows, key=lambda x: _field(x, "started_at", 0) or 0):
+            if _field(r, "aborted", False):
                 aborted += 1
                 continue
-            if getattr(r, "ok", False):
+            if _field(r, "ok", False):
                 oks += 1
                 fail_streak = 0
                 ok_streak += 1
