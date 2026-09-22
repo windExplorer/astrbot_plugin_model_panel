@@ -3840,6 +3840,27 @@ class ModelPanelPlugin(Star):
         except Exception as e:
             logger.warning(f"[ModelPanel] 定时探测写历史失败: {e}")
 
+        # 告警卡片上的名字用「供应商/模型」全名（与面板一致），不是裸模型名
+        names = {pid: (d.get("display_model") or d.get("model") or pid)
+                 for pid, d, _b, _p in targets}
+        await self._apply_probe_results(results, names, now, cfg)
+        try:
+            await self.storage.set_state_value(used_key, str(used + len(results)))
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 记录探测预算失败: {e}")
+
+    async def _apply_probe_results(self, results: list[dict], names: dict[str, str],
+                                   now: int, cfg: MonitorConfig) -> None:
+        """把一批探测结果喂进**状态机与告警链路**。
+
+        为什么所有探测入口都必须走这里：探测结果如果不进 ``model_state``，
+        面板就会继续显示上一次的结论 —— 用户刚点完「检测」看到某模型挂了，
+        回头打开面板却还是绿的（v1.3.15 之前外部检测正是这个毛病）。
+        复用 ``monitor.evaluate`` 也保证了「连续失败几次算故障」「冷却」「恢复需连续成功」
+        在手动 / 定时 / 外部三条路上只有一份实现。
+        """
+        if not results:
+            return
         records = [
             CallRecord(
                 id=i, provider_id=str(r.get("id") or ""), provider_model=str(r.get("model") or ""),
@@ -3854,9 +3875,9 @@ class ModelPanelPlugin(Star):
         notified = await self.storage.last_notified_map()
 
         def cooling(pid: str, kind: str) -> bool:
-            return notified.get((pid, kind), 0) + cfg.cooldown_sec > int(time.time())
+            return notified.get((pid, kind), 0) + cfg.cooldown_sec > int(now)
 
-        decisions = evaluate_monitor(records, states, cfg, int(time.time()), cooling)
+        decisions = evaluate_monitor(records, states, cfg, int(now), cooling)
         # 探测路才知道 error_code 与错误原文（上面那批 CallRecord 是硬凑出来的，没有这两个字段），
         # 所以这里把它们补进 decision 的 detail —— 告警卡片的「错误码」列与「失败原因」都读它。
         err_of = {str(r.get("id")): (str(r.get("error_code") or ""), str(r.get("error") or ""))
@@ -3881,12 +3902,7 @@ class ModelPanelPlugin(Star):
                 "muted_until": int(prev.get("muted_until") or 0),
                 "samples_total": int(prev.get("samples_total") or 0) + d.samples,
             })
-        names = {pid: (d.get("display_model") or d.get("model") or pid) for pid, d, _b, _p in targets}
-        await self._dispatch_alerts(decisions, names, int(time.time()), cfg)
-        try:
-            await self.storage.set_state_value(used_key, str(used + len(results)))
-        except Exception as e:
-            logger.warning(f"[ModelPanel] 记录探测预算失败: {e}")
+        await self._dispatch_alerts(decisions, names, int(now), cfg)
 
     async def _notify_admins(self, chain) -> int:
         """主动投递给管理员。
@@ -4206,8 +4222,12 @@ class ModelPanelPlugin(Star):
             if not targets:
                 return {"ok": False, "error": "模型都不在了（可能已被删除或改名）",
                         "results": [], "items": {}, "missing": missing}
-            results, _names = await self._probe_batch(targets, timeout)
+            results, names = await self._probe_batch(targets, timeout)
             await self._record_probe_history(self.EXTERNAL_TRIGGER, results)
+            # 结果同样要喂进状态机与告警链路：否则面板继续显示上一次的结论 ——
+            # 联动方刚打完一轮、用户一打开面板却还是绿的（这正是必须共用一份实现的原因）。
+            await self._apply_probe_results(
+                results, names, int(time.time()), MonitorConfig.from_config(self.config))
             snap = await self.external_snapshot(pids)
             logger.info(
                 f"[ModelPanel] 外部检测完成：{len(results)} 个模型，"
