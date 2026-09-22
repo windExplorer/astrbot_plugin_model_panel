@@ -1255,14 +1255,14 @@ class ModelPanelPlugin(Star):
         except Exception:
             sender_id = ""
         if not sender_id:
-            yield event.plain_result("暂时拿不到你的身份信息，稍后再试试吧～")
+            await self._reply(event, "暂时拿不到你的身份信息，稍后再试试吧～")
             return
         if self._companion_star() is None:
-            yield event.plain_result("陪伴插件还没加载，暂时查不到好感度哦～")
+            await self._reply(event, "陪伴插件还没加载，暂时查不到好感度哦～")
             return
         record = await self._companion_affinity_record(sender_id)
         if record is None:
-            yield event.plain_result("还没有你的好感度记录，和 bot 聊聊天就会有啦～")
+            await self._reply(event, "还没有你的好感度记录，和 bot 聊聊天就会有啦～")
             return
         try:
             score = int(record.get("relationship_score") or 0)
@@ -1313,7 +1313,7 @@ class ModelPanelPlugin(Star):
         reason = str(state.get("reason") or "")
         if reason and any("\u4e00" <= ch <= "\u9fff" for ch in reason):
             notes.append(f"原因：{reason}")
-        yield event.plain_result(
+        await self._reply(event,
             f"💕 好感度查询\n"
             f"当前分数：{score}（{self._affinity_stage_label(score)}）{extra}\n"
             f"互动状态：{state['label']}（{' · '.join(notes)}）\n"
@@ -3511,6 +3511,39 @@ class ModelPanelPlugin(Star):
         lines.extend(str(x) for x in (notes or []) if x)
         return "\n".join(lines)
 
+    # ------------------------- 直发（绕开「回复时 @ 发送者」） -------------------------
+    #
+    # 为什么不用 ``yield event.plain_result(...)`` / ``yield event.chain_result(...)``：
+    # AstrBot 的 ``ResultDecorateStage`` 会给「**只含 Plain / Image** 的结果链」在最前面插一个
+    # ``At(发送者)``（开关是全局的 ``platform_settings.reply_with_mention``，群聊里开了就会这样）。
+    # 而我们的卡片恰好就是一张 Image —— 于是每张卡片都自带一个 @ 用户：
+    # 群里刷屏、私聊又多余，且用户明确要求「直接发图片」。
+    # **直发**（``event.send``）不进结果链，因此不会被装饰、也不会被改写。
+    # 顺带的好处：``_has_send_oper`` 置位后本轮不会再触发一次 LLM 回复。
+    #
+    # 代价：结果链上的「长文本转图 / 超长转合并转发」等装饰也不再生效 ——
+    # 对卡片无所谓（本来就是图），对纯文本回执反而是好事（我们要的就是原样送达）。
+
+    @staticmethod
+    async def _reply(event: AstrMessageEvent, text: str) -> bool:
+        """直发一条文本。返回是否成功；失败只记日志，不回抛（别让回执失败带崩整轮流程）。"""
+        try:
+            await event.send(MessageChain([Plain(str(text))]))
+            return True
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 发送文本失败（忽略）: {e}")
+            return False
+
+    @staticmethod
+    async def _reply_chain(event: AstrMessageEvent, chain) -> bool:
+        """直发一个消息链（卡片图片用）。"""
+        try:
+            await event.send(chain)
+            return True
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 发送卡片失败（忽略）: {e}")
+            return False
+
     # ================= 巡检与告警 =================
     _ALERT_TITLES = {
         KIND_FAIL: "模型故障告警",
@@ -4365,23 +4398,23 @@ class ModelPanelPlugin(Star):
     async def _start_probe(self, event: AstrMessageEvent, targets: list):
         """开工一次指令探测：占锁 → 后台跑 → 先回执。撞车时礼貌拒绝（不排队）。"""
         if not targets:
-            yield event.plain_result("那些模型已经不在了（可能被删除或改过 id），重新发一次吧。")
+            await self._reply(event, "那些模型已经不在了（可能被删除或改过 id），重新发一次吧。")
             return
         if len(targets) > self._PROBE_MAX_PICK:
             names = "、".join(str(d.get("model") or pid) for pid, d, _p in targets[:5])
-            yield event.plain_result(
+            await self._reply(event,
                 f"一次最多检测 {self._PROBE_MAX_PICK} 个模型，这次选了 {len(targets)} 个"
                 f"（{names} …），少选几个再来～")
             return
         if self._test_all_lock.locked():
-            yield event.plain_result(
+            await self._reply(event,
                 "已经有一轮检测在跑了（手动 / 定时 / 上一条指令），等它结束再发一次～")
             return
         # 先占锁再回执：避免回执到真正开跑之间插进来一次手动一键检测
         await self._test_all_lock.acquire()
         timeout = float(self._test_config()["test_timeout"])
         asyncio.create_task(self._run_command_probe(targets, event.unified_msg_origin, timeout))
-        yield event.plain_result(
+        await self._reply(event,
             f"已开始检测 {len(targets)} 个模型："
             + "、".join(str(d.get("model") or pid) for pid, d, _p in targets)
             + f"\n最坏约 {int(timeout * len(targets))}s 后把结果卡片发回这里。")
@@ -4400,10 +4433,10 @@ class ModelPanelPlugin(Star):
                 view = self._command_scope(await self._health_view(days=_today_days()))
             except Exception as e:
                 logger.warning(f"[ModelPanel] /模型检测 取数失败: {e}")
-                yield event.plain_result(f"读取模型监测数据失败：{e}")
+                await self._reply(event, f"读取模型监测数据失败：{e}")
                 return
             if not view.get("items"):
-                yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
+                await self._reply(event, _NO_COMMAND_SCOPE_HINT)
                 return
             chain = await self._overview_chain(
                 event, view, title="模型检测", badge="选单", kind=self._PICK_PROBE, multi=True,
@@ -4411,25 +4444,24 @@ class ModelPanelPlugin(Star):
                         f"会真实调用模型、产生额度消耗；一次最多 {self._PROBE_MAX_PICK} 个模型",
                         "延迟为最近一次调用耗时；成功率为今天窗口内统计"],
             )
-            yield event.chain_result(chain.chain)
+            await self._reply_chain(event, chain)
             return
         hits, denied = await self._match_models_async(keywords)
         if denied:
-            yield event.plain_result(
+            await self._reply(event,
                 "这些模型没开放指令检测（去模型管理页勾选「指令检测」通道）："
                 + "、".join(str(d.get("display_model") or d.get("id")) for d in denied[:5]))
             return
         if not hits:
-            yield event.plain_result("没找到匹配「" + " ".join(keywords) + "」的模型")
+            await self._reply(event, "没找到匹配「" + " ".join(keywords) + "」的模型")
             return
         if len(hits) > self._PROBE_MAX_TARGETS:
-            yield event.plain_result(
+            await self._reply(event,
                 f"匹配到 {len(hits)} 个，单次最多 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
                 + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6])
                 + "\n也可以直接发 /模型检测 看编号列表。")
             return
-        async for res in self._start_probe(event, hits):
-            yield res
+        await self._start_probe(event, hits)
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("切换系统模型")
@@ -4439,7 +4471,7 @@ class ModelPanelPlugin(Star):
         providers = self._chat_providers()
         if args and args[0] in ("取消", "cancel"):
             _picker_disarm(str(event.unified_msg_origin or ""), _actor_key(event))
-            yield event.plain_result("已取消，没有改动默认模型。")
+            await self._reply(event, "已取消，没有改动默认模型。")
             return
         if not args:
             try:
@@ -4448,10 +4480,10 @@ class ModelPanelPlugin(Star):
                 view = await self._health_view(days=_today_days())
             except Exception as e:
                 logger.warning(f"[ModelPanel] /切换系统模型 取数失败: {e}")
-                yield event.plain_result(f"读取模型监测数据失败：{e}")
+                await self._reply(event, f"读取模型监测数据失败：{e}")
                 return
             if not (view.get("items") or []):
-                yield event.plain_result("当前没有加载任何对话模型。")
+                await self._reply(event, "当前没有加载任何对话模型。")
                 return
             chain = await self._overview_chain(
                 event, view, title="切换系统默认模型", badge="选单",
@@ -4460,7 +4492,7 @@ class ModelPanelPlugin(Star):
                         "列表为全部有效对话模型（不按检测通道过滤）",
                         "/切换系统模型 取消 可关掉挂着的选单"],
             )
-            yield event.chain_result(chain.chain)
+            await self._reply_chain(event, chain)
             return
         # 带参数时按关键词匹配，命中唯一才切，避免猜错
         hits = []
@@ -4472,38 +4504,36 @@ class ModelPanelPlugin(Star):
             if all(pat in hay for pat in pats):
                 hits.append(d)
         if not hits:
-            yield event.plain_result(f"没找到匹配「{' '.join(args)}」的模型，发 /切换系统模型 可以看编号列表")
+            await self._reply(event,
+                f"没找到匹配「{' '.join(args)}」的模型，发 /切换系统模型 可以看编号列表")
             return
         if len(hits) > 1:
-            yield event.plain_result(
+            await self._reply(event,
                 f"「{' '.join(args)}」匹配到 {len(hits)} 个，说具体一点：\n"
                 + "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6]))
             return
-        # _apply_default_model 是 async generator，必须 async for 消费：
-        # 直接 await 一个 generator 会抛 TypeError（回执一条也发不出去）。
-        async for res in self._apply_default_model(event, str(hits[0].get("id"))):
-            yield res
+        await self._apply_default_model(event, str(hits[0].get("id")))
 
     async def _apply_default_model(self, event: AstrMessageEvent, pid: str):
-        """把 pid 写成 AstrBot 的默认对话模型并回执（async generator，用 async for 消费）。"""
+        """把 pid 写成 AstrBot 的默认对话模型并回执。"""
         known = set(self._provider_ids())
         if known and pid not in known:
-            yield event.plain_result("那个序号对应的模型已经不在了（可能被删除或改过 id），重新列一次吧。")
+            await self._reply(event, "那个序号对应的模型已经不在了（可能被删除或改过 id），重新列一次吧。")
             return
         cfg = self._astrbot_config()
         if not isinstance(cfg, dict):
-            yield event.plain_result("读不到 AstrBot 主配置，切换失败。")
+            await self._reply(event, "读不到 AstrBot 主配置，切换失败。")
             return
         before = await self._default_provider_id()
         if not self._set_chat_provider_id(cfg, pid):
-            yield event.plain_result("配置里没有可写的默认模型字段，未做改动。")
+            await self._reply(event, "配置里没有可写的默认模型字段，未做改动。")
             return
         try:
             save = getattr(cfg, "save_config", None)
             if callable(save):
                 save()
         except Exception as e:
-            yield event.plain_result(f"写入配置失败，已放弃切换：{e}")
+            await self._reply(event, f"写入配置失败，已放弃切换：{e}")
             return
         self._sync_default_chat_runtime(pid)
         label = pid
@@ -4513,7 +4543,7 @@ class ModelPanelPlugin(Star):
                 label = str(d.get("display_model") or d.get("model") or pid)
                 break
         logger.info(f"[ModelPanel] 默认对话模型已由指令切换：{before or '未设置'} -> {pid}")
-        yield event.plain_result(
+        await self._reply(event,
             f"已切换系统默认模型：{before or '未设置'} → {label}\n"
             "下一条对话就会走新模型。")
 
@@ -4536,42 +4566,40 @@ class ModelPanelPlugin(Star):
         else:
             # 单选类选单（切换模型 / 看明细）收到多选时**不作废**，让用户重回一个就好
             if len(indices) > 1:
-                yield event.plain_result("这个选单一次只能选一个序号，请只回一个数字～")
+                await self._reply(event, "这个选单一次只能选一个序号，请只回一个数字～")
                 return
             one = self._take_picker(event, indices[0])
             got = None if one is None else (one[0], [one[1]])
         if not got:
-            yield event.plain_result("序号超出范围，按卡片上的数字重新回一次就好～")
+            await self._reply(event, "序号超出范围，按卡片上的数字重新回一次就好～")
             return
         kind, options = got
         if kind == self._PICK_SWITCH:
             pids = _flatten_pids(options)
             if not pids:
-                yield event.plain_result("那个模型已经不在了（可能被删除或改过 id）。")
+                await self._reply(event, "那个模型已经不在了（可能被删除或改过 id）。")
                 return
-            async for res in self._apply_default_model(event, pids[0]):
-                yield res
+            await self._apply_default_model(event, pids[0])
             return
         if kind == self._PICK_STATS:
             pids = set(_flatten_pids(options))
             try:
                 view = self._command_scope(await self._health_view(days=_today_days()))
             except Exception as e:
-                yield event.plain_result(f"读取模型监测数据失败：{e}")
+                await self._reply(event, f"读取模型监测数据失败：{e}")
                 return
             items = [it for it in (view.get("items") or []) if str(it.get("id")) in pids]
             if not items:
-                yield event.plain_result("那个模型已经不在了（可能被删除或改过 id）。")
+                await self._reply(event, "那个模型已经不在了（可能被删除或改过 id）。")
                 return
             chain = await self._detail_chain(items, live_available=bool(view.get("live_available")))
-            yield event.chain_result(chain.chain)
+            await self._reply_chain(event, chain)
             return
         if kind == self._PICK_PROBE:
             targets = self._probe_targets_of(_flatten_pids(options))
-            async for res in self._start_probe(event, targets):
-                yield res
+            await self._start_probe(event, targets)
             return
-        yield event.plain_result("这个选单不支持该操作。")
+        await self._reply(event, "这个选单不支持该操作。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型静音")
@@ -4587,27 +4615,27 @@ class ModelPanelPlugin(Star):
         args = _cmd_args(event).split()
         cfg = getattr(self, "config", None)
         if not hasattr(cfg, "get"):
-            yield event.plain_result("读不到插件配置，改不了告警开关。")
+            await self._reply(event, "读不到插件配置，改不了告警开关。")
             return
         current = bool(cfg.get("alert_notify_enabled", True))
         if args and str(args[0]).strip().lower() in ("状态", "查询", "status"):
-            yield event.plain_result(self._mute_status(current))
+            await self._reply(event, self._mute_status(current))
             return
         word = str(args[0]).strip().lower() if args else ""
         if len(args) > 1 or (word and word not in (_MUTE_ON_WORDS | _MUTE_OFF_WORDS)):
-            yield event.plain_result(
+            await self._reply(event,
                 "用法：/模型静音 —— 切换全部模型的告警推送（再发一次即反向）\n"
                 "也可以明确指定：/模型静音 关、/模型静音 开、/模型静音 状态")
             return
         want = (True if word in _MUTE_ON_WORDS
                 else (False if word in _MUTE_OFF_WORDS else not current))
         if want == current:
-            yield event.plain_result(self._mute_status(current) + "\n（没有改动）")
+            await self._reply(event, self._mute_status(current) + "\n（没有改动）")
             return
         try:
             cfg["alert_notify_enabled"] = bool(want)
         except Exception as e:
-            yield event.plain_result(f"写入配置失败：{e}")
+            await self._reply(event, f"写入配置失败：{e}")
             return
         save = getattr(cfg, "save_config", None)
         if callable(save):
@@ -4620,13 +4648,13 @@ class ModelPanelPlugin(Star):
                     cfg["alert_notify_enabled"] = bool(current)
                 except Exception:
                     pass
-                yield event.plain_result(f"保存配置失败，已放弃改动：{e}")
+                await self._reply(event, f"保存配置失败，已放弃改动：{e}")
                 return
         logger.info(
             f"[ModelPanel] 告警推送全局开关：{'开' if current else '关'} -> "
             f"{'开' if want else '关'}（由指令切换）"
         )
-        yield event.plain_result(self._mute_status(bool(want)))
+        await self._reply(event, self._mute_status(bool(want)))
 
     @staticmethod
     def _mute_status(on: bool) -> str:
@@ -4649,10 +4677,10 @@ class ModelPanelPlugin(Star):
             view = self._command_scope(await self._health_view(days=_today_days()))
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型状态 取数失败: {e}")
-            yield event.plain_result(f"读取模型监测数据失败：{e}")
+            await self._reply(event, f"读取模型监测数据失败：{e}")
             return
         if not view.get("items"):
-            yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
+            await self._reply(event, _NO_COMMAND_SCOPE_HINT)
             return
         chain = await self._overview_chain(
             event, view, title="模型状态", badge="只读",
@@ -4664,7 +4692,7 @@ class ModelPanelPlugin(Star):
                     "「更新」为这一行最近一次记录的时间",
                     "/模型统计 可看单个模型的明细"],
         )
-        yield event.chain_result(chain.chain)
+        await self._reply_chain(event, chain)
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型统计")
@@ -4675,11 +4703,11 @@ class ModelPanelPlugin(Star):
             view = self._command_scope(await self._health_view(days=_today_days()))
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型统计 取数失败: {e}")
-            yield event.plain_result(f"读取模型监测数据失败：{e}")
+            await self._reply(event, f"读取模型监测数据失败：{e}")
             return
         if not keyword:
             if not view.get("items"):
-                yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
+                await self._reply(event, _NO_COMMAND_SCOPE_HINT)
                 return
             chain = await self._overview_chain(
                 event, view, title="模型统计", badge="选单", kind=self._PICK_STATS,
@@ -4687,20 +4715,20 @@ class ModelPanelPlugin(Star):
                         "延迟为最近一次调用耗时；成功率为今天窗口内统计",
                         "也可以直接 /模型统计 <关键词> 一步到位"],
             )
-            yield event.chain_result(chain.chain)
+            await self._reply_chain(event, chain)
             return
         hits = self._view_items_matching(view, keyword)
         if not hits:
-            yield event.plain_result(f"没找到名字里含「{keyword}」的模型～")
+            await self._reply(event, f"没找到名字里含「{keyword}」的模型～")
             return
         if len(hits) > 6:
             names = "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6])
-            yield event.plain_result(
+            await self._reply(event,
                 f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n{names}\n"
                 "也可以发 /模型统计 看编号列表。")
             return
         chain = await self._detail_chain(hits, live_available=bool(view.get("live_available")))
-        yield event.chain_result(chain.chain)
+        await self._reply_chain(event, chain)
 
     async def terminate(self):
         # 必须显式停循环：热重载后旧任务若残留，会出现同一份巡检双份跑、告警双发，

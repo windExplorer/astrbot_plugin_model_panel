@@ -1,5 +1,50 @@
 # 更新日志
 
+## v1.3.16
+
+指令回执改成直发：卡片不再 @ 发送者。
+
+### 现象
+
+用户反馈：发 `/模型状态`（以及其它带卡片的指令）时，卡片前面总跟着一个「@ 发送者」。
+私聊里多余，群里更明显 —— 每来一张卡片就 @ 一次。
+
+### 根因（不在本插件里）
+
+AstrBot 的 `ResultDecorateStage` 会给结果链做装饰，其中一段是：
+
+```python
+can_decorate = all(isinstance(item, (Plain, Image)) for item in result.chain)
+if can_decorate:
+    if self.reply_with_mention and event.get_message_type() != MessageType.FRIEND_MESSAGE:
+        result.chain.insert(0, At(qq=event.get_sender_id(), name=...))
+```
+
+开关是全局的 `platform_settings.reply_with_mention`。我们的卡片**恰好是一张 `Image`**，
+于是命中 `can_decorate`，被插了一个 `At`。
+（同一个 stage 还会做「长文本转图 / 超长转合并转发」，但那些只影响纯文本。）
+
+### 修法
+
+新增 `_reply()` / `_reply_chain()` 两个直发封装（`event.send(MessageChain(...))`），
+全部指令回执改走它们：
+
+- `event.send()` **不进结果链**，结果链上的装饰就都绕过去了 —— 与 user_gateway 的做法一致；
+- 覆盖范围：`/模型状态` `/模型统计` `/模型检测` `/切换系统模型` `/模型静音` `/陪伴分数`
+  以及回序号那条路（`on_number_pick`）的全部回执（图片卡片 + 纯文本提示）；
+- 顺带的好处：直发会置位 `_has_send_oper`，本轮不会再触发一次 LLM 回复；
+- 代价：装饰链里的「长文本转图 / 超长转转发」也不再生效。对卡片无所谓（本来就是图），
+  对文本回执反而更可控（原样送达，不会被改写）；
+- 告警推送（`context.send_message` 给管理员 / 群）本来就是直发，不受影响。
+
+### 自检
+
+- `tests/test_static_guards.py`：
+  - 原来断言「cmd_* 必须是 async generator」——那是 `yield` 时代的代理指标，
+    现在改为「是 async 函数」（AstrBot 的 `call_handler` 两种都支持）；
+  - **新增**静态拦截：源码里出现 `event.plain_result(...)` / `event.chain_result(...)` 即失败。
+    这类回归编译过、单测过，只有群里看得出来，必须静态拦住。
+
 ## v1.3.15
 
 外部检测的结果也要喂进状态机，否则「刚测出故障、面板还是绿的」。

@@ -98,9 +98,10 @@ def check_command_registration(tree: ast.Module) -> None:
             continue
         cmd_text, perm_text, cmd_at, perm_at = registered[meth_name]
         check(want_cmd in cmd_text, f"{meth_name} 指令名为「{want_cmd}」")
-        check(meth_name in methods and isinstance(methods[meth_name], ast.AsyncFunctionDef)
-              and any(isinstance(n, ast.Yield) for n in ast.walk(methods[meth_name])),
-              f"{meth_name} 是 async generator")
+        # AstrBot 的 call_handler 两种都支持（协程 / 异步生成器），所以这里只要求 async。
+        # v1.3.16 起指令回执改成**直发**（见下面的「不许用 plain_result」），自然就不再是生成器了。
+        check(meth_name in methods and isinstance(methods[meth_name], ast.AsyncFunctionDef),
+              f"{meth_name} 是 async 函数")
         if want_perm:
             check(perm_text is not None and want_perm in perm_text, f"{meth_name} 权限为 {want_perm}")
             # AstrBot 由外向内套装饰器：permission_type 必须写在 command 之上才生效
@@ -134,9 +135,27 @@ def check_command_registration(tree: ast.Module) -> None:
         decs = [dec_text(d) for d in meth.decorator_list]
         check(any(want_dec + "(" in d for d in decs),
               f"{meth_name} 带 @{want_dec}(...)，否则永不触发")
-        check(isinstance(meth, ast.AsyncFunctionDef)
-              and any(isinstance(n, ast.Yield) for n in ast.walk(meth)),
-              f"{meth_name} 是 async generator")
+        check(isinstance(meth, ast.AsyncFunctionDef), f"{meth_name} 是 async 函数")
+
+    # 回执必须**直发**：``yield event.plain_result(...)`` 会进 AstrBot 的结果链，
+    # 而 ``ResultDecorateStage`` 会给「只含 Plain / Image 的结果链」最前面插一个
+    # ``At(发送者)``（``platform_settings.reply_with_mention``）—— 卡片就是一张 Image，
+    # 于是每张卡片都自带一个 @ 用户。这类回归编译过、测试过、只有群里看得见，必须静态拦住。
+    bad_reply = [
+        f"{n.value.id}.{n.attr}" for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute)
+        and n.attr in ("plain_result", "chain_result")
+        and isinstance(n.value, ast.Name)
+    ]
+    check(not bad_reply,
+          f"回执一律直发（event.send），不用 {'、'.join(sorted(set(bad_reply))) or 'plain_result/chain_result'}"
+          if not bad_reply else f"回执一律直发，但出现了 {sorted(set(bad_reply))}（会被 @ 发送者）")
+
+    # 有直发就得有人真的用：全部改成直发后，回执发不出去是「指令毫无反应」的翻版
+    check(any(isinstance(n, ast.Attribute) and n.attr in ("_reply", "_reply_chain")
+              for cls_node in [find_plugin_class(tree)] if cls_node
+              for n in ast.walk(cls_node)),
+          "回执走 plugin._reply / _reply_chain（直发封装）")
 
     # @register 误挂到顶层函数上，会让插件类压根没注册——同样静默
     for node in tree.body:
