@@ -254,8 +254,8 @@
               @update:value="(v: number | null) => setVal(editing!, 'rate_multiplier', v)"
               size="small"
               :min="0"
-              :step="0.1"
-              :precision="2"
+              :step="0.01"
+              :precision="4"
               clearable
               style="width: 100%"
             >
@@ -338,15 +338,18 @@ const BILLING = ["unknown", "free", "temp_free", "trial", "paid_overage", "paid"
 const ROLES = ["unknown", "primary", "backup", "fallback", "dedicated", "watch", "retired"];
 // 单价一律「每百万 token」，只有按次单价是每次 —— 单位必须分开标，
 // 否则按次的人会把 0.002 填进 token 价里，算出来的花费差六个数量级。
+// precision 必须给到 **8**（v1.4.2）：n-input-number 的 precision 会把值**静默四舍五入**，
+// 以前写 4，填 0.00025 这类便宜模型的缓存价/按量价会被悄悄改成 0.0003 ——
+// 界面上毫无提示，花费却已经算错了；后端是 REAL 存原值，不设这个限制，问题只在前端。
 const PRICE_FIELDS = [
   { key: "price_input_per_m", label: (tr: any) => tr("profile.fPriceInput"),
-    step: 0.5, precision: 4, unitKey: "profile.perMillion" },
+    step: 0.01, precision: 8, unitKey: "profile.perMillion" },
   { key: "price_output_per_m", label: (tr: any) => tr("profile.fPriceOutput"),
-    step: 0.5, precision: 4, unitKey: "profile.perMillion" },
+    step: 0.01, precision: 8, unitKey: "profile.perMillion" },
   { key: "price_cached_per_m", label: (tr: any) => tr("profile.fPriceCached"),
-    step: 0.1, precision: 4, unitKey: "profile.perMillion" },
+    step: 0.001, precision: 8, unitKey: "profile.perMillion" },
   { key: "price_per_call", label: (tr: any) => tr("profile.fPricePerCall"),
-    step: 0.001, precision: 6, unitKey: "profile.perCall" },
+    step: 0.0001, precision: 8, unitKey: "profile.perCall" },
 ] as const;
 
 const data = ref<HealthResponse | null>(null);

@@ -111,6 +111,21 @@ for prefix, keys in DYNAMIC.items():
         if not has_key(prefix + k):
             fails.append(f"动态 i18n 键缺失 -> {prefix}{k}")
 
+# 7) 单价输入框的 precision 必须 ≥ 8。n-input-number 的 precision 会把值**静默四舍五入**：
+#    以前写 4，填 0.00025 这类便宜模型的缓存价会被悄悄改成 0.0003 ——
+#    界面上毫无提示，花费却已经算错了（用户反馈过）。后端是 REAL 存原值，限制只在前端。
+models_src = (SRC / "views/ModelsView.vue").read_text(encoding="utf-8")
+m = re.search(r"const PRICE_FIELDS = \[(.*?)\] as const;", models_src, re.S)
+if not m:
+    fails.append("ModelsView.vue: 找不到 PRICE_FIELDS（单价输入框定义被挪走了？）")
+else:
+    precisions = [int(x) for x in re.findall(r"precision:\s*(\d+)", m.group(1))]
+    if len(precisions) < 4:
+        fails.append(f"ModelsView.vue: PRICE_FIELDS 只有 {len(precisions)} 个 precision（应为 4 个）")
+    bad = [p for p in precisions if p < 8]
+    if bad:
+        fails.append(f"ModelsView.vue: 单价 precision 出现 {bad}（必须 ≥ 8，否则小数被静默舍掉）")
+
 print(f"扫描 {len(list((SRC / 'views').glob('*.vue')))} 个视图 + App.vue")
 if fails:
     print(f"\n问题 {len(fails)} 项：")

@@ -495,7 +495,7 @@
     "priceGroup": "计费明细",
     "perMillion": "元/百万 token",
     "perCall": "元/次",
-    "priceHint": "单价一律按「每百万 token」填，缓存价留空则按输入价计算。DeepSeek 一类缓存命中价低很多，不填会明显高估成本。",
+    "priceHint": "单价一律按「每百万 token」填，缓存价留空则按输入价计算，小数最多可填 8 位（便宜模型的缓存价 / 按量价常到小数点后 6 位以上）。DeepSeek 一类缓存命中价低很多，不填会明显高估成本。",
     "curNone": "不设置",
     "scopeGroup": "参与哪些检测",
     "followDefault": "跟随默认",
