@@ -4418,8 +4418,12 @@ class ModelPanelPlugin(Star):
             yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
             return
         chain = await self._overview_chain(
-            event, view, title="模型实时状态", badge="实时",
-            footer=["延迟为最近一次调用耗时；成功率为今天窗口内统计",
+            event, view, title="模型状态", badge="只读",
+            # 口径必须写在卡片上：这张卡读的是**已有记录**，不是此刻去探测模型。
+            # 标成「实时」会让人以为数字是刚打出来的（用户就是这么指出的），
+            # 于是「模型明明挂了，卡上却是绿的」会变成一场没必要的排查。
+            footer=["数据来自真实调用的记录，不是此刻探测",
+                    "延迟为最近一次调用耗时；成功率为今天窗口内统计",
                     "/模型统计 可看单个模型的明细"],
         )
         yield event.chain_result(chain.chain)
