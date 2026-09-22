@@ -4064,8 +4064,7 @@ class ModelPanelPlugin(Star):
         names: dict[str, str] = {}
         tcfg = self._test_config()
         modes = await self._probe_modes()
-        concurrency = max(1, min(3, MonitorConfig.from_config(self.config).probe_concurrency))
-        sem = asyncio.Semaphore(concurrency)
+        sem = asyncio.Semaphore(self.probe_parallelism())
 
         async def one(item):
             pid, d, provider = item
@@ -4274,11 +4273,37 @@ class ModelPanelPlugin(Star):
         finally:
             self._test_all_lock.release()
 
-    @staticmethod
-    def external_available() -> dict:
-        """给联动方探活用的静态信息（不碰数据库、不碰网络）。"""
-        return {"plugin": "astrbot_plugin_model_panel", "api": 1,
-                "trigger": ModelPanelPlugin.EXTERNAL_TRIGGER}
+    def external_available(self) -> dict:
+        """给联动方探活用的信息（只读自己的配置，不碰数据库、不碰网络）。
+
+        ``probe_concurrency`` / ``probe_timeout`` 是给联动方**估时**用的：
+        联动方一次可能要点十几个模型（它默认不限量），得能告诉用户「最坏等多久」，
+        而并发数与超时都是本插件定的，它猜不到也不该猜 —— 两边猜的数字迟早对不上。
+        """
+        return {"plugin": "astrbot_plugin_model_panel", "api": 2,
+                "trigger": self.EXTERNAL_TRIGGER,
+                "probe_concurrency": self.probe_parallelism(),
+                "probe_timeout": self.probe_timeout_default()}
+
+    def probe_parallelism(self) -> int:
+        """一次探测同时打几个模型。
+
+        指令 / 定时 / 联动三条路都走 ``_probe_batch``，并发数只有这一个来源 ——
+        自己再算一遍的地方迟早会和配置脱节。上限 3 是刻意压着的：
+        中转站对并发很敏感，一次打太多容易被判成滥用。
+        """
+        try:
+            n = int(MonitorConfig.from_config(self.config).probe_concurrency)
+        except Exception:
+            n = 3
+        return max(1, min(3, n))
+
+    def probe_timeout_default(self) -> float:
+        """单模型探测的默认超时（秒）。给联动方估时用。"""
+        try:
+            return float(self._test_config()["test_timeout"])
+        except Exception:
+            return 45.0
 
     # ================= 序号选单与通用卡片 =================
     # 所有聊天指令共用一张「模型总览卡」：按供应商分组、统一编号。
@@ -4287,7 +4312,10 @@ class ModelPanelPlugin(Star):
     _PICK_PROBE = "probe"    # 模型检测
     _PICK_SWITCH = "switch"  # 切换系统默认模型
     _PICK_STATS = "stats"    # 模型统计（看明细）
-    _PROBE_MAX_PICK = 10     # 回序号多选时一次最多测几个（分组可能很大，得有闸）
+    # 回序号多选时一次最多测几个。v1.3.19 从 10 提到 30：用户明确说过
+    # 「应该直接检测该分组所有可选模型一起测」—— 回一个分组序号却被告知「太多、少选几个」，
+    # 与「整组一起测」是矛盾的。真管成本的是每日预算与并发上限（见 monitor 的护栏）。
+    _PROBE_MAX_PICK = 30
 
     def _arm_picker(self, event: AstrMessageEvent, kind: str, options: list,
                     multi: bool = False) -> None:
@@ -4415,10 +4443,14 @@ class ModelPanelPlugin(Star):
         await self._test_all_lock.acquire()
         timeout = float(self._test_config()["test_timeout"])
         asyncio.create_task(self._run_command_probe(targets, event.unified_msg_origin, timeout))
+        # 估时按**轮数**算：探测是并发跑的（`_probe_batch`），
+        # 早先写成 `timeout × 个数` 会给出 10 个模型「最坏 450s」这种把人吓退的数字。
+        conc = self.probe_parallelism()
+        rounds = -(-len(targets) // conc)
         await self._reply(event,
             f"已开始检测 {len(targets)} 个模型："
             + "、".join(str(d.get("model") or pid) for pid, d, _p in targets)
-            + f"\n最坏约 {int(timeout * len(targets))}s 后把结果卡片发回这里。")
+            + f"\n{conc} 个并发，最坏约 {int(round(rounds * timeout))}s 后把结果卡片发回这里。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型检测", alias={"检测模型"})
