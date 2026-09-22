@@ -195,17 +195,57 @@ DOWN_FAIL_RATE = 0.50
 # 卡片/选单上的状态文案。集中一处，免得同一个状态在两张卡上叫法不一样。
 _STATE_LABELS = {"healthy": "正常", "degraded": "降级", "down": "故障", "unknown": "无数据"}
 
-# 序号选单：``f"{umo}|{actor}"`` -> {kind, pids, expires}。
+# 聊天指令只展示「指令检测」通道开放的模型（卡片与能测的范围必须一致）。
+# 一个都没开时这张卡必然是空的，所以这句提示在四个指令里共用。
+_NO_COMMAND_SCOPE_HINT = (
+    "没有任何模型开放了「指令检测」通道，所以这张卡是空的。\n"
+    "去 WebUI 的「模型管理」页，把需要在这里关注的模型勾上「指令检测」。"
+)
+
+# /模型静音 的显式开关词（不带参数时是「切换」，带了就按词意走）
+_MUTE_ON_WORDS = {"开", "开启", "打开", "启用", "恢复", "on", "true", "1"}
+_MUTE_OFF_WORDS = {"关", "关闭", "静音", "取消", "解除", "off", "false", "0", "mute"}
+
+# 序号选单：``f"{umo}|{actor}"`` -> {kind, options, multi, expires}。
 # 放模块级而不是实例级，是因为拦数字消息的 CustomFilter 拿不到插件实例，
 # 而它必须能在 filter 阶段就判断「这个会话有没有挂过选单」——
 # 否则就得在 handler 里决定吞不吞消息，而 handler 一旦匹配上，
 # 日常发一句「3」的人就会被我们的逻辑拦下来。
+#
+# 选项表（``options``）而不是一串 pid：卡片上的序号和「回数字」必须是**同一份表**，
+# 而且现在序号既可能指向一个模型、也可能指向一个供应商分组（回组号 = 选整组），
+# 只有存 {label, pids, group} 这种结构才表达得清楚。
 _PICKERS: dict[str, dict] = {}
 _PICKER_TTL_SEC = 180
+# 一条消息里最多回这么多个序号（多选场景的防御性上限，正常用不到）
+_MAX_PICKS = 8
+
+# 「整条消息就是一串序号」的识别式：``3`` / ``1 3`` / ``1,3`` / ``1、3``
+_NUM_LIST_RE = re.compile(r"^\d{1,3}(?:[\s,，、]+\d{1,3}){0,%d}$" % (_MAX_PICKS - 1))
+_INDEX_SPLIT_RE = re.compile(r"[\s,，、]+")
 
 
 def _picker_key(umo: str, actor: str) -> str:
     return f"{umo}|{actor}"
+
+
+def _parse_index_list(text: Any) -> list[int]:
+    """把「1 3 5」/「1,3」解析成 [1, 3, 5]；解析不出返回空表。
+
+    去重但保序：用户回「3 3」不该被执行两次。
+    """
+    raw = str(text or "").strip()
+    if not _NUM_LIST_RE.match(raw):
+        return []
+    out: list[int] = []
+    for part in _INDEX_SPLIT_RE.split(raw):
+        try:
+            n = int(part)
+        except (TypeError, ValueError):
+            return []
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def _picker_prune() -> None:
@@ -214,35 +254,107 @@ def _picker_prune() -> None:
         _PICKERS.pop(key, None)
 
 
-def _picker_arm(umo: str, actor: str, kind: str, pids: list) -> None:
+def _normalize_options(options: list) -> list[dict]:
+    """选项归一化：允许直接传 pid 字符串表（老调用点与自检脚本都这么用）。"""
+    out: list[dict] = []
+    for i, raw in enumerate(list(options or []), start=1):
+        if isinstance(raw, dict):
+            item = dict(raw)
+        else:
+            text = str(raw or "")
+            item = {"label": text, "pids": [text]}
+        item.setdefault("label", "")
+        item["index"] = int(item.get("index") or i)
+        item["pids"] = [str(p) for p in (item.get("pids") or ([item["label"]] if item["label"] else [])) if str(p)]
+        item["group"] = bool(item.get("group"))
+        out.append(item)
+    return out
+
+
+def _picker_arm(umo: str, actor: str, kind: str, options: list, multi: bool = False) -> None:
     _picker_prune()
     _PICKERS[_picker_key(umo, actor)] = {
-        "kind": kind, "pids": list(pids), "expires": time.time() + _PICKER_TTL_SEC,
+        "kind": kind,
+        "options": _normalize_options(options),
+        "multi": bool(multi),
+        "expires": time.time() + _PICKER_TTL_SEC,
     }
+
+
+def _picker_entry(umo: str, actor: str) -> Optional[dict]:
+    """取未过期的选单（过期的顺手清掉）。领取前想先看看「能不能多选」时用。"""
+    key = _picker_key(umo, actor)
+    entry = _PICKERS.get(key)
+    if not entry:
+        return None
+    if float(entry.get("expires", 0) or 0) <= time.time():
+        _PICKERS.pop(key, None)
+        return None
+    return entry
 
 
 def _picker_peek(umo: str, actor: str) -> bool:
     """这个 (会话, 人) 有没有挂着未过期的选单。filter 阶段用，不作废。"""
-    entry = _PICKERS.get(_picker_key(umo, actor))
-    return bool(entry and entry.get("expires", 0) > time.time())
+    return _picker_entry(umo, actor) is not None
 
 
 def _picker_disarm(umo: str, actor: str) -> None:
     _PICKERS.pop(_picker_key(umo, actor), None)
 
 
-def _picker_take(umo: str, actor: str, index: int):
-    """按序号取选单项并作废。取完就作废，避免同一串数字被重复执行。"""
+def _picker_take_multi(umo: str, actor: str, indices: list):
+    """按序号领取（可多个），返回 ``(kind, [option, ...])``；取完即作废。
+
+    **按选项自带的 ``index`` 查，而不是按列表下标**：卡片承诺的就是「回这个号」，
+    万一以后有人拿一份裁剪过的选项表来挂选单（下标 ≠ 号），按号查才不会被静默错位。
+    越界返回 ``None`` 且**不作废** —— 用户回了个不存在的数字时应该能重输，
+    而不是让整张卡片白白失效（旧版就是这个语义，继续保留）。
+    """
     key = _picker_key(umo, actor)
-    entry = _PICKERS.get(key)
-    if not entry or entry.get("expires", 0) <= time.time():
-        _PICKERS.pop(key, None)
+    entry = _picker_entry(umo, actor)
+    if not entry:
         return None
-    pids = entry.get("pids") or []
-    if index < 1 or index > len(pids):
+    options = entry.get("options") or []
+    if not options:
+        return None
+    by_index: dict[int, dict] = {}
+    for opt in options:
+        try:
+            n = int(opt.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_index.setdefault(n, opt)
+    picked: list[dict] = []
+    seen: set = set()
+    for idx in list(indices or []):
+        opt = by_index.get(int(idx))
+        if opt is None:
+            return None
+        if idx in seen:
+            continue
+        seen.add(idx)
+        picked.append(opt)
+    if not picked:
         return None
     _PICKERS.pop(key, None)
-    return str(entry.get("kind") or ""), str(pids[index - 1])
+    return str(entry.get("kind") or ""), picked
+
+
+def _picker_take(umo: str, actor: str, index: int):
+    """单个序号领取，返回 ``(kind, option)``。越界返回 None 且不作废。"""
+    got = _picker_take_multi(umo, actor, [int(index)])
+    return None if got is None else (got[0], got[1][0])
+
+
+def _flatten_pids(options: list) -> list[str]:
+    """把选中的选项摊平成去重、保序的 provider id 表（分组会摊成组内所有模型）。"""
+    out: list[str] = []
+    for opt in list(options or []):
+        for pid in (opt.get("pids") or []):
+            pid = str(pid or "")
+            if pid and pid not in out:
+                out.append(pid)
+    return out
 
 
 def _actor_key(event: AstrMessageEvent) -> str:
@@ -270,15 +382,19 @@ def _actor_key(event: AstrMessageEvent) -> str:
 
 
 class NumberPickerFilter(astr_filter.CustomFilter):
-    """只在「整条消息就是一个数字」且这个会话+这个人挂着未过期选单时才放行。
+    """只在「整条消息就是一串序号」且这个会话+这个人挂着未过期选单时才放行。
 
     两条都要在 filter 阶段判完：如果先进了 handler 再决定不管，
     普通用户日常发一句「3」就会被插件吃掉不回话 —— 那是最难排查的投诉之一。
+
+    允许 ``1 3 5`` / ``1,3`` 这种多选写法（``/模型检测`` 支持一次点几个模型），
+    但**整条消息必须只有数字和分隔符**：夹了任何汉字就一律不认，
+    日常聊天里的「3楼见」「12345」照旧走原来的流程。
     """
 
     def filter(self, event, cfg) -> bool:
-        text = str(getattr(event, "message_str", "") or "").strip()
-        if not text.isdigit() or len(text) > 3:
+        text = re.sub(r"\s+", " ", str(getattr(event, "message_str", "") or "").strip())
+        if not _NUM_LIST_RE.match(text):
             return False
         return _picker_peek(str(event.unified_msg_origin or ""), _actor_key(event))
 
@@ -370,6 +486,29 @@ def _fmt_success(fail_rate) -> str:
         return "-"
 
 
+def _name_sort_key(value) -> tuple:
+    """按名字排序的 key：小写化 + 原文兜底。
+
+    卡片现在**一律按名字排序**（供应商、模型名各自升序），而序号选单要求顺序稳定：
+    同一份数据刷新两次不能换顺序，否则用户照着上一条卡片回的序号会指到别的模型。
+    """
+    text = str(value if value is not None else "").strip()
+    return (text.lower(), text)
+
+
+def _scope_label(days: float) -> str:
+    """窗口天数 → 给人看的范围说法（今天 / 近 N 天）。"""
+    try:
+        d = float(days)
+    except (TypeError, ValueError):
+        return ""
+    if d <= 0:
+        return ""
+    if abs(d - _today_days()) < 0.02:
+        return "今天"
+    return f"近 {d:g} 天"
+
+
 def _cmd_args(event: AstrMessageEvent) -> str:
     """取指令的参数部分（第一个 token 之后的所有内容）。
 
@@ -384,13 +523,8 @@ def _cmd_args(event: AstrMessageEvent) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-def _parse_duration(text: Any) -> int:
-    """把 ``30m`` / ``2h`` / ``1d`` / ``90`` 解析成秒。解析不出来返回 0，由调用方兜默认值。"""
-    m = re.fullmatch(r"(\d+)\s*([smhd]?)", str(text or "").strip().lower())
-    if not m:
-        return 0
-    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2) or "m"]
-    return int(m.group(1)) * unit
+# v1.4.0 起 /模型静音 只做全局开关，逐模型静音连带它的时长解析一并下线
+# （状态机里的 muted_until 仍然保留：将来要在 WebUI 上做单模型静音时是现成的）。
 
 
 # 陪伴插件的 provider 配置真实存放在 schema 分组 model_assignment_config 下，
@@ -3014,7 +3148,6 @@ class ModelPanelPlugin(Star):
                     pass
         return {"ok": False, "latency_ms": None, "ttft_ms": None, "error_code": code, "error": msg}
     # ================= 卡片输出与查询指令 =================
-    _STATE_ORDER = {"down": 0, "degraded": 1, "unknown": 2, "healthy": 3}
     _BILLING_LABELS = {
         "unknown": "",
         "free": "免费",
@@ -3039,11 +3172,10 @@ class ModelPanelPlugin(Star):
 
         这张卡要列**全部**模型，每多一行装饰就多一分不可读，所以角色、计费、备注
         这些档案信息都不进来，只有故障原因、静音、限时免费到期才值得占第二行。
+        「默认模型」也不在这里 —— 它已经由行内那个胶囊标签表达（更显眼，且不占第二行）。
         """
         parts = []
         billing = item.get("billing") or {}
-        if item.get("is_default"):
-            parts.append("默认模型")
         if str(billing.get("type") or "") == "temp_free":
             bl = self._billing_label(billing)
             if bl:
@@ -3097,118 +3229,170 @@ class ModelPanelPlugin(Star):
         out["samples"] = sum(int((it.get("window") or {}).get("total") or 0) for it in items)
         return out
 
-    def _card_payload(self, view: dict, title: str, badge: str, detailed: bool = False):
-        """把视图表转成卡片要的 stats / columns / rows。
+    def _sorted_vendor_groups(self, items: list) -> list:
+        """按供应商分组、组内按模型名排序 —— **一律按名字**，不按状态。
 
-        总览卡**不折叠行数**：用户要的是「一眼看完所有模型谁挂了」，截断会把恰好
-        故障的那个藏起来，而它正是这张卡存在的理由。行高已经压到 44px，
-        超过约 15 行由渲染器自动折成两栏。
+        旧版把「组内最坏状态」浮到最上面：看着聪明，但每次刷新顺序都可能变，
+        而这张卡现在是「先看序号、再回数字」的入口 —— 顺序稳定比故障优先重要得多。
         """
-        items = list(view.get("items") or [])
-        # 先按供应商分组：同名模型挂在不同渠道时，只有分组才分得清是谁。
-        # 组间按「组内最坏状态」排，出问题的供应商整体浮到上面。
-        def worst(list_items):
-            return min((self._STATE_ORDER.get(str(it.get("state")), 9) for it in list_items), default=9)
-
         by_vendor: dict[str, list] = {}
         for it in items:
             by_vendor.setdefault(str(it.get("name") or "未归组供应商"), []).append(it)
-        ordered = []
-        for vendor, group in sorted(by_vendor.items(), key=lambda kv: (worst(kv[1]), kv[0])):
-            for it in sorted(group, key=lambda it: (
-                    self._STATE_ORDER.get(str(it.get("state")), 9),
-                    -int((it.get("calls") or {}).get("counted")
-                         or (it.get("window") or {}).get("total") or 0))):
-                row = {
-                    "group": vendor,
-                    "state": it.get("state"),
-                    "name": str(it.get("model") or it.get("display_model") or it.get("id") or "(未知)"),
-                }
-                w = it.get("window") or {}
-                last = it.get("last") or {}
-                # 有逐次埋点就以它为准：核心那张表在「主模型失败、备用救回来」时
-                # 会把整轮记到备用模型头上，于是面板报 100% 成功而日志里全是失败。
-                c = it.get("calls") or {}
-                c_counted = int(c.get("counted") or 0)
-                if c_counted:
-                    rate = c.get("fail_rate")
-                    cl = c.get("last") or {}
-                    lat = cl.get("ttft_ms") or cl.get("latency_ms") or c.get("avg_latency_ms")
-                    ok_flag = bool(cl.get("ok"))
-                    fail_n, total_n = int(c.get("fail") or 0), c_counted
-                else:
-                    rate = w.get("fail_rate")
-                    lat = last.get("ttft_ms") or last.get("latency_ms")
-                    ok_flag = bool(last.get("ok")) if last else True
-                    fail_n = int(w.get("fail") or 0)
-                    total_n = int(w.get("counted") or 0)
-                counted = total_n
-                if detailed:
-                    row["sub"] = self._row_sub(it)
-                    row["cells"] = [
-                        _fmt_ms(c.get("avg_ttft_ms") if c_counted else w.get("avg_ttft_ms")),
-                        _fmt_ms(w.get("p95_ttft_ms")),
-                        _fmt_ms(c.get("avg_latency_ms") if c_counted else w.get("avg_latency_ms")),
-                        _fmt_success(rate) if counted else "-",
-                        f"{fail_n}/{total_n}",
-                    ]
-                else:
-                    note = self._row_note(it)
-                    # 失败次数直接写进副标题：这正是之前看不见的那个数
-                    if fail_n:
-                        note = (f"失败 {fail_n} 次" + (f" · {note}" if note else ""))
-                    elif not ok_flag and last:
-                        note = (f"最近一次失败 · {note}" if note else "最近一次失败")
-                    row["sub"] = note
-                    row["cells"] = [
-                        _fmt_ms(lat) if (lat or c_counted or last) else "-",
-                        _fmt_success(rate) if counted else "-",
-                    ]
-                ordered.append(row)
-        rows = ordered
+        return [
+            (vendor, sorted(by_vendor[vendor],
+                            key=lambda it: _name_sort_key(it.get("model")
+                                                          or it.get("display_model")
+                                                          or it.get("id"))))
+            for vendor in sorted(by_vendor, key=_name_sort_key)
+        ]
+
+    def _card_row_for(self, item: dict, index: int, detailed: bool = False) -> dict:
+        """单个模型 → 卡片行（含右对齐数值列）。
+
+        数值口径与面板一致：有逐次埋点就以它为准 —— 核心 provider_stats 在
+        「主模型失败、备用救回来」时会把整轮记到备用模型头上，按它算就报 100% 成功。
+        """
+        w = item.get("window") or {}
+        last = item.get("last") or {}
+        c = item.get("calls") or {}
+        c_counted = int(c.get("counted") or 0)
+        if c_counted:
+            rate = c.get("fail_rate")
+            cl = c.get("last") or {}
+            lat = cl.get("ttft_ms") or cl.get("latency_ms") or c.get("avg_latency_ms")
+            ok_flag = bool(cl.get("ok"))
+            fail_n, total_n = int(c.get("fail") or 0), c_counted
+        else:
+            rate = w.get("fail_rate")
+            lat = last.get("ttft_ms") or last.get("latency_ms")
+            ok_flag = bool(last.get("ok")) if last else True
+            fail_n = int(w.get("fail") or 0)
+            total_n = int(w.get("counted") or 0)
+        row = {
+            "index": index,
+            "state": str(item.get("state") or "unknown"),
+            "label": str(item.get("model") or item.get("display_model")
+                         or item.get("id") or "(未知)"),
+            # 「默认」做成行内胶囊而不是第二行小字：切模型时最要紧的就是认清当前那个
+            "tag": "默认" if item.get("is_default") else ("静音" if item.get("muted") else ""),
+            "highlight": bool(item.get("is_default")),
+        }
+        if detailed:
+            row["note"] = self._row_sub(item)
+            row["cells"] = [
+                _fmt_ms(c.get("avg_ttft_ms") if c_counted else w.get("avg_ttft_ms")),
+                _fmt_ms(w.get("p95_ttft_ms")),
+                _fmt_ms(c.get("avg_latency_ms") if c_counted else w.get("avg_latency_ms")),
+                _fmt_success(rate) if total_n else "-",
+                f"{fail_n}/{total_n}",
+            ]
+            return row
+        note = self._row_note(item)
+        # 失败次数直接写进副标题：这正是旧版看不见的那个数
+        if fail_n:
+            note = (f"失败 {fail_n} 次" + (f" · {note}" if note else ""))
+        elif not ok_flag and last:
+            note = (f"最近一次失败 · {note}" if note else "最近一次失败")
+        row["note"] = note
+        row["cells"] = [
+            _fmt_ms(lat) if (lat or c_counted or last) else "-",
+            _fmt_success(rate) if total_n else "-",
+        ]
+        return row
+
+    def _grouped_card_rows(self, view: dict, *, numbered: bool = True,
+                           detailed: bool = False) -> tuple[list[dict], list[dict]]:
+        """生成「卡片行表」与「选单选项表」——两者**共用同一份序号**。
+
+        Returns:
+            ``(rows, options)``：``rows`` 直接喂 ``render_card``；
+            ``options`` 喂 ``_picker_arm``，且 ``options[i]["index"] == i + 1``。
+            模型行与分组行在同一个数字空间里连续编号（回组号 = 选整组）。
+        """
+        rows: list[dict] = []
+        options: list[dict] = []
+        n = 0
+        for vendor, group in self._sorted_vendor_groups(list(view.get("items") or [])):
+            n += 1
+            rows.append({"kind": "group", "index": n, "label": vendor,
+                         "note": f"{len(group)} 个模型"})
+            options.append({
+                "index": n, "group": True, "label": vendor, "state": "",
+                "pids": [str(it.get("id")) for it in group if it.get("id")],
+            })
+            for it in group:
+                n += 1
+                rows.append(self._card_row_for(it, n, detailed))
+                options.append({
+                    "index": n, "group": False,
+                    "label": str(it.get("model") or it.get("display_model")
+                                 or it.get("id") or ""),
+                    "state": str(it.get("state") or "unknown"),
+                    "pids": [str(it.get("id"))] if it.get("id") else [],
+                })
+        if not numbered:
+            for r in rows:
+                r.pop("index", None)
+        return rows, options
+
+    def _counts_stats(self, view: dict) -> list[dict]:
+        """头部那行汇总点：正常 / 降级 / 故障 / 无数据。"""
         counts = view.get("counts") or {}
-        stats = [
+        return [
             {"label": "正常", "value": str(int(counts.get("healthy") or 0)), "state": "healthy"},
             {"label": "降级", "value": str(int(counts.get("degraded") or 0)), "state": "degraded"},
             {"label": "故障", "value": str(int(counts.get("down") or 0)), "state": "down"},
             {"label": "无数据", "value": str(int(counts.get("unknown") or 0)), "state": "unknown"},
         ]
-        if detailed:
-            # 明细模式看的就是单个模型的数字，顶部再放全局计数只是噪音
-            stats = []
-        columns = (["首字", "首字P95", "整轮", "成功率", "失败"] if detailed
-                   else ["延迟", "成功率"])
-        # 卡片是发到聊天里的，脚注一句就够：口径细节留在面板和文档里，不往图上抄
-        notes = ["明细卡各列分别标注统计口径" if detailed else "延迟为最近一次调用耗时"]
-        if not view.get("live_available"):
-            notes[0] = "部分数据暂不可用"
-        notes.append(time.strftime("%m-%d %H:%M"))
-        return stats, columns, rows, notes
 
-    async def _render_status_card(self, view: dict, title: str, badge: str, detailed: bool = False):
-        """渲染状态卡片。返回 PNG bytes；字体不可用时返回 None，调用方降级发文本。"""
-        stats, columns, rows, notes = self._card_payload(view, title, badge, detailed)
+    def _card_meta(self, scope: str = "今天", extra: str = "") -> str:
+        """头部副信息：统计范围 · 附加说明 · 统计时刻。
+
+        时间戳放头部而不是脚注：脚注现在是「怎么用这张卡」的提示位，
+        把口径和「回几」挤在一行会两边都读不清。
+        """
+        return " · ".join(p for p in (scope, extra, time.strftime("%m-%d %H:%M")) if p)
+
+    async def _card_png(self, *, title: str, badge: str = "", stats: Optional[list] = None,
+                        columns: Optional[list] = None, rows: Optional[list] = None,
+                        notes: Optional[list] = None, headline: str = "", meta: str = "",
+                        numbered: bool = False, width: int = 0) -> Optional[bytes]:
+        """渲染卡片。返回 PNG bytes；字体不可用时返回 None，调用方降级发文本。
+
+        Pillow 是 CPU 密集的，必须 ``to_thread`` —— 直接在事件循环里画会卡住整条消息管线。
+        """
         cfg = getattr(self, "config", None)
         font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
-        # Pillow 是 CPU 密集的，直接在事件循环里画会卡住整条消息管线
         return await asyncio.to_thread(
-            render_card, title, badge, stats, columns, rows, notes, font
+            render_card, title, badge, stats or [], columns or [], rows or [], notes or [],
+            font, headline=headline, meta=meta, numbered=numbered, width=width,
         )
 
-    def _status_text(self, view: dict, title: str) -> str:
-        """没有可用中文字体时的纯文本降级。丑，但比发一张豆腐块图或报错好。"""
-        stats, columns, rows, notes = self._card_payload(view, title, "", False)
-        lines = [f"{title}  " + " ".join(f"{s['label']}{s['value']}" for s in stats)]
-        prev_group: object = object()
+    def _rows_text(self, title: str, rows: list, *, stats: Optional[list] = None,
+                   notes: Optional[list] = None, headline: str = "") -> str:
+        """没有可用中文字体时的纯文本降级。丑，但比发一张豆腐块图或报错好。
+
+        序号照旧带上：用户要回的就是它，图片发不出来时更不能丢。
+        """
+        head = str(title or "")
+        if headline:
+            head += f"｜{headline}"
+        if stats:
+            head += "  " + " ".join(f"{s.get('label')}{s.get('value')}" for s in stats)
+        lines = [head]
         for r in rows:
-            group = r.get("group")
-            if group and group != prev_group:
-                lines.append(f"— {group} —")
-            prev_group = group or None
-            lines.append(f"[{r['state']}] {r['name']}  " + " / ".join(r["cells"]))
-            if r.get("sub"):
-                lines.append(f"    {r['sub']}")
-        lines.extend(notes[:2])
+            if r.get("kind") == "group":
+                lines.append(f"— {r.get('label')} —")
+                continue
+            idx = f"{r.get('index')}. " if r.get("index") else ""
+            # 图上状态是色点，纯文本里没有颜色，得把状态词补回来（否则看不出谁坏了）
+            state = _STATE_LABELS.get(str(r.get("state") or ""), "")
+            mark = f"[{state}] " if state else ""
+            tail = " / ".join(str(x) for x in (r.get("cells") or []))
+            lines.append(f"{idx}{mark}{r.get('label')}  {tail}".rstrip())
+            if r.get("note"):
+                lines.append(f"    {r['note']}")
+        lines.extend(str(x) for x in (notes or []) if x)
         return "\n".join(lines)
 
     # ================= 巡检与告警 =================
@@ -3331,6 +3515,12 @@ class ModelPanelPlugin(Star):
         重试的理由：刚装上时 ``admins_id`` 往往还是默认占位值，若不重试，
         第一批告警会被静默吞掉，而「没收到告警」看起来永远像「一切正常」。
         """
+        # 全局静音（/模型静音）时一条都不发，**补发也一并停掉**：
+        # 只堵新增、放任补发的话，用户按了静音仍然会被历史事件刷屏 —— 那等于没静音。
+        # 静音期间不写 notified_at，所以取消静音后 pending_alerts 会把它们补上，不丢。
+        if not cfg.notify_enabled:
+            logger.debug("[ModelPanel] 告警推送已全局关闭（/模型静音），本轮不投递")
+            return
         groups: dict[str, list] = {}
         for d in [x for x in decisions if x.should_notify]:
             groups.setdefault(d.kind, []).append(d)
@@ -3390,20 +3580,22 @@ class ModelPanelPlugin(Star):
                 cells = [str(det.get("days_left", "?"))]
             rows.append({
                 "state": "down" if kind == KIND_FAIL else ("degraded" if kind == KIND_FREE_EXPIRING else "healthy"),
-                "name": names.get(d.provider_id) or d.provider_id,
-                "sub": redact(d.reason),
+                "label": names.get(d.provider_id) or d.provider_id,
+                "note": redact(d.reason),
                 "cells": cells,
             })
         notes = []
         if kind == KIND_FAIL:
-            notes.append(f"冷却 {cooldown_min} 分钟内不重复推送 · /模型静音 可临时关闭")
+            notes.append(f"冷却 {cooldown_min} 分钟内不重复推送 · /模型静音 可关掉全部告警")
+        elif kind == KIND_RECOVER:
+            notes.append("恢复通知与故障告警共用同一冷却，避免抖动时来回发")
         elif kind == KIND_FREE_EXPIRING:
             notes.append("到期后是否转付费请人工确认")
-        notes.append(time.strftime("%m-%d %H:%M"))
         badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
-        cfg_font = getattr(self, "config", None)
-        font = str(cfg_font.get("card_font_path") or "") if hasattr(cfg_font, "get") else ""
-        png = await asyncio.to_thread(render_card, title, badge, stats, columns, rows, notes, font)
+        png = await self._card_png(
+            title=title, badge=badge, stats=stats, columns=columns, rows=rows, notes=notes,
+            headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=960,
+        )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
         lines = [title] + [f"{names.get(d.provider_id) or d.provider_id} · {redact(d.reason)}" for d in group]
@@ -3617,25 +3809,29 @@ class ModelPanelPlugin(Star):
             {"label": "失败", "value": str(down), "state": "down" if down else "healthy"},
         ]
         rows = []
-        for r in results:
+        for i, r in enumerate(results, start=1):
             pid = str(r.get("id") or "")
             ok = bool(r.get("ok"))
             rows.append({
+                "index": i,
                 "state": "healthy" if ok else "down",
-                "name": names.get(pid) or pid,
-                "sub": (f"重试 {r.get('retry_count')} 次" if ok and r.get("retry_count")
-                        else (_error_label(r.get("error_code")) if not ok else "")),
+                "label": names.get(pid) or pid,
+                "note": (f"重试 {r.get('retry_count')} 次" if ok and r.get("retry_count")
+                         else (_error_label(r.get("error_code")) if not ok else "")),
                 "cells": [_fmt_ms(r.get("latency_ms")),
-                          time.strftime("%H:%M:%S", time.localtime(int(r.get("checked_at") or time.time())))],
+                          time.strftime("%H:%M:%S",
+                                        time.localtime(int(r.get("checked_at") or time.time())))],
             })
         notes = ["探测延迟为单次往返耗时", context_line]
-        cfg = getattr(self, "config", None)
-        font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
-        png = await asyncio.to_thread(render_card, "模型探测结果", "指令", stats, ["探测延迟", "时间"],
-                                      rows, notes, font)
+        headline = f"成功 {len(results) - down} / 失败 {down}"
+        png = await self._card_png(
+            title="模型检测结果", badge="指令", stats=stats, columns=["探测延迟", "时间"],
+            rows=rows, notes=notes, headline=headline, meta=self._card_meta("此刻"),
+            numbered=True,
+        )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
-        lines = ["模型探测结果"]
+        lines = ["模型检测结果"]
         for r in results:
             pid = str(r.get("id") or "")
             lines.append(f"{'OK ' if r.get('ok') else 'FAIL'} {names.get(pid) or pid} "
@@ -3690,123 +3886,170 @@ class ModelPanelPlugin(Star):
         finally:
             self._test_all_lock.release()
 
-    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
-    @astr_filter.command("检测模型")
-    async def cmd_model_probe(self, event: AstrMessageEvent):
-        """指令检测：/检测模型 <名称关键词> [更多关键词…]，真打一次模型，会花额度。"""
-        keywords = _cmd_args(event).split()
-        if not keywords:
-            yield event.plain_result(
-                "用法：/检测模型 <模型名关键词>，可空格分隔多个\n"
-                f"例如：/检测模型 deepseek 或 /检测模型 硅基流动 kimi\n"
-                f"单次最多 {self._PROBE_MAX_TARGETS} 个模型，且只测档案里开放了「指令检测」通道的模型。")
+    # ================= 序号选单与通用卡片 =================
+    # 所有聊天指令共用一张「模型总览卡」：按供应商分组、统一编号。
+    # 编号在同一张卡里**连续**（① 供应商、② 它下面的模型、③ …），
+    # 所以「回数字」不必区分自己回的是组还是模型 —— 回组号就是选整组。
+    _PICK_PROBE = "probe"    # 模型检测
+    _PICK_SWITCH = "switch"  # 切换系统默认模型
+    _PICK_STATS = "stats"    # 模型统计（看明细）
+    _PROBE_MAX_PICK = 10     # 回序号多选时一次最多测几个（分组可能很大，得有闸）
+
+    def _arm_picker(self, event: AstrMessageEvent, kind: str, options: list,
+                    multi: bool = False) -> None:
+        """挂上序号选单；``options`` 就是卡片上那份编号（含分组项）。"""
+        _picker_arm(str(event.unified_msg_origin or ""), _actor_key(event), kind,
+                    list(options or []), multi=multi)
+
+    def _take_picker(self, event: AstrMessageEvent, index: int):
+        return _picker_take(str(event.unified_msg_origin or ""), _actor_key(event), int(index))
+
+    def _take_picker_multi(self, event: AstrMessageEvent, indices: list):
+        return _picker_take_multi(str(event.unified_msg_origin or ""), _actor_key(event),
+                                  list(indices or []))
+
+    def _picker_state(self, event: AstrMessageEvent) -> Optional[dict]:
+        """当前挂着的选单（领取前想先看看「能不能多选」时用），不作废。"""
+        return _picker_entry(str(event.unified_msg_origin or ""), _actor_key(event))
+
+    @staticmethod
+    def _pick_hint(kind: str, multi: bool = False) -> str:
+        """选单卡的脚注：把「怎么回」和「多久有效」写进最显眼那句。
+
+        刻意压到一行放得下的长度：这行会被渲染器按宽度折行，一折就吃掉两行脚部空间。
+        """
+        ttl = _PICKER_TTL_SEC // 60
+        if multi:
+            return f"回复序号即检测（可多选，如 2 4；回组号测整组）· {ttl} 分钟内有效"
+        if kind == "stats":
+            return f"回复序号看该模型的明细卡 · {ttl} 分钟内有效"
+        return f"回复序号即切换默认模型 · {ttl} 分钟内有效"
+
+    async def _overview_chain(self, event: AstrMessageEvent, view: dict, *, title: str,
+                              badge: str = "", footer: Optional[list] = None,
+                              kind: str = "", multi: bool = False) -> MessageChain:
+        """发「模型总览卡」—— 状态 / 统计 / 检测 / 切换四个指令的公共入口。
+
+        卡片行与选单选项由 :meth:`_grouped_card_rows` **一次性同时产出**，
+        所以卡片上的号与「回数字」认的号天然一致；分两处各算一遍迟早就错位。
+        """
+        items = list(view.get("items") or [])
+        rows, options = self._grouped_card_rows(view, numbered=True)
+        stats = self._counts_stats(view)
+        headline = f"{len(items)} 个模型"
+        png = await self._card_png(
+            title=title, badge=badge, stats=stats, columns=["延迟", "成功率"], rows=rows,
+            notes=list(footer or []), headline=headline,
+            meta=self._card_meta(_scope_label(view.get("days"))), numbered=True,
+        )
+        if kind:
+            self._arm_picker(event, kind, options, multi=multi)
+        if png is not None:
+            return MessageChain([Image.fromBytes(png)])
+        return MessageChain([Plain(self._rows_text(title, rows, stats=stats, notes=footer,
+                                                   headline=headline))])
+
+    async def _detail_chain(self, items: list, *, title: str = "模型明细",
+                            live_available: bool = True) -> MessageChain:
+        """明细卡：单个（或几个）模型，多给首字 P95、整轮、失败次数。"""
+        rows, _options = self._grouped_card_rows({"items": list(items)}, numbered=False,
+                                                 detailed=True)
+        notes = ["首字与整轮为逐次埋点均值；P95、成功率按今天窗口统计",
+                 "探测延迟不等于真实对话延迟"]
+        if not live_available:
+            notes[0] = "部分数据暂不可用（核心统计表读不到）"
+        headline = f"{len(items)} 个模型"
+        png = await self._card_png(
+            title=title, badge="详情", columns=["首字", "首字P95", "整轮", "成功率", "失败"],
+            rows=rows, notes=notes, headline=headline, meta=self._card_meta("今天"),
+            width=1000,
+        )
+        if png is not None:
+            return MessageChain([Image.fromBytes(png)])
+        return MessageChain([Plain(self._rows_text(title, rows, notes=notes, headline=headline))])
+
+    def _view_items_matching(self, view: dict, keyword: str) -> list:
+        """按关键词匹配视图项（供应商名 / 模型名 / provider id 都算）。"""
+        kw = str(keyword or "").strip().lower()
+        if not kw:
+            return []
+        return [
+            it for it in (view.get("items") or [])
+            if kw in " ".join([
+                str(it.get("display_model") or ""), str(it.get("model") or ""),
+                str(it.get("name") or ""), str(it.get("id") or ""),
+            ]).lower()
+        ]
+
+    def _probe_targets_of(self, pids: list) -> list:
+        """provider id 表 → ``[(pid, display, provider)]``，顺序跟传入的 pid 表走。
+
+        顺序必须跟着用户回的序号：探测是并发跑的，但回执卡片里的先后
+        要和用户点的顺序对得上，否则「第一个是我点的那个吗」只能靠猜。
+        """
+        found: dict[str, tuple] = {}
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = str(d.get("id") or "")
+            if pid and pid not in found:
+                found[pid] = (pid, d, p)
+        out, seen = [], set()
+        for pid in [str(x) for x in (pids or [])]:
+            if pid in found and pid not in seen:
+                seen.add(pid)
+                out.append(found[pid])
+        return out
+
+    async def _start_probe(self, event: AstrMessageEvent, targets: list):
+        """开工一次指令探测：占锁 → 后台跑 → 先回执。撞车时礼貌拒绝（不排队）。"""
+        if not targets:
+            yield event.plain_result("那些模型已经不在了（可能被删除或改过 id），重新发一次吧。")
             return
-        hits, denied = await self._match_models_async(keywords)
-        if denied:
+        if len(targets) > self._PROBE_MAX_PICK:
+            names = "、".join(str(d.get("model") or pid) for pid, d, _p in targets[:5])
             yield event.plain_result(
-                "这些模型没开放指令检测（去模型档案页勾选「指令」通道）："
-                + "、".join(str(d.get("display_model") or d.get("id")) for d in denied[:5]))
-            return
-        if not hits:
-            yield event.plain_result("没找到匹配「" + " ".join(keywords) + "」的模型")
-            return
-        if len(hits) > self._PROBE_MAX_TARGETS:
-            yield event.plain_result(
-                f"匹配到 {len(hits)} 个，超过单次上限 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
-                + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6]))
+                f"一次最多检测 {self._PROBE_MAX_PICK} 个模型，这次选了 {len(targets)} 个"
+                f"（{names} …），少选几个再来～")
             return
         if self._test_all_lock.locked():
-            yield event.plain_result("已经有一轮检测在跑了（手动或定时），等它结束再试～")
+            yield event.plain_result(
+                "已经有一轮检测在跑了（手动 / 定时 / 上一条指令），等它结束再发一次～")
             return
         # 先占锁再回执：避免回执到真正开跑之间插进来一次手动一键检测
         await self._test_all_lock.acquire()
         timeout = float(self._test_config()["test_timeout"])
-        asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
+        asyncio.create_task(self._run_command_probe(targets, event.unified_msg_origin, timeout))
         yield event.plain_result(
-            f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
-            + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
-
-    # ================= 序号选单（先列后回数字） =================
-    _PICK_PROBE = "probe"
-    _PICK_SWITCH = "switch"
-
-    def _arm_picker(self, event: AstrMessageEvent, kind: str, pids: list) -> None:
-        _picker_arm(str(event.unified_msg_origin or ""), _actor_key(event), kind, pids)
-
-    def _take_picker(self, event: AstrMessageEvent, index: int):
-        return _picker_take(str(event.unified_msg_origin or ""), _actor_key(event), index)
-
-    async def _picker_card(self, title: str, badge: str, entries: list[dict], footnotes: list[str]):
-        """把「序号 + 模型 + 状态 + 延迟」画成选单卡；没字体时退回编号文本。"""
-        rows = [{
-            "state": e.get("state") or "unknown",
-            "name": f"{i + 1}. {e.get('name') or e.get('pid')}",
-            "sub": str(e.get("sub") or ""),
-            "cells": [str(e.get("latency") or "-"), str(e.get("verdict") or "-")],
-        } for i, e in enumerate(entries)]
-        stats = [
-            {"label": "正常", "value": str(sum(1 for e in entries if e.get("state") == "healthy")), "state": "healthy"},
-            {"label": "故障", "value": str(sum(1 for e in entries if e.get("state") == "down")), "state": "down"},
-            {"label": "共", "value": str(len(entries)), "state": "unknown"},
-        ]
-        cfg = getattr(self, "config", None)
-        font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
-        png = await asyncio.to_thread(render_card, title, badge, stats, ["延迟", "状态"],
-                                      rows, footnotes + [time.strftime("%m-%d %H:%M")], font)
-        if png is not None:
-            return MessageChain([Image.fromBytes(png)])
-        lines = [title]
-        for i, e in enumerate(entries):
-            lines.append(f"{i + 1}. {e.get('name') or e.get('pid')}  "
-                         f"{e.get('verdict') or '-'} {e.get('latency') or '-'} {e.get('sub') or ''}".rstrip())
-        lines.append(footnotes[0] if footnotes else "")
-        return MessageChain([Plain("\n".join(lines))])
-
-    async def _probe_candidates(self) -> list:
-        """开放了「指令检测」通道的模型，顺序与选单编号一致。"""
-        scopes = {}
-        if self.storage:
-            try:
-                scopes = await self.storage.get_detect_scopes()
-            except Exception as e:
-                logger.warning(f"[ModelPanel] 读取指令检测名单失败: {e}")
-        out = []
-        for p in self._chat_providers():
-            d = self._provider_display(p)
-            pid = str(d.get("id") or "")
-            if pid and (scopes.get(pid) or {}).get("command", True):
-                out.append((pid, d, p))
-        return out
+            f"已开始检测 {len(targets)} 个模型："
+            + "、".join(str(d.get("model") or pid) for pid, d, _p in targets)
+            + f"\n最坏约 {int(timeout * len(targets))}s 后把结果卡片发回这里。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
-    @astr_filter.command("检测模型")
+    @astr_filter.command("模型检测", alias={"检测模型"})
     async def cmd_model_probe(self, event: AstrMessageEvent):
-        """指令检测：不带参数时列出可测模型并编号，回数字即检测。"""
+        """指令检测：不带参数发带序号的卡片（可多选、可选分组），带关键词直接测。
+
+        会**真实调用模型、消耗额度**，所以默认只对开放了「指令检测」通道的模型生效。
+        旧名「检测模型」保留为别名，老用户不用改习惯。
+        """
         keywords = _cmd_args(event).split()
         if not keywords:
-            candidates = await self._probe_candidates()
-            if not candidates:
-                yield event.plain_result(
-                    "还没有模型开放「指令检测」通道。\n"
-                    "去 WebUI 的「模型管理」页，把需要指令触发的模型勾上「指令检测」。")
+            try:
+                view = self._command_scope(await self._health_view(days=_today_days()))
+            except Exception as e:
+                logger.warning(f"[ModelPanel] /模型检测 取数失败: {e}")
+                yield event.plain_result(f"读取模型监测数据失败：{e}")
                 return
-            view = await self._health_view(days=_today_days())
-            state_of = {str(it.get("id")): it for it in (view.get("items") or [])}
-            entries = []
-            for pid, d, _p in candidates:
-                it = state_of.get(pid) or {}
-                entries.append({
-                    "pid": pid, "state": it.get("state") or "unknown",
-                    "name": d.get("model") or d.get("display_model") or pid,
-                    "sub": str(it.get("reason") or ""),
-                    "latency": _fmt_ms((it.get("calls") or {}).get("avg_latency_ms")),
-                    "verdict": _STATE_LABELS.get(str(it.get("state") or "unknown"), "无数据"),
-                })
-            self._arm_picker(event, self._PICK_PROBE, [pid for pid, _d, _p in candidates])
-            yield event.chain_result((await self._picker_card(
-                "可检测模型", "选单", entries,
-                [f"回复序号数字（1-{len(entries)}）即检测该模型，{_PICKER_TTL_SEC // 60} 分钟内有效；"
-                 f"也可以 /检测模型 <关键词>，单次最多 {self._PROBE_MAX_TARGETS} 个"])).chain)
+            if not view.get("items"):
+                yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
+                return
+            chain = await self._overview_chain(
+                event, view, title="模型检测", badge="选单", kind=self._PICK_PROBE, multi=True,
+                footer=[self._pick_hint(self._PICK_PROBE, multi=True),
+                        f"会真实调用模型、产生额度消耗；一次最多 {self._PROBE_MAX_PICK} 个模型",
+                        "延迟为最近一次调用耗时；成功率为今天窗口内统计"],
+            )
+            yield event.chain_result(chain.chain)
             return
         hits, denied = await self._match_models_async(keywords)
         if denied:
@@ -3819,19 +4062,12 @@ class ModelPanelPlugin(Star):
             return
         if len(hits) > self._PROBE_MAX_TARGETS:
             yield event.plain_result(
-                f"匹配到 {len(hits)} 个，超过单次上限 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
-                + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6]))
+                f"匹配到 {len(hits)} 个，单次最多 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
+                + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6])
+                + "\n也可以直接发 /模型检测 看编号列表。")
             return
-        if self._test_all_lock.locked():
-            yield event.plain_result("已经有一轮检测在跑了（手动或定时），等它结束再试～")
-            return
-        # 先占锁再回执：避免回执到真正开跑之间插进来一次手动一键检测
-        await self._test_all_lock.acquire()
-        timeout = float(self._test_config()["test_timeout"])
-        asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
-        yield event.plain_result(
-            f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
-            + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
+        async for res in self._start_probe(event, hits):
+            yield res
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("切换系统模型")
@@ -3844,35 +4080,25 @@ class ModelPanelPlugin(Star):
             yield event.plain_result("已取消，没有改动默认模型。")
             return
         if not args:
-            view = await self._health_view(days=_today_days())
-            state_of = {str(it.get("id")): it for it in (view.get("items") or [])}
-            default_id = await self._default_provider_id()
-            entries = []
-            for p in providers:
-                d = self._provider_display(p)
-                pid = str(d.get("id") or "")
-                if not pid:
-                    continue
-                it = state_of.get(pid) or {}
-                calls = it.get("calls") or {}
-                sub = "当前默认" if pid == default_id else ""
-                if it.get("muted"):
-                    sub = (sub + " · " if sub else "") + "告警静音中"
-                entries.append({
-                    "pid": pid, "state": it.get("state") or "unknown",
-                    "name": d.get("model") or d.get("display_model") or pid,
-                    "sub": sub,
-                    "latency": _fmt_ms(calls.get("avg_ttft_ms") or calls.get("avg_latency_ms")),
-                    "verdict": _STATE_LABELS.get(str(it.get("state") or "unknown"), "无数据"),
-                })
-            if not entries:
+            try:
+                # 这里刻意**不**按「指令检测」通道裁剪：换哪个模型本来就是全量决策，
+                # 而卡片会顺便标出当前默认那行，正好用来看「现在走的是谁」。
+                view = await self._health_view(days=_today_days())
+            except Exception as e:
+                logger.warning(f"[ModelPanel] /切换系统模型 取数失败: {e}")
+                yield event.plain_result(f"读取模型监测数据失败：{e}")
+                return
+            if not (view.get("items") or []):
                 yield event.plain_result("当前没有加载任何对话模型。")
                 return
-            self._arm_picker(event, self._PICK_SWITCH, [e["pid"] for e in entries])
-            yield event.chain_result((await self._picker_card(
-                "切换系统默认模型", "选单", entries,
-                [f"回复序号数字（1-{len(entries)}）即切换，{_PICKER_TTL_SEC // 60} 分钟内有效；"
-                 "状态与延迟取今天的数据"])).chain)
+            chain = await self._overview_chain(
+                event, view, title="切换系统默认模型", badge="选单",
+                kind=self._PICK_SWITCH,
+                footer=[self._pick_hint(self._PICK_SWITCH),
+                        "列表为全部有效对话模型（不按检测通道过滤）",
+                        "/切换系统模型 取消 可关掉挂着的选单"],
+            )
+            yield event.chain_result(chain.chain)
             return
         # 带参数时按关键词匹配，命中唯一才切，避免猜错
         hits = []
@@ -3891,10 +4117,13 @@ class ModelPanelPlugin(Star):
                 f"「{' '.join(args)}」匹配到 {len(hits)} 个，说具体一点：\n"
                 + "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6]))
             return
-        await self._apply_default_model(event, str(hits[0].get("id")))
+        # _apply_default_model 是 async generator，必须 async for 消费：
+        # 直接 await 一个 generator 会抛 TypeError（回执一条也发不出去）。
+        async for res in self._apply_default_model(event, str(hits[0].get("id"))):
+            yield res
 
-    async def _apply_default_model(self, event: AstrMessageEvent, pid: str) -> None:
-        """把 pid 写成 AstrBot 的默认对话模型并回执。"""
+    async def _apply_default_model(self, event: AstrMessageEvent, pid: str):
+        """把 pid 写成 AstrBot 的默认对话模型并回执（async generator，用 async for 消费）。"""
         known = set(self._provider_ids())
         if known and pid not in known:
             yield event.plain_result("那个序号对应的模型已经不在了（可能被删除或改过 id），重新列一次吧。")
@@ -3928,145 +4157,183 @@ class ModelPanelPlugin(Star):
 
     @astr_filter.custom_filter(NumberPickerFilter)
     async def on_number_pick(self, event: AstrMessageEvent):
-        """回数字即执行选单。
+        """回「序号」执行选单（支持 ``1 3 5`` 这种多选）。
 
-        NumberPickerFilter 已经确认过「整条消息是一个数字」且这个会话+这个人
+        NumberPickerFilter 已经确认过「整条消息就是一串序号」且这个 (会话, 人)
         挂着未过期选单，所以没挂选单的日常数字消息根本不会进到这里 ——
         它们照常走 LLM，不被插件吞。
         """
-        text = str(event.message_str or "").strip()
-        if not text.isdigit():
+        indices = _parse_index_list(event.message_str)
+        if not indices:
             return
-        picked = self._take_picker(event, int(text))
-        if not picked:
+        entry = self._picker_state(event)
+        if not entry:
             return
-        kind, pid = picked
+        if entry.get("multi"):
+            got = self._take_picker_multi(event, indices)
+        else:
+            # 单选类选单（切换模型 / 看明细）收到多选时**不作废**，让用户重回一个就好
+            if len(indices) > 1:
+                yield event.plain_result("这个选单一次只能选一个序号，请只回一个数字～")
+                return
+            one = self._take_picker(event, indices[0])
+            got = None if one is None else (one[0], [one[1]])
+        if not got:
+            yield event.plain_result("序号超出范围，按卡片上的数字重新回一次就好～")
+            return
+        kind, options = got
         if kind == self._PICK_SWITCH:
-            await self._apply_default_model(event, pid)
-            return
-        if kind == self._PICK_PROBE:
-            provider = None
-            for p in self._chat_providers():
-                if str(self._provider_display(p).get("id") or "") == pid:
-                    provider = p
-                    break
-            if provider is None:
+            pids = _flatten_pids(options)
+            if not pids:
                 yield event.plain_result("那个模型已经不在了（可能被删除或改过 id）。")
                 return
-            if self._test_all_lock.locked():
-                self._arm_picker(event, self._PICK_PROBE, [pid])
-                yield event.plain_result("已经有一轮检测在跑了，等它结束再回一次数字。")
+            async for res in self._apply_default_model(event, pids[0]):
+                yield res
+            return
+        if kind == self._PICK_STATS:
+            pids = set(_flatten_pids(options))
+            try:
+                view = self._command_scope(await self._health_view(days=_today_days()))
+            except Exception as e:
+                yield event.plain_result(f"读取模型监测数据失败：{e}")
                 return
-            await self._test_all_lock.acquire()
-            timeout = float(self._test_config()["test_timeout"])
-            d = self._provider_display(provider)
-            hits = [(pid, d, provider)]
-            asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
-            yield event.plain_result(f"已开始检测 {d.get('model') or pid}，最坏约 {int(timeout)}s 后发结果卡片。")
+            items = [it for it in (view.get("items") or []) if str(it.get("id")) in pids]
+            if not items:
+                yield event.plain_result("那个模型已经不在了（可能被删除或改过 id）。")
+                return
+            chain = await self._detail_chain(items, live_available=bool(view.get("live_available")))
+            yield event.chain_result(chain.chain)
+            return
+        if kind == self._PICK_PROBE:
+            targets = self._probe_targets_of(_flatten_pids(options))
+            async for res in self._start_probe(event, targets):
+                yield res
             return
         yield event.plain_result("这个选单不支持该操作。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型静音")
     async def cmd_model_mute(self, event: AstrMessageEvent):
-        """临时关闭某模型的告警推送：/模型静音 <名称> [时长]，或 /模型静音 取消 <名称>。
+        """告警推送的**全局**开关：``/模型静音`` 切换，``/模型静音 开|关`` 明确指定。
 
-        只静音通知，不影响状态采集与面板显示——明知某个模型坏了且在等供应商修时，
-        需要的是关掉噪音，而不是把配置删掉。
+        v1.4.0 起改口径：不再针对单个模型，而是「所有模型的告警推送」一起开关。
+        理由是同一个人被多家供应商的告警刷屏时，真正想按的是总闸；
+        而关掉之后状态照常采集、面板照常显示 —— 静音的是通知，不是监测。
+        开关落回插件配置 ``alert_notify_enabled``（与 WebUI 上那一项是同一个值），
+        所以指令与 WebUI 互相看得见，重启也不会丢。
         """
         args = _cmd_args(event).split()
-        if not args:
+        cfg = getattr(self, "config", None)
+        if not hasattr(cfg, "get"):
+            yield event.plain_result("读不到插件配置，改不了告警开关。")
+            return
+        current = bool(cfg.get("alert_notify_enabled", True))
+        if args and str(args[0]).strip().lower() in ("状态", "查询", "status"):
+            yield event.plain_result(self._mute_status(current))
+            return
+        word = str(args[0]).strip().lower() if args else ""
+        if len(args) > 1 or (word and word not in (_MUTE_ON_WORDS | _MUTE_OFF_WORDS)):
             yield event.plain_result(
-                "用法：/模型静音 <模型名关键词> [时长]，例如 /模型静音 kimi 6h\n"
-                "时长支持 30m / 2h / 1d，默认 2h；/模型静音 取消 <名称> 解除")
+                "用法：/模型静音 —— 切换全部模型的告警推送（再发一次即反向）\n"
+                "也可以明确指定：/模型静音 关、/模型静音 开、/模型静音 状态")
             return
-        if not self.storage:
-            yield event.plain_result("存储还没就绪，稍后再试～")
+        want = (True if word in _MUTE_ON_WORDS
+                else (False if word in _MUTE_OFF_WORDS else not current))
+        if want == current:
+            yield event.plain_result(self._mute_status(current) + "\n（没有改动）")
             return
-        if args[0] in ("取消", "解除", "unmute") and len(args) > 1:
-            keyword, until, hint = " ".join(args[1:]), 0, "已解除静音"
-        else:
-            keyword = args[0]
-            seconds = _parse_duration(args[1] if len(args) > 1 else "2h") or 7200
-            until = int(time.time()) + seconds
-            hint = f"静音 {max(1, seconds // 60)} 分钟"
-        names = {}
-        for p in self._chat_providers():
-            d = self._provider_display(p)
-            names[d["id"]] = f"{d.get('display_model') or ''} {d.get('model') or ''} {d.get('name') or ''}".lower()
-        kw = keyword.lower()
-        hits = [pid for pid, text in names.items() if kw in text]
-        if not hits:
-            yield event.plain_result(f"没找到名字里含「{keyword}」的模型")
+        try:
+            cfg["alert_notify_enabled"] = bool(want)
+        except Exception as e:
+            yield event.plain_result(f"写入配置失败：{e}")
             return
-        if len(hits) > 3:
-            yield event.plain_result(
-                f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n"
-                + "\n".join(names[h].split(" ")[0] for h in hits[:5]))
-            return
-        for pid in hits:
-            await self.storage.set_muted(pid, until)
-        yield event.plain_result(f"{hint}：" + "、".join(str(names[h]).split(" ")[0] for h in hits))
+        save = getattr(cfg, "save_config", None)
+        if callable(save):
+            try:
+                save()
+            except Exception as e:
+                # 回滚内存里的值：否则「配置写失败但本进程确实静音了」，
+                # 与磁盘、与下次重启后的行为都不一致，最难查。
+                try:
+                    cfg["alert_notify_enabled"] = bool(current)
+                except Exception:
+                    pass
+                yield event.plain_result(f"保存配置失败，已放弃改动：{e}")
+                return
+        logger.info(
+            f"[ModelPanel] 告警推送全局开关：{'开' if current else '关'} -> "
+            f"{'开' if want else '关'}（由指令切换）"
+        )
+        yield event.plain_result(self._mute_status(bool(want)))
+
+    @staticmethod
+    def _mute_status(on: bool) -> str:
+        """给用户看的开关状态 + 下一步怎么说。"""
+        if on:
+            return ("告警推送：已开启（模型故障 / 恢复 / 限时免费到期都会发给管理员）\n"
+                    "发 /模型静音 可关掉全部告警推送。")
+        return ("告警推送：已关闭（所有模型的告警都不再推送，状态照常采集、面板照常显示）\n"
+                "再发一次 /模型静音 即可打开。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型状态")
     async def cmd_model_status(self, event: AstrMessageEvent):
-        """查询模型健康与延迟总览。只读已有记录，不请求模型、不产生任何费用。"""
+        """模型健康与延迟总览：**只读**，不请求模型、不产生费用，也不挂选单。
+
+        这是「通用卡片」本身：分组 + 序号 + 延迟 + 成功率，只给人看。
+        别的指令（统计 / 检测 / 切换）发的是同一张卡，只是顺手挂上选单。
+        """
         try:
-            view = await self._health_view(days=_today_days())
+            view = self._command_scope(await self._health_view(days=_today_days()))
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型状态 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")
             return
-        view = self._command_scope(view)
         if not view.get("items"):
-            yield event.plain_result(
-                "没有任何模型开放了「指令检测」通道，所以这张卡是空的。\n"
-                "去 WebUI 的「模型管理」页，把需要在这里关注的模型勾上「指令检测」。")
+            yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
             return
-        png = await self._render_status_card(view, "模型实时状态", "实时")
-        if png is None:
-            yield event.plain_result(self._status_text(view, "模型实时状态"))
-            return
-        yield event.chain_result([Image.fromBytes(png)])
+        chain = await self._overview_chain(
+            event, view, title="模型实时状态", badge="实时",
+            footer=["延迟为最近一次调用耗时；成功率为今天窗口内统计",
+                    "/模型统计 可看单个模型的明细"],
+        )
+        yield event.chain_result(chain.chain)
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型统计")
     async def cmd_model_stats(self, event: AstrMessageEvent):
-        """查单个模型明细：/模型统计 <名称关键词>。"""
+        """查明细：不带参数先发带序号的总览卡（回序号看那个模型的明细），也可直接带关键词。"""
         keyword = _cmd_args(event)
-        if not keyword:
-            yield event.plain_result("用法：/模型统计 <模型名关键词>，例如 /模型统计 deepseek")
-            return
         try:
-            view = await self._health_view(days=_today_days())
+            view = self._command_scope(await self._health_view(days=_today_days()))
         except Exception as e:
             logger.warning(f"[ModelPanel] /模型统计 取数失败: {e}")
             yield event.plain_result(f"读取模型监测数据失败：{e}")
             return
-        view = self._command_scope(view)
-        kw = keyword.lower()
-        hits = [
-            it for it in (view.get("items") or [])
-            if kw in " ".join([
-                str(it.get("display_model") or ""), str(it.get("model") or ""),
-                str(it.get("name") or ""), str(it.get("id") or ""),
-            ]).lower()
-        ]
+        if not keyword:
+            if not view.get("items"):
+                yield event.plain_result(_NO_COMMAND_SCOPE_HINT)
+                return
+            chain = await self._overview_chain(
+                event, view, title="模型统计", badge="选单", kind=self._PICK_STATS,
+                footer=[self._pick_hint(self._PICK_STATS),
+                        "延迟为最近一次调用耗时；成功率为今天窗口内统计",
+                        "也可以直接 /模型统计 <关键词> 一步到位"],
+            )
+            yield event.chain_result(chain.chain)
+            return
+        hits = self._view_items_matching(view, keyword)
         if not hits:
             yield event.plain_result(f"没找到名字里含「{keyword}」的模型～")
             return
         if len(hits) > 6:
             names = "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6])
-            yield event.plain_result(f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n{names}")
+            yield event.plain_result(
+                f"「{keyword}」匹配到 {len(hits)} 个，关键词再具体一点：\n{names}\n"
+                "也可以发 /模型统计 看编号列表。")
             return
-        view = dict(view)
-        view["items"] = hits
-        png = await self._render_status_card(view, "模型明细", "详情", detailed=True)
-        if png is None:
-            yield event.plain_result(self._status_text(view, "模型明细"))
-            return
-        yield event.chain_result([Image.fromBytes(png)])
+        chain = await self._detail_chain(hits, live_available=bool(view.get("live_available")))
+        yield event.chain_result(chain.chain)
 
     async def terminate(self):
         # 必须显式停循环：热重载后旧任务若残留，会出现同一份巡检双份跑、告警双发，

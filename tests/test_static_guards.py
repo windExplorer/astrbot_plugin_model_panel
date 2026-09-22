@@ -26,11 +26,17 @@ MAIN_PY = ROOT / "main.py"
 # 指令清单：方法名 → (指令名, 期望权限)。权限 None 表示不声明 permission_type，即全员。
 EXPECTED_COMMANDS = {
     "cmd_companion_affinity": ("陪伴分数", None),
-    "cmd_model_probe": ("检测模型", "ADMIN"),
+    # v1.4.0 起正名为「模型检测」；旧名「检测模型」必须留在 alias 里，否则老用户突然失灵
+    "cmd_model_probe": ("模型检测", "ADMIN"),
     "cmd_model_mute": ("模型静音", "ADMIN"),
     "cmd_model_status": ("模型状态", "ADMIN"),
     "cmd_model_stats": ("模型统计", "ADMIN"),
     "cmd_switch_model": ("切换系统模型", "ADMIN"),
+}
+
+# 指令别名：方法名 → 必须出现的别名（改名的指令要留住旧名）
+EXPECTED_ALIASES = {
+    "cmd_model_probe": "检测模型",
 }
 
 # 非 command 的钩子型 handler：靠 custom_filter 匹配，必须带 filter 装饰器否则永不触发
@@ -106,6 +112,17 @@ def check_command_registration(tree: ast.Module) -> None:
     unlisted = sorted(set(m for m in methods if m.startswith("cmd_")) - set(EXPECTED_COMMANDS))
     check(not unlisted, f"清单覆盖了所有 cmd_* 方法（未登记：{unlisted}）" if unlisted
           else "清单覆盖了所有 cmd_* 方法")
+
+    # 改名必须留别名：@command 装饰器被改成新名字时，老用户手里的旧指令会静默失效
+    for meth_name, want_alias in EXPECTED_ALIASES.items():
+        meth = methods.get(meth_name)
+        text = ""
+        if meth is not None:
+            for dec in meth.decorator_list:
+                t = dec_text(dec)
+                if t.startswith("astr_filter.command(") or t.startswith("command("):
+                    text = t
+        check(want_alias in text, f"{meth_name} 保留了旧指令名「{want_alias}」作为 alias")
 
     # custom_filter 型 handler：没有 filter 装饰器就永远不会被触发，
     # 而且症状是「回数字没反应」，和装饰器被吃掉那一类完全一样。
