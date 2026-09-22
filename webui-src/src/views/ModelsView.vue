@@ -111,6 +111,12 @@
           @update:value="(v: number | null) => setVendorVal(g.name, 'daily_call_limit', v)"
         />
         <span class="limit-chip" :class="limitClass(g.name)">{{ limitText(g.name) }}</span>
+        <n-tooltip :delay="400">
+          <template #trigger>
+            <span class="limit-chip calls-split">{{ callsSplit(g.name) }}</span>
+          </template>
+          {{ t("models.callsSplitHint") }}
+        </n-tooltip>
         <span class="group-spacer" />
         <n-button
           size="tiny"
@@ -392,12 +398,22 @@ function effectiveMultiplier(it: HealthItem): number {
   return 1;
 }
 
-/** 今日调用数按供应商汇总。注意它只含真实对话，不含探测，是供应商计数器的下限。 */
+/** 今日调用数按供应商汇总：llm_calls 逐次埋点（与实时监测同源，含 AstrBot 后台
+    的「提供商测试」与 WebChat；不含检测）。成功 / 失败单独一支，见 callsSplit。 */
 function limitText(name: string): string {
   const v = vendors.value[name];
   const used = Number(v?.calls_today ?? 0);
   const limit = vendorVal(name, "daily_call_limit");
   return limit ? t("models.callsOfLimit", { used, limit }) : t("models.costToday") + " " + used;
+}
+
+/** 成功 / 失败拆分：之前只有总数，出问题时看不出是调用多了还是失败多了。 */
+function callsSplit(name: string): string {
+  const v = vendors.value[name] || {};
+  return t("models.callsSplit", {
+    ok: Number(v?.calls_ok ?? 0),
+    fail: Number(v?.calls_fail ?? 0),
+  });
 }
 
 function limitClass(name: string): string {
@@ -951,6 +967,8 @@ function onVisibility() {
   font-size: 11px; padding: 1px 8px; border-radius: 9px;
   background: rgba(148, 163, 184, .14); color: var(--muted); white-space: nowrap;
 }
+/* 成功 / 失败拆分支：文案里的 ✓ / ✗ 由 locale 给（伪元素插符号会落到句尾，位置不对） */
+.calls-split { color: var(--muted); }
 .limit-near { background: rgba(229, 154, 43, .18); color: var(--warn); }
 .limit-over { background: rgba(239, 77, 104, .18); color: var(--err); font-weight: 700; }
 .limit-none { opacity: .6; }

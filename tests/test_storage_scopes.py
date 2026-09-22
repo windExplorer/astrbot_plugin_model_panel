@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,6 +123,38 @@ async def main() -> None:
     check(row.get("state") == "healthy", "有错误码的行仍能被后续写入更新")
     check(row.get("last_error_code") == "unknown" and row.get("muted_until") == 0,
           "没写的字段保持原值（整行 upsert 的读-改-写语义）")
+
+    # 7) 分组「今日次数」的取数（v1.4.1）：llm_calls 按天按 provider 聚合。
+    #    以前取 llm_usage 的 requests，那张表跳过流式分片 —— 数字与实时监测对不上，
+    #    也没有成败可分。这里直接喂几行 llm_calls 验证聚合与过滤断言。
+    today = time.strftime("%Y-%m-%d")
+    rows = [
+        {"ts": time.time(), "provider_id": "p_x", "provider_model": "m",
+         "ok": True, "aborted": False, "streamed": True,
+         "latency_ms": 800.0, "ttft_ms": 200.0, "error_code": "", "error_message": ""},
+        {"ts": time.time(), "provider_id": "p_x", "provider_model": "m",
+         "ok": False, "aborted": False, "streamed": False,
+         "latency_ms": None, "ttft_ms": None, "error_code": "timeout",
+         "error_message": "timed out"},
+        {"ts": time.time(), "provider_id": "p_x", "provider_model": "m",
+         "ok": False, "aborted": True, "streamed": False,
+         "latency_ms": None, "ttft_ms": None, "error_code": "cancelled",
+         "error_message": "取消"},
+    ]
+    for r in rows:
+        await st.insert_call(r)
+    day = await st.calls_day_by_provider()
+    x = day.get("p_x") or {}
+    check(x.get("total") == 3, "按天按 provider 的总次数（含流式与失败）")
+    check(x.get("ok") == 1, "成功次数")
+    check(x.get("fail") == 1, "失败次数（取消不算失败）")
+    check(x.get("aborted") == 1, "被取消的单列")
+    totals = await st.calls_totals()
+    check(totals.get("today_total") == 3, "累计口径里今天的部分")
+    check(totals.get("all_total") == 3, "累计总次数")
+    check(totals.get("all_fail") == 1, "累计失败次数")
+    yest = await st.calls_day_by_provider(day="2000-01-01")
+    check("p_x" not in yest, "指定别的日子 → 查不到今天的行（day 过滤生效）")
 
     await st.close()
     print()

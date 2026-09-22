@@ -2418,9 +2418,9 @@ class ModelPanelPlugin(Star):
         绝不能显示 0.00 —— 那会被读成「这个模型真没花钱」。
 
         每日次数限制是供应商级的，所以「今日已用次数」也按供应商汇总。
-        注意这里的次数只含真实对话（llm_usage 由 on_llm_response 写），
-        不含定时探测与手动检测 —— 供应商那边的计数器是两者一起算的，
-        所以显示的是下限而不是精确值。
+        次数来自逐次埋点（llm_calls，含 AstrBot 后台的提供商测试与 WebChat），
+        **不含检测**（探测走自己的表、埋点对它抑制）—— 供应商那边的计数器通常是
+        两者一起算的，所以这里显示的仍可能比它小，这是口径差异不是漏记。
         """
         empty = {"by_provider": {}, "by_vendor": {}, "totals": {}}
         if not self.storage:
@@ -2430,6 +2430,10 @@ class ModelPanelPlugin(Star):
             week_u = await self.storage.usage_aggregate(days=7)
             profiles = await self.storage.get_all_profiles()
             vendors = await self.storage.get_all_vendor_profiles()
+            # 分组「今日次数」的来源（v1.4.1 起）：逐次埋点，而不是 llm_usage。
+            # llm_usage 由 on_llm_response 写、流式分片直接跳过 —— 流式模型调 10 次
+            # 可能只记两三次，于是这里显示的数字与实时监测对不上，也没有成败可分。
+            day_calls = await self.storage.calls_day_by_provider()
         except Exception as e:
             logger.warning(f"[ModelPanel] 花费统计失败: {e}")
             return empty
@@ -2437,7 +2441,7 @@ class ModelPanelPlugin(Star):
         vendor_of = {str(d.get("id") or ""): str(d.get("name") or "").strip() for d in displays}
         # 用量表里可能有已删除 provider 的孤儿行，也要计入全局总额，
         # 否则「今日花费」会悄悄比真实支出少一截
-        pids = set(vendor_of) | set(today_u) | set(week_u)
+        pids = set(vendor_of) | set(today_u) | set(week_u) | set(day_calls)
         by_provider: dict[str, dict] = {}
         by_vendor: dict[str, dict] = {}
         tot_today = tot_week = 0.0
@@ -2450,13 +2454,20 @@ class ModelPanelPlugin(Star):
             btype = str(prof.get("billing_type") or "unknown")
             c_today = estimate_cost(btype, prices, today_u.get(pid) or {}, pricing["multiplier"])
             c_week = estimate_cost(btype, prices, week_u.get(pid) or {}, pricing["multiplier"])
+            dc = day_calls.get(pid) or {}
             by_provider[pid] = {
                 "currency": pricing["currency"],
                 "multiplier": pricing["multiplier"],
                 "multiplier_from_group": pricing["multiplier_from_group"],
                 "today": c_today,
                 "week": c_week,
-                "calls_today": int((today_u.get(pid) or {}).get("requests") or 0),
+                # 今日次数与成败：逐次埋点（llm_calls），口径与实时监测一致。
+                # 不含检测（探测走自己的表、且埋点对它抑制），供应商后台若把探测
+                # 也算进配额，这里的数字会比它小 —— 这是口径差异，不是漏记。
+                "calls_today": int(dc.get("total") or 0),
+                "calls_ok": int(dc.get("ok") or 0),
+                "calls_fail": int(dc.get("fail") or 0),
+                "calls_aborted": int(dc.get("aborted") or 0),
                 "billable": c_week is not None or c_today is not None,
             }
             v = by_vendor.setdefault(vname, {
@@ -2466,11 +2477,17 @@ class ModelPanelPlugin(Star):
                 "daily_call_limit": pricing["daily_call_limit"],
                 "note": (vendors.get(vname) or {}).get("note") or "",
                 "calls_today": 0,
+                "calls_ok": 0,
+                "calls_fail": 0,
+                "calls_aborted": 0,
                 "today": 0.0,
                 "week": 0.0,
                 "priced": False,
             })
             v["calls_today"] += by_provider[pid]["calls_today"]
+            v["calls_ok"] += by_provider[pid]["calls_ok"]
+            v["calls_fail"] += by_provider[pid]["calls_fail"]
+            v["calls_aborted"] += by_provider[pid]["calls_aborted"]
             if c_today is not None:
                 v["today"] += c_today
                 tot_today += c_today

@@ -1076,6 +1076,36 @@ class Storage:
                 out[f"{prefix}_{key}"] = value
         return out
 
+    async def calls_day_by_provider(self, day: Optional[str] = None) -> dict[str, dict[str, int]]:
+        """某一天（默认今天）每个 provider 的逐次调用计数：总数 / 成功 / 失败 / 中断。
+
+        模型管理页分组的「今日次数」用它：以前取的是 llm_usage 的 requests，
+        那张表由 ``on_llm_response`` 写、**流式分片直接跳过** —— 流式模型调 10 次
+        可能只记两三次，于是分组计数与实时监测对不上，也没有成败可分。
+        llm_calls 是每次尝试一行，口径与实时监测一致。
+        """
+        await self.init()
+        where, params = "", []
+        if day is None:
+            day = time.strftime("%Y-%m-%d")
+        where, params = " WHERE day = ?", [str(day)]
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"""SELECT provider_id,
+                           COUNT(*) AS total,
+                           COALESCE(SUM(CASE WHEN aborted = 1 THEN 1 ELSE 0 END), 0) AS aborted,
+                           COALESCE(SUM(CASE WHEN aborted = 0 AND ok = 1 THEN 1 ELSE 0 END), 0) AS ok,
+                           COALESCE(SUM(CASE WHEN aborted = 0 AND ok = 0 THEN 1 ELSE 0 END), 0) AS fail
+                    FROM llm_calls{where} GROUP BY provider_id""",
+                params,
+            )
+            rows = await cur.fetchall()
+        return {str(r["provider_id"] or ""): {
+            "total": int(r["total"] or 0), "ok": int(r["ok"] or 0),
+            "fail": int(r["fail"] or 0), "aborted": int(r["aborted"] or 0),
+        } for r in rows}
+
     async def calls_stats(self, since_ts: int, until_ts: Optional[int] = None) -> dict[str, dict]:
         """按 provider 聚合一段时间的逐次调用：成败、延迟、首字、最近一次。
 

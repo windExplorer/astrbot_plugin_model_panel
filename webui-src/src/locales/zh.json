@@ -530,6 +530,8 @@
     "groupVendorHint": "倍率与每日次数限制属于整个供应商分组，改一次本组所有模型都跟着变；单个模型要例外就在抽屉里填倍率覆盖。",
     "groupApplied": "已把「{vendor}」的分组设置保存",
     "callsOfLimit": "{used} / {limit}",
+    "callsSplit": "✓ 成功 {ok} · ✗ 失败 {fail}",
+    "callsSplitHint": "今日所有真实 LLM 调用（含 AstrBot 后台的「提供商测试」与 WebChat），与「实时监测」同一来源；不含检测——检测次数在「历史检测」里。失败 = 真实报错，用户主动取消不计入。每日限额如果要和供应商后台对账，记得对方通常把检测也算进去。",
     "limitUnset": "未设限额",
     "limitNear": "已用到 {pct}%",
     "colCost": "预估花费",

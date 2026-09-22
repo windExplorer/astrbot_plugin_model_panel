@@ -57,7 +57,9 @@
             <div class="usage-sub">{{ t("dashboard.usageTotal") }}</div>
           </n-gi>
           <n-gi>
-            <div class="usage-big muted">{{ usage.today.requests }}</div>
+            <!-- 次数与「实时监测」同源（llm_calls）：llm_usage 会跳过流式分片，
+                 这里若用它，流式模型的请求次数会明显偏少（用户反馈过对不上） -->
+            <div class="usage-big muted">{{ overview?.calls?.today_total ?? usage.today.requests }}</div>
             <div class="usage-sub">{{ t("dashboard.usageRequests") }}</div>
           </n-gi>
         </n-grid>

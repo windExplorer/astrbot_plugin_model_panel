@@ -691,8 +691,12 @@ export interface ModelCost {
   multiplier_from_group: boolean;
   today: number | null;
   week: number | null;
-  /** 今日对话调用数。不含定时探测与手动检测，是供应商计数器的下限 */
+  /** 今日调用数（llm_calls 逐次埋点，与实时监测同源；不含检测）。 */
   calls_today: number;
+  /** 其中成功 / 失败 / 被取消（取消不算成败） */
+  calls_ok: number;
+  calls_fail: number;
+  calls_aborted: number;
   billable: boolean;
 }
 
@@ -704,6 +708,9 @@ export interface VendorProfile {
   daily_call_limit: number | null;
   note: string;
   calls_today: number;
+  calls_ok: number;
+  calls_fail: number;
+  calls_aborted: number;
   today: number;
   week: number;
   priced: boolean;
