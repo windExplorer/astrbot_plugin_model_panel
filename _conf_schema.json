@@ -29,6 +29,14 @@
     "hint": "模型状态/告警以图片卡片发送时需要中文字体。留空则自动查找系统字体（Windows 微软雅黑 / Linux Noto Sans CJK / macOS 苹方）。若卡片退化成纯文本，说明没找到中文字体，可在此填一个 .ttc 或 .otf 的绝对路径。插件不内置字体文件，避免包体膨胀数十 MB。",
     "default": ""
   },
+  "card_theme": {
+    "description": "卡片配色主题",
+    "type": "string",
+    "options": ["rose", "indigo", "teal", "sunset", "graphite"],
+    "labels": ["樱粉（默认）", "靛蓝", "青碧", "落日橙", "石墨灰"],
+    "hint": "只影响聊天里那几张图片卡片的配色（渐变头 + 强调色 + 行底），不影响 WebUI。留空或填了不认识的名字都会回落到「樱粉」。改完下一条卡片就生效，不需要重启。",
+    "default": "rose"
+  },
   "monitor_enabled": {
     "description": "开启后台巡检与告警",
     "type": "bool",

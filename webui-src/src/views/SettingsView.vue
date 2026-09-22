@@ -61,6 +61,30 @@
             </n-text>
           </n-form-item>
 
+          <!-- 卡片外观：文案直接写中文（本仓库约定不再新增多语言文案） -->
+          <n-form-item label="卡片配色主题">
+            <n-select
+              v-model:value="form.card_theme"
+              :options="themeOptions"
+              style="width: 200px"
+            />
+            <n-text depth="3" style="margin-left: 12px; font-size: 12px">
+              聊天里那几张图片卡片（模型状态 / 检测结果 / 告警）的配色，不影响本页。
+            </n-text>
+          </n-form-item>
+
+          <n-form-item label="卡片中文字体路径">
+            <n-input
+              v-model:value="form.card_font_path"
+              placeholder="留空 = 自动探测系统字体"
+              style="width: 360px"
+              clearable
+            />
+            <n-text depth="3" style="margin-left: 12px; font-size: 12px">
+              找不到字体时卡片会退化成纯文本，可在这里填一个 .ttc / .otf 的绝对路径。
+            </n-text>
+          </n-form-item>
+
           <n-form-item>
             <n-space>
               <n-button type="primary" :loading="saving" @click="save">
@@ -97,7 +121,9 @@ import {
   NCard,
   NForm,
   NFormItem,
+  NInput,
   NInputNumber,
+  NSelect,
   NSpace,
   NSpin,
   NText,
@@ -114,17 +140,28 @@ interface Config {
   test_retry_count: number;
   test_retry_backoff: number;
   history_retention_days: number;
+  card_theme: string;
+  card_font_path: string;
+}
+
+interface ThemeOption {
+  value: string;
+  label: string;
 }
 
 const form = ref<Config | null>(null);
+// 主题候选由后端下发（唯一来源是 card_render.THEME_CHOICES）。
+// 前端再抄一份的话，以后加主题就会出现「下拉里没有、后台也选不到」。
+const themeOptions = ref<ThemeOption[]>([]);
 const loading = ref(false);
 const saving = ref(false);
 
 async function load() {
   loading.value = true;
   try {
-    const r = await apiGet<{ items: Config }>("/panel/config");
+    const r = await apiGet<{ items: Config; themes?: ThemeOption[] }>("/panel/config");
     form.value = { ...r.items };
+    themeOptions.value = r.themes?.length ? r.themes : [{ value: "rose", label: "樱粉（默认）" }];
   } catch (e: any) {
     message.error(String(e?.message || e || "加载失败"));
   } finally {

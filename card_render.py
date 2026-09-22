@@ -132,8 +132,38 @@ THEMES: dict[str, dict[str, tuple]] = {
         "footer": (238, 250, 247),
         "border": (192, 227, 218),
     },
+    "sunset": {
+        "top": (255, 236, 214),
+        "bottom": (250, 194, 164),
+        "ink": (94, 40, 20),
+        "sub": (146, 76, 46),
+        "accent": (234, 88, 12),
+        "accent2": (190, 24, 93),
+        "soft": (255, 243, 235),
+        "footer": (255, 247, 241),
+        "border": (248, 214, 190),
+    },
+    "graphite": {
+        "top": (238, 240, 245),
+        "bottom": (203, 208, 222),
+        "ink": (38, 42, 54),
+        "sub": (88, 94, 110),
+        "accent": (71, 85, 105),
+        "accent2": (51, 65, 85),
+        "soft": (241, 243, 247),
+        "footer": (245, 246, 250),
+        "border": (214, 219, 229),
+    },
 }
 DEFAULT_THEME = "rose"
+# 给配置页下拉用的候选顺序（键 → 中文名）。别删「rose」：它是默认值。
+THEME_CHOICES = (
+    ("rose", "樱粉（默认）"),
+    ("indigo", "靛蓝"),
+    ("teal", "青碧"),
+    ("sunset", "落日橙"),
+    ("graphite", "石墨灰"),
+)
 
 # 状态色：浅色底上要压得住，所以全部走深一档
 STATE_COLORS = {
@@ -274,6 +304,31 @@ def _line_h(font) -> int:
         return 24
 
 
+def _ink_right(font, text: Any) -> float:
+    """文本**墨迹**右边缘相对落笔点的偏移。
+
+    右对齐必须按墨迹、不能按步进宽度（``getlength``）：末位是汉字还是拉丁字母、
+    字号多大，右侧留白都不一样。表头（17px）与数值（24px）用不同字号时，
+    按步进对齐能让两条「右边缘」差出 5px —— 人眼一眼就看出没对齐。
+    """
+    try:
+        return float(font.getbbox(str(text if text is not None else ""))[2])
+    except Exception:
+        return _text_w(font, text)
+
+
+def _draw_right(draw, right: float, cy: float, text: str, font, fill: tuple) -> None:
+    """把 ``text`` 的**墨迹**右边缘对齐到 ``right``（垂直居中于 ``cy``）。
+
+    ``anchor="rm"`` 只把步进宽度对齐到落笔点，所以这里补一个
+    ``步进宽度 - 墨迹右偏移`` 的修正量，让汉字和拉丁字母落在同一条竖线上。
+    """
+    text = str(text if text is not None else "")
+    advance = _text_w(font, text)
+    x = right + (advance - _ink_right(font, text))
+    draw.text((x, cy), text, font=font, fill=fill, anchor="rm")
+
+
 def _fit(font, text: Any, max_w: float) -> str:
     """按像素宽度截断，超出补省略号。中文不能按字符数截。"""
     text = str(text if text is not None else "")
@@ -381,22 +436,31 @@ def _state_dot(draw, cx: int, cy: int, color: tuple) -> None:
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
 
 
-def _index_badge(draw, fonts: "_Fonts", x: int, cy: int, n: Any, *, filled: bool,
-                 accent: tuple, size: int = BADGE) -> None:
-    """序号方块：实心（模型行）或描边（分组行）。
+def _index_badge(draw, fonts: "_Fonts", x: int, cy: int, n: Any, *, style: str,
+                 accent: tuple, ink: tuple, size: int = BADGE) -> None:
+    """序号方块。三种样式：
+
+    - ``solid``：实心强调色 + 白字。**只给「当前默认」那一行**用 ——
+      一眼就能在整列里找到它，这正是切模型时最要紧的信息。
+    - ``tint``：极淡的强调色底 + 强调色数字（模型行的常规样式）。
+      整列都是实心亮色块的话，满屏都是重点，反而没有重点。
+    - ``outline``：白底描边（分组行）。不靠颜色也能把它和模型行区分开。
 
     序号是这张卡的主要入口（看完回一个数字），所以它单独占一个方块，
     绝不和名字挤在一段文字里 —— 名字被截断时序号必须还在。
     """
     font = fonts.get(F_INDEX if size >= BADGE else F_INDEX_G)
     box = [x, cy - size // 2, x + size, cy + size // 2]
-    if filled:
+    if style == "solid":
         draw.rounded_rectangle(box, 12, fill=accent + (255,))
-        ink = (255, 255, 255)
+        text_ink = (255, 255, 255)
+    elif style == "tint":
+        draw.rounded_rectangle(box, 12, fill=_mix(accent, CARD_BG, 0.86) + (255,))
+        text_ink = _mix(accent, ink, 0.25)
     else:
         draw.rounded_rectangle(box, 12, fill=CARD_BG + (255,), outline=accent + (255,), width=2)
-        ink = accent
-    draw.text((x + size // 2, cy), str(n), font=font, fill=ink + (255,), anchor="mm")
+        text_ink = accent
+    draw.text((x + size // 2, cy), str(n), font=font, fill=text_ink + (255,), anchor="mm")
 
 
 def _pill(draw, fonts: "_Fonts", text: str, x: int, cy: int, color: tuple) -> None:
@@ -412,13 +476,17 @@ def _pill(draw, fonts: "_Fonts", text: str, x: int, cy: int, color: tuple) -> No
 
 
 def _column_widths(fonts: "_Fonts", columns: list[str], rows: list[dict]) -> list[int]:
-    """每个数值列需要的像素宽：表头与各单元格文本宽的最大值。"""
-    widths = [int(_text_w(fonts.get(F_COLHEAD), c)) for c in columns]
+    """每个数值列需要的像素宽：表头与各单元格**墨迹**宽的最大值。
+
+    用墨迹宽而不是步进宽：列宽决定相邻两列之间到底看得见多少空隙，
+    而右侧那点边距是看不见的 —— 按步进算会让两列看起来比设定值更挤。
+    """
+    widths = [int(_ink_right(fonts.get(F_COLHEAD), c)) for c in columns]
     for r in rows:
         cells = list(r.get("cells") or [])
         for i in range(len(columns)):
             txt = str(cells[i]) if i < len(cells) else "-"
-            widths[i] = max(widths[i], int(_text_w(fonts.get(F_CELL), txt)))
+            widths[i] = max(widths[i], int(_ink_right(fonts.get(F_CELL), txt)))
     return widths
 
 
@@ -593,9 +661,11 @@ def render_card(
         if anchors:
             for i, col_name in enumerate(cols):
                 _, right = anchors[i]
-                draw.text((right - _text_w(fonts.get(F_COLHEAD), col_name), y + 8), col_name,
-                          font=fonts.get(F_COLHEAD),
-                          fill=_mix(c["accent"], TEXT_SOFT, 0.35) + (255,))
+                # 与下面的数值共用同一个「按墨迹右对齐」的写法：
+                # 表头手动减宽度、数值交给锚点，两套写法混用正是曾经差出几十像素的原因
+                _draw_right(draw, right, y + 9 + _line_h(fonts.get(F_COLHEAD)) // 2,
+                            col_name, fonts.get(F_COLHEAD),
+                            _mix(c["accent"], TEXT_BODY, 0.62) + (255,))
             y += COLHEAD_H
 
         # ---------- 5) 行（分组行 + 模型行，序号共用同一个数字空间） ----------
@@ -608,7 +678,7 @@ def render_card(
                 name_x = body_l + 16
                 if numbered:
                     _index_badge(draw, fonts, body_l + 14, cy, r.get("index", "·"),
-                                 filled=False, accent=c["accent"], size=GBADGE)
+                                 style="outline", accent=c["accent"], ink=c["ink"], size=GBADGE)
                     name_x = body_l + 14 + GBADGE + 14
                 label = _fit(fonts.get(F_NAME), r.get("label") or "",
                              body_r - name_x - 160)
@@ -623,14 +693,17 @@ def render_card(
                 continue
 
             cy = y + ROW_H // 2
+            # 行底跟着主题走（不是中性灰）：卡片整体才是一个色系，不会出现「粉卡 + 蓝灰块」
             draw.rounded_rectangle(
                 [body_l, y, body_r, y + ROW_H], ROW_RADIUS,
-                fill=(c["soft"] if r.get("highlight") else ROW_BG) + (255,),
+                fill=((c["soft"] if r.get("highlight") else _mix(c["soft"], CARD_BG, 0.45))
+                      + (255,)),
             )
             x = body_l + 18
             if numbered:
-                _index_badge(draw, fonts, x, cy, r.get("index", ridx + 1), filled=True,
-                             accent=c["accent"])
+                _index_badge(draw, fonts, x, cy, r.get("index", ridx + 1),
+                             style="solid" if r.get("highlight") else "tint",
+                             accent=c["accent"], ink=c["ink"])
                 x += BADGE + 16
             state = str(r.get("state") or "")
             if state:
@@ -659,8 +732,9 @@ def render_card(
             cells = list(r.get("cells") or [])
             for i, (_, right) in enumerate(anchors):
                 txt = str(cells[i]) if i < len(cells) else "-"
-                draw.text((right - _text_w(fonts.get(F_CELL), txt), cy), txt,
-                          font=fonts.get(F_CELL), fill=TEXT_BODY + (255,), anchor="rm")
+                # 只给墨迹右边缘、**不要再减一次文本宽度**：_draw_right 已经处理了偏移，
+                # 再减一遍等于整体左移一个字宽（曾经数值列比表头左偏 69px，正是这个错）
+                _draw_right(draw, right, cy, txt, fonts.get(F_CELL), TEXT_BODY + (255,))
             y += ROW_H + ROW_GAP
 
         # ---------- 6) 脚部：提示 + 品牌 ----------

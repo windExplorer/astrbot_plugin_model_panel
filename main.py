@@ -14,7 +14,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
-from .card_render import render_card
+from .card_render import DEFAULT_THEME, THEME_CHOICES, render_card
 from .call_recorder import install as install_call_recorder, suppressed as suppress_call_recording, wrapped_classes as recorder_wrapped_classes
 from .monitor import (
     KIND_FAIL,
@@ -1907,27 +1907,42 @@ class ModelPanelPlugin(Star):
             "default_provider_id": default_id,
         }
 
-    # ---------- 插件配置（检测参数） ----------
+    # ---------- 插件配置（检测参数 + 卡片外观） ----------
+    # 面板设置页只管这几个键；其余配置（告警阈值、定时探测…）走 AstrBot 的插件配置页。
+    _CONFIG_DEFAULTS = {
+        "test_timeout": 45,
+        "test_retry_count": 1,
+        "test_retry_backoff": 2.0,
+        "history_retention_days": 30,
+        "card_theme": "rose",
+        "card_font_path": "",
+    }
+    _CONFIG_TYPES = {
+        "test_timeout": int,
+        "test_retry_count": int,
+        "test_retry_backoff": float,
+        "history_retention_days": int,
+        "card_theme": str,
+        "card_font_path": str,
+    }
+
     async def api_get_config(self) -> dict:
         """读取插件 _conf_schema 暴露的字段（含默认值），返回当前生效值。"""
         cfg = getattr(self, "config", None)
-        defaults = {
-            "test_timeout": 45,
-            "test_retry_count": 1,
-            "test_retry_backoff": 2.0,
-            "history_retention_days": 30,
-        }
-        values = dict(defaults)
+        values = dict(self._CONFIG_DEFAULTS)
         if cfg is not None and hasattr(cfg, "get"):
-            for k in defaults:
+            for k, default in self._CONFIG_DEFAULTS.items():
                 v = cfg.get(k)
                 if v is None:
                     continue
-                if k == "test_retry_backoff":
-                    values[k] = float(v)
-                else:
-                    values[k] = int(v)
-        return {"items": values}
+                try:
+                    values[k] = type(default)(v)
+                except (TypeError, ValueError):
+                    values[k] = default
+        # 主题候选跟着配置一起下发：主题表的唯一来源是 card_render.THEME_CHOICES，
+        # 前端再抄一份的话，以后加主题就会出现「下拉里没有、后台也选不到」
+        return {"items": values,
+                "themes": [{"value": k, "label": label} for k, label in THEME_CHOICES]}
 
     async def api_set_config(self) -> dict:
         """批量设置插件配置字段。仅更新传入的 key，缺省保留原值。"""
@@ -1938,17 +1953,12 @@ class ModelPanelPlugin(Star):
         cfg = getattr(self, "config", None)
         if cfg is None or not hasattr(cfg, "__setitem__"):
             return {"ok": False, "error": "插件配置不可写（self.config 缺失）"}
-        type_map = {
-            "test_timeout": int,
-            "test_retry_count": int,
-            "test_retry_backoff": float,
-            "history_retention_days": int,
-        }
         try:
             for k, v in raw.items():
-                if k not in type_map:
+                cast = self._CONFIG_TYPES.get(k)
+                if cast is None:
                     continue
-                casted = type_map[k](v)
+                casted = cast(v)
                 if k == "test_timeout":
                     casted = max(1, casted)
                 elif k == "test_retry_count":
@@ -1957,6 +1967,12 @@ class ModelPanelPlugin(Star):
                     casted = max(0.0, casted)
                 elif k == "history_retention_days":
                     casted = max(0, casted)
+                elif k == "card_theme":
+                    # 不认识的主题名照收（渲染器会回落到默认），但空串也归一成默认名，
+                    # 免得配置页出现一个空下拉、看着像没配上
+                    casted = str(casted or "").strip().lower() or DEFAULT_THEME
+                elif k == "card_font_path":
+                    casted = str(casted or "").strip()
                 cfg[k] = casted
             save = getattr(cfg, "save_config", None)
             if callable(save):
@@ -3417,12 +3433,15 @@ class ModelPanelPlugin(Star):
         """渲染卡片。返回 PNG bytes；字体不可用时返回 None，调用方降级发文本。
 
         Pillow 是 CPU 密集的，必须 ``to_thread`` —— 直接在事件循环里画会卡住整条消息管线。
+        字体路径与主题色都从插件配置读：``card_font_path`` / ``card_theme``，
+        主题名不认识时渲染器自己回落到默认主题（配置写错不该让卡片画不出来）。
         """
         cfg = getattr(self, "config", None)
         font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
+        theme = str(cfg.get("card_theme") or "") if hasattr(cfg, "get") else ""
         return await asyncio.to_thread(
             render_card, title, badge, stats or [], columns or [], rows or [], notes or [],
-            font, headline=headline, meta=meta, numbered=numbered, width=width,
+            font, headline=headline, meta=meta, numbered=numbered, width=width, theme=theme,
         )
 
     def _rows_text(self, title: str, rows: list, *, stats: Optional[list] = None,

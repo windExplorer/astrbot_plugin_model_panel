@@ -311,7 +311,7 @@
     "defaultMark": "（默认）"
   },
   "settings": {
-    "title": "检测配置",
+    "title": "检测与卡片配置",
     "testTimeout": "单次超时（秒）",
     "testTimeoutHint": "单个模型检测的最长等待时间。",
     "testRetryCount": "失败重试次数",
