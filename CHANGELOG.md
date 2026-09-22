@@ -1,5 +1,77 @@
 # 更新日志
 
+## v1.3.9
+
+补上核心统计表结构性看不见的失败（自己埋点），指令侧加序号选单与默认模型切换，监测窗口默认「今天」。
+
+### 问题
+
+1. **实时监测在骗人**：AstrBot 日志里某个模型当天失败了好几次，面板上却写着 100% 成功。
+   用户原话：「就是 llm 每次调用成功和时间、延迟你好像都没记录上去的感觉」。
+2. `/检测模型` 必须打对模型名，而 provider 名字根本记不住。
+3. 想在聊天里换系统默认模型，只能去后台配置。
+4. 默认窗口是近 7 天，今天的故障被七天的分母摊平掉了。
+
+### 根因（第 1 条是结构性的，不是 bug）
+
+核心只有 `_record_internal_agent_stats`（`pipeline/process_stage/method/agent_sub_stages/internal.py:553`）
+这一个写入方，**一轮对话记一行**，`provider_id` 取当时的 `self.provider`；
+而 `core/agent/runners/tool_loop_agent_runner.py` 在候选循环里会 `self.provider = candidate`
+（约 569 行）逐个试。于是**主模型失败、备用救回来**的那一轮，落库的是备用的成功行，
+主模型那次失败在 `provider_stats` 里根本不存在。
+
+`on_llm_response` 钩子在模型报错时**不触发**（runner 合成 `role="err"` 分片后直接 return），
+所以「失败」这一半在核心侧拿不到第二个来源 —— 只能自己埋点，没有第二条路。
+
+### 修复（后端）
+
+- 新增 **`call_recorder.py`**：在**类**上包装 `text_chat` / `text_chat_stream`。
+  两个要点：只看 `cls.__dict__` 里本类自己的实现（顺着 MRO 拿基类方法再 setattr，
+  子类覆写的那份永远拦不到）；`_model_panel_wrapped` 标记保证幂等，可反复 install 而不套娃。
+- 新表 **`llm_calls`**（一次尝试一行：`ts/day/provider_id/provider_model/ok/aborted/streamed/latency_ms/ttft_ms/error_code/error_message`）
+  加三个索引与 `cleanup_calls_older_than`。核心那张表没有保留期清理，这张自己清。
+- 插件自己的探测包在 `suppressed()` 里：结果已经写进 `model_test_results`，
+  不抑制的话每轮探测会再往 `llm_calls` 记一行，同一件事被数两遍。
+- `monitor.evaluate` 加 `_field()`，同时吃核心的 `CallRecord` 与本表的 dict 行 ——
+  状态机只留一份实现，两边各写一套必然分叉。
+- 巡检游标拆成 `calls_cursor` / `stats_cursor`：换数据源时若共用一个游标，
+  会把另一张表的老历史当成新数据重放一遍并立刻告警。
+- 告警数据源：`llm_calls` 一旦有数据就用它，否则回落 `provider_stats`。
+- `/检测模型` **不带参数**改为列序号选单；新增 **`/切换系统模型`**（列全部有效对话模型 + 今天的状态与延迟，回数字切换）。
+- `NumberPickerFilter`：「整条消息就是一个数字」且这个 **(会话, 人)** 挂着未过期选单才放行。
+  两条都必须在 filter 阶段判完 —— 进了 handler 再决定不管，用户日常发的一句「3」就被插件吃掉了，
+  那是最难排查的投诉。按人不只按会话，否则管理员刚列完表，群里别人回个数字就把默认模型切走了。
+- `_actor_key` 兜底核心的已知行为：`get_sender_id()` 在 `user_id` 是 int 时**直接返回空串**。
+- 「今天」折算成滚动小数天（`_today_days`），复用全部现有窗口逻辑，
+  改动面从三个文件缩到一个函数；`api_health` 缺省即今天。
+
+### 修复（前端）
+
+- 实时监测新增 **「逐次成败」「逐次延迟」** 两列，悬停给「共 N 次 / 成功 / 失败 / 打断」与最近一次失败错误码。
+- 窗口选项前置 **「今天」** 并设为默认（`DAY_OPTIONS` 允许 `"today"` 与数字混排）。
+- 口径说明补第 4 条：为什么「成功率 100% 而逐次有失败」不是矛盾 —— 是备用起作用了。
+- `calls_available === false` 时给一条横幅说明这层埋点从本次启动才开始记录，重启前的历史补不回来。
+
+### 已知限制
+
+- 包装在插件装载时安装，本仓库**没有 `importlib.reload` 热重载列表**，
+  所以从旧版本热更上来不会自动装上，**必须完整重启 AstrBot**。
+- 不走 `text_chat` / `text_chat_stream` 的调用路径（极少数插件自定义 provider 方法）埋不到。
+
+### 自检
+
+- 新增 `tests/test_call_recorder.py`：真异步生成器，覆盖成功 / 抛错 / `role="err"` 软失败 /
+  ttft / 流中途抛错 / 消费方提前 `aclose` / install 幂等 / 子类覆写 / 抑制 / 存储写失败不影响对话。
+  抓到过一个真 bug：`if ttft` 把合法的 0 当成「没测到」丢掉，整列首字延迟会空。
+- 新增 `tests/test_monitor_alerts.py`：两种行形状等价、**被备用救回仍报故障**、
+  aborted 中性、连续成功 2 次才算恢复、冷却、阈值。
+- 新增 `tests/test_picker_flow.py`：用 AST 把选单函数从 `main.py` **原样抠出来** exec
+  （main.py 依赖整个 astrbot 运行时，本机 import 不了），测领取即作废、越界不作废、
+  过期清理、按人隔离、filter 放行条件、`_actor_key` 兜底。
+  反向对照：把 `index < 1` 改成 `index < 0` 后立刻 MISS 4 项，确认它不是空跑。
+- 前端：桩桥 + headless Chrome 截图验收「成功率 100% / 逐次失败 3 次」并排显示；
+  把 `calls_available` 改成 false 验证横幅确实出现（`v-else-if` 链没被上面的告警吃掉）。
+
 ## v1.3.8
 
 补齐计费维度，并让单价/倍率真的算出钱来。

@@ -703,6 +703,19 @@ export interface CostTotals {
   unpriced_models: number;
 }
 
+/** 插件自己埋点的逐次调用聚合（llm_calls）。与核心 provider_stats 的「一轮一行」口径不同。 */
+export interface CallStats {
+  total?: number;
+  ok?: number;
+  fail?: number;
+  aborted?: number;
+  counted?: number;
+  fail_rate?: number;
+  avg_latency_ms?: number | null;
+  avg_ttft_ms?: number | null;
+  last?: { ts: number; ok: boolean; aborted: boolean; error_code?: string } | null;
+}
+
 export interface HealthItem {
   id: string;
   name: string;
@@ -713,6 +726,7 @@ export interface HealthItem {
   cost: ModelCost;
   scope: HealthScope;
   window: HealthWindow;
+  calls: CallStats;
   last: LastCall | null;
   state: HealthState;
   reason: string;
@@ -745,6 +759,8 @@ export interface HealthResponse {
   counts: Partial<Record<HealthState, number>>;
   days: number;
   live_available: boolean;
+  /** 插件自己的逐次埋点是否已经有数据 */
+  calls_available?: boolean;
   truncated: boolean;
   samples: number;
   alerts: HealthAlert[];
@@ -756,7 +772,8 @@ export interface HealthResponse {
   error?: string;
 }
 
-export async function apiGetHealth(days: number): Promise<HealthResponse> {
+/** 监测窗口。``"today"`` 由后端折算成本地零点到现在。 */
+export async function apiGetHealth(days: number | "today"): Promise<HealthResponse> {
   // 窗口拉长时核心表要全表扫，超时给足
   return apiGet<HealthResponse>("/panel/health", { days }, 25000);
 }

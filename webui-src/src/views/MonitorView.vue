@@ -3,8 +3,8 @@
     <div class="m-toolbar">
       <n-space align="center" :size="10" wrap>
         <n-radio-group v-model:value="days" size="small" @update:value="load">
-          <n-radio-button v-for="d in DAY_OPTIONS" :key="d" :value="d">
-            {{ t('monitor.dayN', { n: d }) }}
+          <n-radio-button v-for="d in DAY_OPTIONS" :key="String(d)" :value="d">
+            {{ d === "today" ? t("monitor.dayToday") : t("monitor.dayN", { n: d }) }}
           </n-radio-button>
         </n-radio-group>
         <n-checkbox v-model:checked="onlyIssues">{{ t('monitor.onlyIssues') }}</n-checkbox>
@@ -30,6 +30,7 @@
         <li>{{ t('monitor.caliber1') }}</li>
         <li>{{ t('monitor.caliber2') }}</li>
         <li>{{ t('monitor.caliber3') }}</li>
+        <li>{{ t('monitor.caliber4') }}</li>
       </ul>
     </n-alert>
 
@@ -38,6 +39,9 @@
     </n-alert>
     <n-alert v-else-if="data?.truncated" type="warning" class="m-warn">
       {{ t('monitor.truncated', { n: data.samples }) }}
+    </n-alert>
+    <n-alert v-else-if="!loading && data?.calls_available === false" type="info" class="m-warn">
+      {{ t('monitor.callsOffBanner') }}
     </n-alert>
 
     <n-grid :x-gap="10" :y-gap="10" cols="2 s:3 m:6" responsive="screen" class="m-summary">
@@ -86,7 +90,7 @@
         :pagination="false"
         :bordered="true"
         :single-line="false"
-        :scroll-x="1180"
+        :scroll-x="1400"
       />
     </section>
   </div>
@@ -108,7 +112,7 @@ import {
 
 const { t } = useI18n();
 
-const DAY_OPTIONS = [1, 3, 7, 30];
+const DAY_OPTIONS: Array<number | "today"> = ["today", 1, 3, 7, 30];
 const STATE_ORDER: Record<HealthState, number> = { down: 0, degraded: 1, unknown: 2, healthy: 3 };
 const STATE_COLOR: Record<HealthState, string> = {
   healthy: "#4ade80", degraded: "#fbbf24", down: "#f87171", unknown: "#94a3b8",
@@ -118,7 +122,7 @@ const SOURCE_LABELS: Record<CallSource, string> = {
 };
 
 const data = ref<HealthResponse | null>(null);
-const days = ref(7);
+const days = ref<number | "today">("today");
 const loading = ref(false);
 const onlyIssues = ref(false);
 const keyword = ref("");
@@ -222,6 +226,39 @@ function lastCell(it: HealthItem) {
   ]);
 }
 
+/** 插件自己埋点的逐次调用。核心表按「轮」记，被备用救回的失败它看不见，所以单独一列。 */
+function callsCell(it: HealthItem) {
+  const c = it.calls || {};
+  const tip = c.counted
+    ? t("monitor.callsTip", { total: c.total ?? 0, ok: c.ok ?? 0, fail: c.fail ?? 0, aborted: c.aborted ?? 0 })
+      + (c.last && !c.last.ok && c.last.error_code
+        ? t("monitor.callsLastErr", { code: c.last.error_code }) : "")
+    : (data.value?.calls_available ? t("monitor.callsNone") : t("monitor.callsOffTip"));
+  if (!c.counted) {
+    return h(NTooltip, { trigger: "hover" }, {
+      default: () => tip,
+      trigger: () => h("span", { class: "num thin" }, "–"),
+    });
+  }
+  return h(NTooltip, { trigger: "hover" }, {
+    default: () => tip,
+    trigger: () => h("div", { class: "calls-cell" }, [
+      h("span", { class: "num" }, String(c.counted)),
+      h("span", { class: c.fail ? "num bad" : "num good" },
+        c.fail ? t("monitor.callsFail", { n: c.fail }) : t("monitor.callsAllOk")),
+    ]),
+  });
+}
+
+function callsLatCell(it: HealthItem) {
+  const c = it.calls || {};
+  if (!c.counted) return h("span", { class: "num thin" }, "–");
+  return h("div", { class: "calls-cell" }, [
+    h("span", { class: "num" }, fmtMs(c.avg_latency_ms)),
+    h("span", { class: "num sub" }, t("monitor.callsTtft", { v: fmtMs(c.avg_ttft_ms) })),
+  ]);
+}
+
 function scopeDots(it: HealthItem) {
   const s = it.scope;
   const marks: Array<[string, boolean]> = [["manual", s.manual], ["scheduled", s.scheduled], ["command", s.command]];
@@ -278,6 +315,8 @@ const columns = computed<DataTableColumns<HealthItem>>(() => [
         "n=" + (it.window?.total || 0)),
     }),
   },
+  { title: t("monitor.colCalls"), key: "calls", width: 96, align: "right", render: callsCell },
+  { title: t("monitor.colCallsLat"), key: "callslat", width: 104, align: "right", render: callsLatCell },
   {
     title: t("monitor.colBilling"), key: "billing", width: 140,
     render: (it) => h("span", null, billingText(it)),
@@ -368,6 +407,8 @@ onMounted(load);
 :deep(.last-cell) { display: flex; flex-direction: column; gap: 2px; }
 :deep(.last-main) { display: flex; align-items: center; gap: 6px; }
 :deep(.last-time) { font-size: 11px; opacity: .5; }
+:deep(.calls-cell) { display: flex; flex-direction: column; gap: 1px; align-items: flex-end; line-height: 1.35; }
+:deep(.num.sub) { font-size: 11px; opacity: .55; }
 :deep(.src-tag) {
   font-size: 10px; padding: 1px 5px; border-radius: 4px;
   background: rgba(148, 163, 184, .14); color: #9aa3c0;

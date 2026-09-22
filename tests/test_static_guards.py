@@ -30,6 +30,12 @@ EXPECTED_COMMANDS = {
     "cmd_model_mute": ("模型静音", "ADMIN"),
     "cmd_model_status": ("模型状态", "ADMIN"),
     "cmd_model_stats": ("模型统计", "ADMIN"),
+    "cmd_switch_model": ("切换系统模型", "ADMIN"),
+}
+
+# 非 command 的钩子型 handler：靠 custom_filter 匹配，必须带 filter 装饰器否则永不触发
+EXPECTED_FILTERED = {
+    "on_number_pick": "custom_filter",
 }
 
 _failures: list[str] = []
@@ -95,6 +101,25 @@ def check_command_registration(tree: ast.Module) -> None:
             check(perm_at >= 0 and perm_at < cmd_at, f"{meth_name} permission_type 位于 command 之上")
         else:
             check(perm_text is None, f"{meth_name} 未声明 permission_type（全员可用）")
+
+    # 有人新增了 cmd_* 却没登记进清单时，上面的循环不会报任何东西 —— 清单本身也会腐烂。
+    unlisted = sorted(set(m for m in methods if m.startswith("cmd_")) - set(EXPECTED_COMMANDS))
+    check(not unlisted, f"清单覆盖了所有 cmd_* 方法（未登记：{unlisted}）" if unlisted
+          else "清单覆盖了所有 cmd_* 方法")
+
+    # custom_filter 型 handler：没有 filter 装饰器就永远不会被触发，
+    # 而且症状是「回数字没反应」，和装饰器被吃掉那一类完全一样。
+    for meth_name, want_dec in EXPECTED_FILTERED.items():
+        meth = methods.get(meth_name)
+        if meth is None:
+            check(False, f"{meth_name} 存在")
+            continue
+        decs = [dec_text(d) for d in meth.decorator_list]
+        check(any(want_dec + "(" in d for d in decs),
+              f"{meth_name} 带 @{want_dec}(...)，否则永不触发")
+        check(isinstance(meth, ast.AsyncFunctionDef)
+              and any(isinstance(n, ast.Yield) for n in ast.walk(meth)),
+              f"{meth_name} 是 async generator")
 
     # @register 误挂到顶层函数上，会让插件类压根没注册——同样静默
     for node in tree.body:

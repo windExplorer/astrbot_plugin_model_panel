@@ -192,6 +192,96 @@ MIN_LIVE_SAMPLES = 3
 DEGRADED_FAIL_RATE = 0.10
 DOWN_FAIL_RATE = 0.50
 
+# 卡片/选单上的状态文案。集中一处，免得同一个状态在两张卡上叫法不一样。
+_STATE_LABELS = {"healthy": "正常", "degraded": "降级", "down": "故障", "unknown": "无数据"}
+
+# 序号选单：``f"{umo}|{actor}"`` -> {kind, pids, expires}。
+# 放模块级而不是实例级，是因为拦数字消息的 CustomFilter 拿不到插件实例，
+# 而它必须能在 filter 阶段就判断「这个会话有没有挂过选单」——
+# 否则就得在 handler 里决定吞不吞消息，而 handler 一旦匹配上，
+# 日常发一句「3」的人就会被我们的逻辑拦下来。
+_PICKERS: dict[str, dict] = {}
+_PICKER_TTL_SEC = 180
+
+
+def _picker_key(umo: str, actor: str) -> str:
+    return f"{umo}|{actor}"
+
+
+def _picker_prune() -> None:
+    now = time.time()
+    for key in [k for k, v in _PICKERS.items() if v.get("expires", 0) <= now]:
+        _PICKERS.pop(key, None)
+
+
+def _picker_arm(umo: str, actor: str, kind: str, pids: list) -> None:
+    _picker_prune()
+    _PICKERS[_picker_key(umo, actor)] = {
+        "kind": kind, "pids": list(pids), "expires": time.time() + _PICKER_TTL_SEC,
+    }
+
+
+def _picker_peek(umo: str, actor: str) -> bool:
+    """这个 (会话, 人) 有没有挂着未过期的选单。filter 阶段用，不作废。"""
+    entry = _PICKERS.get(_picker_key(umo, actor))
+    return bool(entry and entry.get("expires", 0) > time.time())
+
+
+def _picker_disarm(umo: str, actor: str) -> None:
+    _PICKERS.pop(_picker_key(umo, actor), None)
+
+
+def _picker_take(umo: str, actor: str, index: int):
+    """按序号取选单项并作废。取完就作废，避免同一串数字被重复执行。"""
+    key = _picker_key(umo, actor)
+    entry = _PICKERS.get(key)
+    if not entry or entry.get("expires", 0) <= time.time():
+        _PICKERS.pop(key, None)
+        return None
+    pids = entry.get("pids") or []
+    if index < 1 or index > len(pids):
+        return None
+    _PICKERS.pop(key, None)
+    return str(entry.get("kind") or ""), str(pids[index - 1])
+
+
+def _actor_key(event: AstrMessageEvent) -> str:
+    """这条消息是谁发的。
+
+    核心 ``get_sender_id()`` 在 ``user_id`` 是 int 时会直接返回空串（已知行为），
+    所以兜底去取原始 sender 字段。选单要按人而不只按会话来认，否则群里管理员
+    刚列出模型，别人回一个数字就把系统默认模型切走了。
+    """
+    try:
+        sid = str(event.get_sender_id() or "").strip()
+        if sid:
+            return sid
+    except Exception:
+        pass
+    raw = getattr(getattr(event, "message_obj", None), "sender", None)
+    for attr in ("user_id", "uid", "user"):
+        try:
+            v = raw.get(attr) if isinstance(raw, dict) else getattr(raw, attr, None)
+        except Exception:
+            v = None
+        if v:
+            return str(v)
+    return str(event.unified_msg_origin or "")
+
+
+class NumberPickerFilter(astr_filter.CustomFilter):
+    """只在「整条消息就是一个数字」且这个会话+这个人挂着未过期选单时才放行。
+
+    两条都要在 filter 阶段判完：如果先进了 handler 再决定不管，
+    普通用户日常发一句「3」就会被插件吃掉不回话 —— 那是最难排查的投诉之一。
+    """
+
+    def filter(self, event, cfg) -> bool:
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text.isdigit() or len(text) > 3:
+            return False
+        return _picker_peek(str(event.unified_msg_origin or ""), _actor_key(event))
+
 
 def _derive_state(live: dict, probe: dict) -> tuple[str, str]:
     """推一个健康态：真实对话监测优先，样本不够时退回最近一次探测。
@@ -3635,6 +3725,246 @@ class ModelPanelPlugin(Star):
         yield event.plain_result(
             f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
             + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
+
+    # ================= 序号选单（先列后回数字） =================
+    _PICK_PROBE = "probe"
+    _PICK_SWITCH = "switch"
+
+    def _arm_picker(self, event: AstrMessageEvent, kind: str, pids: list) -> None:
+        _picker_arm(str(event.unified_msg_origin or ""), _actor_key(event), kind, pids)
+
+    def _take_picker(self, event: AstrMessageEvent, index: int):
+        return _picker_take(str(event.unified_msg_origin or ""), _actor_key(event), index)
+
+    async def _picker_card(self, title: str, badge: str, entries: list[dict], footnotes: list[str]):
+        """把「序号 + 模型 + 状态 + 延迟」画成选单卡；没字体时退回编号文本。"""
+        rows = [{
+            "state": e.get("state") or "unknown",
+            "name": f"{i + 1}. {e.get('name') or e.get('pid')}",
+            "sub": str(e.get("sub") or ""),
+            "cells": [str(e.get("latency") or "-"), str(e.get("verdict") or "-")],
+        } for i, e in enumerate(entries)]
+        stats = [
+            {"label": "正常", "value": str(sum(1 for e in entries if e.get("state") == "healthy")), "state": "healthy"},
+            {"label": "故障", "value": str(sum(1 for e in entries if e.get("state") == "down")), "state": "down"},
+            {"label": "共", "value": str(len(entries)), "state": "unknown"},
+        ]
+        cfg = getattr(self, "config", None)
+        font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
+        png = await asyncio.to_thread(render_card, title, badge, stats, ["延迟", "状态"],
+                                      rows, footnotes + [time.strftime("%m-%d %H:%M")], font)
+        if png is not None:
+            return MessageChain([Image.fromBytes(png)])
+        lines = [title]
+        for i, e in enumerate(entries):
+            lines.append(f"{i + 1}. {e.get('name') or e.get('pid')}  "
+                         f"{e.get('verdict') or '-'} {e.get('latency') or '-'} {e.get('sub') or ''}".rstrip())
+        lines.append(footnotes[0] if footnotes else "")
+        return MessageChain([Plain("\n".join(lines))])
+
+    async def _probe_candidates(self) -> list:
+        """开放了「指令检测」通道的模型，顺序与选单编号一致。"""
+        scopes = {}
+        if self.storage:
+            try:
+                scopes = await self.storage.get_detect_scopes()
+            except Exception as e:
+                logger.warning(f"[ModelPanel] 读取指令检测名单失败: {e}")
+        out = []
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = str(d.get("id") or "")
+            if pid and (scopes.get(pid) or {}).get("command", True):
+                out.append((pid, d, p))
+        return out
+
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("检测模型")
+    async def cmd_model_probe(self, event: AstrMessageEvent):
+        """指令检测：不带参数时列出可测模型并编号，回数字即检测。"""
+        keywords = _cmd_args(event).split()
+        if not keywords:
+            candidates = await self._probe_candidates()
+            if not candidates:
+                yield event.plain_result(
+                    "还没有模型开放「指令检测」通道。\n"
+                    "去 WebUI 的「模型管理」页，把需要指令触发的模型勾上「指令检测」。")
+                return
+            view = await self._health_view(days=_today_days())
+            state_of = {str(it.get("id")): it for it in (view.get("items") or [])}
+            entries = []
+            for pid, d, _p in candidates:
+                it = state_of.get(pid) or {}
+                entries.append({
+                    "pid": pid, "state": it.get("state") or "unknown",
+                    "name": d.get("model") or d.get("display_model") or pid,
+                    "sub": str(it.get("reason") or ""),
+                    "latency": _fmt_ms((it.get("calls") or {}).get("avg_latency_ms")),
+                    "verdict": _STATE_LABELS.get(str(it.get("state") or "unknown"), "无数据"),
+                })
+            self._arm_picker(event, self._PICK_PROBE, [pid for pid, _d, _p in candidates])
+            yield event.chain_result((await self._picker_card(
+                "可检测模型", "选单", entries,
+                [f"回复序号数字（1-{len(entries)}）即检测该模型，{_PICKER_TTL_SEC // 60} 分钟内有效；"
+                 f"也可以 /检测模型 <关键词>，单次最多 {self._PROBE_MAX_TARGETS} 个"])).chain)
+            return
+        hits, denied = await self._match_models_async(keywords)
+        if denied:
+            yield event.plain_result(
+                "这些模型没开放指令检测（去模型管理页勾选「指令检测」通道）："
+                + "、".join(str(d.get("display_model") or d.get("id")) for d in denied[:5]))
+            return
+        if not hits:
+            yield event.plain_result("没找到匹配「" + " ".join(keywords) + "」的模型")
+            return
+        if len(hits) > self._PROBE_MAX_TARGETS:
+            yield event.plain_result(
+                f"匹配到 {len(hits)} 个，超过单次上限 {self._PROBE_MAX_TARGETS} 个，关键词再具体一点：\n"
+                + "\n".join(str(d.get("display_model") or pid) for pid, d, _p in hits[:6]))
+            return
+        if self._test_all_lock.locked():
+            yield event.plain_result("已经有一轮检测在跑了（手动或定时），等它结束再试～")
+            return
+        # 先占锁再回执：避免回执到真正开跑之间插进来一次手动一键检测
+        await self._test_all_lock.acquire()
+        timeout = float(self._test_config()["test_timeout"])
+        asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
+        yield event.plain_result(
+            f"已开始检测 {len(hits)} 个模型：" + "、".join(str(d.get("model") or pid) for pid, d, _p in hits)
+            + f"\n最坏约 {int(timeout * len(hits))}s 后把结果卡片发回这里。")
+
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("切换系统模型")
+    async def cmd_switch_model(self, event: AstrMessageEvent):
+        """切换 AstrBot 的默认对话模型：不带参数列出候选并编号，回数字即切换。"""
+        args = _cmd_args(event).split()
+        providers = self._chat_providers()
+        if args and args[0] in ("取消", "cancel"):
+            _picker_disarm(str(event.unified_msg_origin or ""), _actor_key(event))
+            yield event.plain_result("已取消，没有改动默认模型。")
+            return
+        if not args:
+            view = await self._health_view(days=_today_days())
+            state_of = {str(it.get("id")): it for it in (view.get("items") or [])}
+            default_id = await self._default_provider_id()
+            entries = []
+            for p in providers:
+                d = self._provider_display(p)
+                pid = str(d.get("id") or "")
+                if not pid:
+                    continue
+                it = state_of.get(pid) or {}
+                calls = it.get("calls") or {}
+                sub = "当前默认" if pid == default_id else ""
+                if it.get("muted"):
+                    sub = (sub + " · " if sub else "") + "告警静音中"
+                entries.append({
+                    "pid": pid, "state": it.get("state") or "unknown",
+                    "name": d.get("model") or d.get("display_model") or pid,
+                    "sub": sub,
+                    "latency": _fmt_ms(calls.get("avg_ttft_ms") or calls.get("avg_latency_ms")),
+                    "verdict": _STATE_LABELS.get(str(it.get("state") or "unknown"), "无数据"),
+                })
+            if not entries:
+                yield event.plain_result("当前没有加载任何对话模型。")
+                return
+            self._arm_picker(event, self._PICK_SWITCH, [e["pid"] for e in entries])
+            yield event.chain_result((await self._picker_card(
+                "切换系统默认模型", "选单", entries,
+                [f"回复序号数字（1-{len(entries)}）即切换，{_PICKER_TTL_SEC // 60} 分钟内有效；"
+                 "状态与延迟取今天的数据"])).chain)
+            return
+        # 带参数时按关键词匹配，命中唯一才切，避免猜错
+        hits = []
+        pats = [k.lower() for k in args]
+        for p in providers:
+            d = self._provider_display(p)
+            hay = " ".join([str(d.get("display_model") or ""), str(d.get("model") or ""),
+                            str(d.get("name") or ""), str(d.get("id") or "")]).lower()
+            if all(pat in hay for pat in pats):
+                hits.append(d)
+        if not hits:
+            yield event.plain_result(f"没找到匹配「{' '.join(args)}」的模型，发 /切换系统模型 可以看编号列表")
+            return
+        if len(hits) > 1:
+            yield event.plain_result(
+                f"「{' '.join(args)}」匹配到 {len(hits)} 个，说具体一点：\n"
+                + "\n".join(str(h.get("display_model") or h.get("id")) for h in hits[:6]))
+            return
+        await self._apply_default_model(event, str(hits[0].get("id")))
+
+    async def _apply_default_model(self, event: AstrMessageEvent, pid: str) -> None:
+        """把 pid 写成 AstrBot 的默认对话模型并回执。"""
+        known = set(self._provider_ids())
+        if known and pid not in known:
+            yield event.plain_result("那个序号对应的模型已经不在了（可能被删除或改过 id），重新列一次吧。")
+            return
+        cfg = self._astrbot_config()
+        if not isinstance(cfg, dict):
+            yield event.plain_result("读不到 AstrBot 主配置，切换失败。")
+            return
+        before = await self._default_provider_id()
+        if not self._set_chat_provider_id(cfg, pid):
+            yield event.plain_result("配置里没有可写的默认模型字段，未做改动。")
+            return
+        try:
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as e:
+            yield event.plain_result(f"写入配置失败，已放弃切换：{e}")
+            return
+        self._sync_default_chat_runtime(pid)
+        label = pid
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            if str(d.get("id") or "") == pid:
+                label = str(d.get("display_model") or d.get("model") or pid)
+                break
+        logger.info(f"[ModelPanel] 默认对话模型已由指令切换：{before or '未设置'} -> {pid}")
+        yield event.plain_result(
+            f"已切换系统默认模型：{before or '未设置'} → {label}\n"
+            "下一条对话就会走新模型。")
+
+    @astr_filter.custom_filter(NumberPickerFilter)
+    async def on_number_pick(self, event: AstrMessageEvent):
+        """回数字即执行选单。
+
+        NumberPickerFilter 已经确认过「整条消息是一个数字」且这个会话+这个人
+        挂着未过期选单，所以没挂选单的日常数字消息根本不会进到这里 ——
+        它们照常走 LLM，不被插件吞。
+        """
+        text = str(event.message_str or "").strip()
+        if not text.isdigit():
+            return
+        picked = self._take_picker(event, int(text))
+        if not picked:
+            return
+        kind, pid = picked
+        if kind == self._PICK_SWITCH:
+            await self._apply_default_model(event, pid)
+            return
+        if kind == self._PICK_PROBE:
+            provider = None
+            for p in self._chat_providers():
+                if str(self._provider_display(p).get("id") or "") == pid:
+                    provider = p
+                    break
+            if provider is None:
+                yield event.plain_result("那个模型已经不在了（可能被删除或改过 id）。")
+                return
+            if self._test_all_lock.locked():
+                self._arm_picker(event, self._PICK_PROBE, [pid])
+                yield event.plain_result("已经有一轮检测在跑了，等它结束再回一次数字。")
+                return
+            await self._test_all_lock.acquire()
+            timeout = float(self._test_config()["test_timeout"])
+            d = self._provider_display(provider)
+            hits = [(pid, d, provider)]
+            asyncio.create_task(self._run_command_probe(hits, event.unified_msg_origin, timeout))
+            yield event.plain_result(f"已开始检测 {d.get('model') or pid}，最坏约 {int(timeout)}s 后发结果卡片。")
+            return
+        yield event.plain_result("这个选单不支持该操作。")
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("模型静音")
