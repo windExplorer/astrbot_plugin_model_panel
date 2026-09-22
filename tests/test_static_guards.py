@@ -28,6 +28,8 @@ EXPECTED_COMMANDS = {
     "cmd_companion_affinity": ("陪伴分数", None),
     # v1.3.10 起正名为「模型检测」；旧名「检测模型」必须留在 alias 里，否则老用户突然失灵
     "cmd_model_probe": ("模型检测", "ADMIN"),
+    # 「全部模型检测」：不挑通道，机器上的对话模型全测一遍
+    "cmd_probe_all": ("全部模型检测", "ADMIN"),
     "cmd_model_mute": ("模型静音", "ADMIN"),
     "cmd_model_status": ("模型状态", "ADMIN"),
     "cmd_model_stats": ("模型统计", "ADMIN"),

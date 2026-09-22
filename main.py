@@ -14,7 +14,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
-from .card_render import DEFAULT_THEME, THEME_CHOICES, render_card
+from .card_render import DEFAULT_THEME, THEME_CHOICES, TONE_THEMES, render_card
 from .call_recorder import install as install_call_recorder, suppressed as suppress_call_recording, wrapped_classes as recorder_wrapped_classes
 from .monitor import (
     KIND_FAIL,
@@ -3348,7 +3348,8 @@ class ModelPanelPlugin(Star):
             for vendor in sorted(by_vendor, key=_name_sort_key)
         ]
 
-    def _card_row_for(self, item: dict, index: int, detailed: bool = False) -> dict:
+    def _card_row_for(self, item: dict, index: int, detailed: bool = False,
+                      probe: Optional[dict] = None) -> dict:
         """单个模型 → 卡片行（含右对齐数值列）。
 
         数值口径与面板一致：有逐次埋点就以它为准 —— 核心 provider_stats 在
@@ -3382,6 +3383,13 @@ class ModelPanelPlugin(Star):
             "tag": "默认" if item.get("is_default") else ("静音" if item.get("muted") else ""),
             "highlight": bool(item.get("is_default")),
         }
+        if probe is not None:
+            # 刚跑完一次检测时：行底状态是**对面状态机现在的判定**，而这个标签是
+            # 「刚刚这一轮过没过」——两件事都要说，而且必须分得清（用户提过
+            # 「红的却有毫秒、成功率 2.3%，看不出最新这次到底过没过」）。
+            ok = bool(probe.get("ok"))
+            row["probe_label"] = "本次通过" if ok else "本次失败"
+            row["probe_tone"] = "ok" if ok else "bad"
         # 「更新于」列：延迟/成功率都是**历史**数据的统计值，光给数字看不出新鲜度。
         # 真实对话和主动探测都会刷新它，所以这一列回答的是「这行数字是什么时候的」。
         # 取的时间戳必须**跟着延迟数字的来源**走（逐次埋点优先，其次合并台账），
@@ -3414,7 +3422,8 @@ class ModelPanelPlugin(Star):
         return row
 
     def _grouped_card_rows(self, view: dict, *, numbered: bool = True,
-                           detailed: bool = False) -> tuple[list[dict], list[dict]]:
+                           detailed: bool = False,
+                           probe_of: Optional[dict] = None) -> tuple[list[dict], list[dict]]:
         """生成「卡片行表」与「选单选项表」——两者**共用同一份序号**。
 
         Returns:
@@ -3435,7 +3444,9 @@ class ModelPanelPlugin(Star):
             })
             for it in group:
                 n += 1
-                rows.append(self._card_row_for(it, n, detailed))
+                rows.append(self._card_row_for(
+                    it, n, detailed,
+                    (probe_of or {}).get(str(it.get("id") or ""))))
                 options.append({
                     "index": n, "group": False,
                     "label": str(it.get("model") or it.get("display_model")
@@ -3469,19 +3480,26 @@ class ModelPanelPlugin(Star):
     async def _card_png(self, *, title: str, badge: str = "", stats: Optional[list] = None,
                         columns: Optional[list] = None, rows: Optional[list] = None,
                         notes: Optional[list] = None, headline: str = "", meta: str = "",
-                        numbered: bool = False, width: int = 0) -> Optional[bytes]:
+                        numbered: bool = False, width: int = 0,
+                        tone: str = "") -> Optional[bytes]:
         """渲染卡片。返回 PNG bytes；字体不可用时返回 None，调用方降级发文本。
 
         Pillow 是 CPU 密集的，必须 ``to_thread`` —— 直接在事件循环里画会卡住整条消息管线。
         字体路径与主题色都从插件配置读：``card_font_path`` / ``card_theme``，
         主题名不认识时渲染器自己回落到默认主题（配置写错不该让卡片画不出来）。
+
+        ``tone``（``error`` / ``alert`` / ``ok``）会**强制**换成固定主题（见 ``TONE_THEMES``）：
+        报错红、告警橙、恢复绿 —— 与用户的主题偏好无关。区分一张卡是「提醒」还是「出错了」，
+        靠的该是颜色本身，而不是让人去读小字。
         """
         cfg = getattr(self, "config", None)
         font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
         theme = str(cfg.get("card_theme") or "") if hasattr(cfg, "get") else ""
+        forced = TONE_THEMES.get(str(tone or "").strip().lower(), "")
         return await asyncio.to_thread(
             render_card, title, badge, stats or [], columns or [], rows or [], notes or [],
-            font, headline=headline, meta=meta, numbered=numbered, width=width, theme=theme,
+            font, headline=headline, meta=meta, numbered=numbered, width=width,
+            theme=forced or theme,
         )
 
     def _rows_text(self, title: str, rows: list, *, stats: Optional[list] = None,
@@ -3504,6 +3522,9 @@ class ModelPanelPlugin(Star):
             # 图上状态是行底渐变的颜色，纯文本里没有颜色，得把状态词补回来（否则看不出谁坏了）
             state = _STATE_LABELS.get(str(r.get("state") or ""), "")
             mark = f"[{state}] " if state else ""
+            # 「本次通过 / 失败」同理：图上是彩色胶囊，纯文本里只能靠文字
+            if r.get("probe_label"):
+                mark = f"[{r['probe_label']}] " + mark
             tail = " / ".join(str(x) for x in (r.get("cells") or []))
             lines.append(f"{idx}{mark}{r.get('label')}  {tail}".rstrip())
             if r.get("note"):
@@ -3533,6 +3554,22 @@ class ModelPanelPlugin(Star):
         except Exception as e:
             logger.warning(f"[ModelPanel] 发送文本失败（忽略）: {e}")
             return False
+
+    async def _notice_card(self, event: AstrMessageEvent, *, title: str, headline: str,
+                           note: str = "", tone: str = "alert") -> None:
+        """发一张「只有头 + 脚」的提示卡（检测中 / 撞车 / 报错），渲染不出来退回文本。
+
+        ``tone``：``alert``（橙）= 需要你处理的通知，``error``（红）= 真出错了。
+        与纯文本相比，卡片的好处是**性质写在颜色里**：同一个群里几条指令下去，
+        哪条是「等一会儿」哪条是「去看日志」一眼就能分。
+        """
+        png = await self._card_png(
+            title=title, headline=headline, notes=[note] if note else [],
+            meta=self._card_meta("此刻"), tone=tone, width=1040,
+        )
+        if png is not None and await self._reply_chain(event, MessageChain([Image.fromBytes(png)])):
+            return
+        await self._reply(event, f"{title}｜{headline}" + (f"\n{note}" if note else ""))
 
     @staticmethod
     async def _reply_chain(event: AstrMessageEvent, chain) -> bool:
@@ -3770,9 +3807,14 @@ class ModelPanelPlugin(Star):
         elif kind == KIND_FREE_EXPIRING:
             notes.append("到期后是否转付费请人工确认")
         badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
+        # 这三张卡的颜色**固定**（不跟 card_theme）：橙 = 需要你处理，
+        # 绿 = 已经好了。角标那两个字（告警 / 恢复 / 提醒）与颜色说的是同一件事，
+        # 看颜色认得快、看字确认得准。
+        tone = {KIND_FAIL: "alert", KIND_RECOVER: "ok", KIND_FREE_EXPIRING: "alert"}.get(kind, "")
         png = await self._card_png(
             title=title, badge=badge, stats=stats, columns=columns, rows=rows, notes=notes,
             headline=f"{len(group)} 个模型", meta=self._card_meta("此刻"), width=1040,
+            tone=tone,
         )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
@@ -4351,16 +4393,18 @@ class ModelPanelPlugin(Star):
             return f"回复序号看该模型的明细卡 · {ttl} 分钟内有效"
         return f"回复序号即切换默认模型 · {ttl} 分钟内有效"
 
-    async def _overview_chain(self, event: AstrMessageEvent, view: dict, *, title: str,
+    async def _overview_chain(self, event: Optional[AstrMessageEvent], view: dict, *, title: str,
                               badge: str = "", footer: Optional[list] = None,
-                              kind: str = "", multi: bool = False) -> MessageChain:
+                              kind: str = "", multi: bool = False,
+                              probe_of: Optional[dict] = None) -> MessageChain:
+        """``event`` 允许为 None（后台任务发卡时没有事件）：那时 ``kind`` 必须留空。"""
         """发「模型总览卡」—— 状态 / 统计 / 检测 / 切换四个指令的公共入口。
 
         卡片行与选单选项由 :meth:`_grouped_card_rows` **一次性同时产出**，
         所以卡片上的号与「回数字」认的号天然一致；分两处各算一遍迟早就错位。
         """
         items = list(view.get("items") or [])
-        rows, options = self._grouped_card_rows(view, numbered=True)
+        rows, options = self._grouped_card_rows(view, numbered=True, probe_of=probe_of)
         stats = self._counts_stats(view)
         headline = f"{len(items)} 个模型"
         png = await self._card_png(
@@ -4499,6 +4543,79 @@ class ModelPanelPlugin(Star):
                 + "\n也可以直接发 /模型检测 看编号列表。")
             return
         await self._start_probe(event, hits)
+
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("全部模型检测", alias={"模型全检"})
+    async def cmd_probe_all(self, event: AstrMessageEvent):
+        """一键把**全部**对话模型打一遍（不受「指令检测」通道过滤），跑完发最新状态卡。
+
+        与 `/模型检测` 的分工（两个指令都留着，因为「我配了通道」和
+        「我现在想把机器上的模型全测一遍」是两个不同的意图）：
+
+        - `/模型检测`：只测开放了「指令检测」通道的那批，可带关键词、可回序号选；
+        - `/全部模型检测`：**不挑**，加载中的对话模型全测一遍 —— 用户原话
+          「怎么用指令一次性检测全部模型」。
+
+        三重防重入（用户明确要求「避免任务没跑完就加新的检测任务」）：
+
+        1. ``_test_all_lock``（与手动 / 定时 / 联动**共用一把**）：撞车直接明说，不排队；
+        2. **先占锁再回执**：回执与真正开跑之间不留空档，别人插不进来；
+        3. 开跑前发一张「检测中」卡片（带并发数与最坏耗时）—— 否则用户不知道已经开始了，
+           会再点一次，然后被 ① 拦住，看起来像「没反应」。
+        """
+        title = "全部模型检测"
+        if self._test_all_lock.locked():
+            await self._notice_card(
+                event, title=title, headline="已经有一轮检测在跑了",
+                note="同一时间只跑一轮（手动 / 定时 / 另一条指令都算）· "
+                     "等它跑完再发一次这个指令",
+            )
+            return
+        targets = self._probe_targets_of(
+            [str(self._provider_display(p).get("id") or "") for p in self._chat_providers()])
+        if not targets:
+            await self._notice_card(
+                event, title=title, headline="没有可检测的对话模型",
+                note="先去「服务提供商」里加一个模型，或确认它已经加载",
+                tone="error",
+            )
+            return
+        await self._test_all_lock.acquire()  # 先占锁再回执
+        timeout = float(self._test_config()["test_timeout"])
+        conc = self.probe_parallelism()
+        rounds = -(-len(targets) // conc)
+        await self._notice_card(
+            event, title=title, headline=f"正在检测全部 {len(targets)} 个模型",
+            note=f"{conc} 个并发 · 最坏约 {int(round(rounds * timeout))} 秒 · "
+                 "跑完自动发一张最新的模型状态卡片",
+        )
+        asyncio.create_task(self._run_all_probe(targets, event.unified_msg_origin, timeout))
+
+    async def _run_all_probe(self, targets: list, umo: str, timeout: float) -> None:
+        """后台：全测一遍 → 喂状态机与告警 → 把**最新的模型状态卡**发回原会话。"""
+        try:
+            results, names = await self._probe_batch(targets, timeout)
+            # 记历史用 "command"：面板的来源标签只认那几个既有值，
+            # 为这一条指令新造一个来源会让它显示成「未知」。
+            await self._record_probe_history("command", results)
+            await self._apply_probe_results(
+                results, names, int(time.time()), MonitorConfig.from_config(self.config))
+            view = await self._health_view(days=_today_days())
+            probe_of = {str(r.get("id")): r for r in results if r.get("id")}
+            ok_n = sum(1 for r in results if r.get("ok"))
+            chain = await self._overview_chain(
+                None, view, title="模型状态", badge="全部检测", probe_of=probe_of,
+                footer=[f"刚刚全测了 {len(results)} 个模型：{ok_n} 通过 / "
+                        f"{len(results) - ok_n} 失败（行内标签是本次结果）",
+                        "延迟为最近一次调用耗时；成功率按今天窗口统计",
+                        "「更新」为这一行最近一次记录的时间"],
+            )
+            if not await self.context.send_message(umo, chain):
+                logger.warning("[ModelPanel] 全部模型检测的状态卡未能送回原会话")
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 全部模型检测异常: {e}", exc_info=True)
+        finally:
+            self._test_all_lock.release()
 
     @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
     @astr_filter.command("切换系统模型")

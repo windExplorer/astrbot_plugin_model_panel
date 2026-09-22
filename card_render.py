@@ -116,12 +116,28 @@ THEMES: dict[str, dict[str, tuple]] = {
         "border": (240, 210, 232),
     },
     "indigo": {
+        # v1.3.21 起「靛蓝」是**真的蓝**。旧版这套数字（(79,70,229) 一带）看着是紫的，
+        # 用户提过「默认的主题颜色靛蓝，为啥我看着是紫色」—— 那套配色没删，
+        # 改名成 violet 留在下面，喜欢它的人配一下就行。
+        "top": (226, 236, 255),
+        "bottom": (147, 178, 248),
+        "ink": (23, 45, 96),
+        "sub": (56, 88, 152),
+        "accent": (37, 99, 235),
+        "accent2": (37, 99, 235),
+        "soft": (235, 243, 255),
+        "footer": (242, 247, 255),
+        "border": (198, 216, 245),
+    },
+    "violet": {
+        # 旧版的「靛蓝」：偏紫。留住它是因为它已经出现在很多人的配置里，
+        # 直接把 indigo 改成蓝会让他们的卡片悄悄换个颜色 —— 想找回那个紫，选这个。
         "top": (232, 234, 255),
         "bottom": (160, 170, 248),
         "ink": (42, 38, 94),
         "sub": (78, 74, 138),
         "accent": (79, 70, 229),
-        "accent2": (79, 70, 229),
+        "accent2": (124, 58, 200),
         "soft": (238, 240, 255),
         "footer": (243, 244, 255),
         "border": (206, 210, 243),
@@ -136,6 +152,30 @@ THEMES: dict[str, dict[str, tuple]] = {
         "soft": (233, 247, 244),
         "footer": (238, 250, 247),
         "border": (192, 227, 218),
+    },
+    "amber": {
+        # 琥珀橙：**告警卡的固定主题**（模型故障 / 限时免费到期）。见 TONE_THEMES。
+        "top": (255, 241, 217),
+        "bottom": (249, 203, 132),
+        "ink": (92, 58, 12),
+        "sub": (140, 96, 30),
+        "accent": (186, 96, 12),
+        "accent2": (186, 96, 12),
+        "soft": (253, 243, 229),
+        "footer": (254, 247, 237),
+        "border": (240, 213, 174),
+    },
+    "crimson": {
+        # 朱红：**报错卡的固定主题**（指令执行失败 / 基础设施出错）。见 TONE_THEMES。
+        "top": (255, 231, 234),
+        "bottom": (243, 168, 178),
+        "ink": (92, 20, 32),
+        "sub": (152, 52, 66),
+        "accent": (198, 40, 56),
+        "accent2": (198, 40, 56),
+        "soft": (255, 239, 241),
+        "footer": (255, 245, 246),
+        "border": (246, 200, 208),
     },
     "sunset": {
         "top": (255, 236, 214),
@@ -164,11 +204,24 @@ DEFAULT_THEME = "rose"
 # 给配置页下拉用的候选顺序（键 → 中文名）。别删「rose」：它是默认值。
 THEME_CHOICES = (
     ("rose", "樱粉（默认）"),
-    ("indigo", "靛蓝"),
+    ("indigo", "靛蓝（蓝）"),
+    ("violet", "紫罗兰（旧靛蓝的紫）"),
     ("teal", "青碧"),
+    ("amber", "琥珀橙"),
     ("sunset", "落日橙"),
+    ("crimson", "朱红"),
     ("graphite", "石墨灰"),
 )
+
+# 卡片**性质** → 强制主题：与用户的主题偏好无关，报错就得是红、告警就得是橙。
+# 为什么要有这个：用户原话「能不能把一些提示卡片固定颜色主题，例如报错用红色、告警用橙色」——
+# 一张卡的第一眼信息应该是「它是什么性质」，而不是「我今天喜欢什么颜色」。
+# 其余卡片（状态 / 选单 / 明细 / 只读）仍跟随 card_theme 配置。
+TONE_THEMES = {
+    "error": "crimson",   # 报错：指令执行失败、基础设施出错
+    "alert": "amber",     # 告警：模型故障 / 限时免费到期这类需要人处理的通知
+    "ok": "teal",         # 恢复正常 / 操作成功
+}
 
 # 状态色：浅色底上要压得住，所以全部走深一档
 STATE_COLORS = {
@@ -521,16 +574,27 @@ def _index_badge(draw, fonts: "_Fonts", x: int, cy: int, n: Any, *, style: str,
     draw.text((x + size // 2, cy), str(n), font=font, fill=text_ink + (255,), anchor="mm")
 
 
-def _pill(draw, fonts: "_Fonts", text: str, x: int, cy: int, color: tuple) -> None:
-    """在 ``x`` 处往右画一个描边小胶囊（透明底 + 彩色边与字）。"""
+def _pill(draw, fonts: "_Fonts", text: str, x: int, cy: int, color: tuple,
+          filled: bool = False) -> int:
+    """在 ``x`` 处往右画一个小胶囊，返回**右边界**（供下一个接着排）。
+
+    ``filled=True`` 时画实心（白字）：只给「本次失败」这类**必须立刻看见**的用。
+    一行里全是描边才安静，实心就是重点 —— 满屏实心等于没有重点。
+    """
     if not text:
-        return
+        return int(x)
     font = fonts.get(F_TAG)
     w = int(_text_w(font, text)) + 24
     h = 30
-    draw.rounded_rectangle([x, cy - h // 2, x + w, cy + h // 2], h // 2,
-                           fill=CARD_BG + (255,), outline=color + (255,), width=2)
-    draw.text((x + 12, cy), text, font=font, fill=color + (255,), anchor="lm")
+    box = [x, cy - h // 2, x + w, cy + h // 2]
+    if filled:
+        draw.rounded_rectangle(box, h // 2, fill=color + (255,))
+        draw.text((x + 12, cy), text, font=font, fill=(255, 255, 255, 255), anchor="lm")
+    else:
+        draw.rounded_rectangle(box, h // 2, fill=CARD_BG + (255,),
+                               outline=color + (255,), width=2)
+        draw.text((x + 12, cy), text, font=font, fill=color + (255,), anchor="lm")
+    return int(x + w)
 
 
 def _column_widths(fonts: "_Fonts", columns: list[str], rows: list[dict]) -> list[int]:
@@ -639,6 +703,10 @@ def render_card(
         for r in rows:
             body_h += (GROUP_H if r.get("kind") == "group" else ROW_H) + ROW_GAP
         body_h = body_h - ROW_GAP + 24
+        if not rows:
+            # 没有行就**不留**那条空白带：提示卡（检测中 / 撞车 / 报错）只有头 + 脚，
+            # 中间空一块白会让它看起来像「内容没加载出来」。
+            body_h = 0
 
         foot_lines = [
             ln for note in footnotes
@@ -775,15 +843,33 @@ def render_card(
             label_x = x
             # 名字的可用宽度 = 到第一个数值列（没有数值列就到卡片右沿）再减去小胶囊
             right_limit = (anchors[0][0] - FIT_PAD) if anchors else (body_r - CELL_PAD)
+            # 行内胶囊可以有**两个**：「默认 / 静音」这类身份标签 + 「本次通过 / 本次失败」
+            # 这类结论标签。它们经常同时成立（默认那个模型也可能刚测失败），
+            # 挤掉一个就等于让用户二选一地丢信息。
+            pills: list[tuple[str, tuple, bool]] = []
             tag = str(r.get("tag") or "")
-            tag_w = (int(_text_w(fonts.get(F_TAG), tag)) + 24 + 12) if tag else 0
-            limit = max(60, right_limit - label_x - tag_w)
+            if tag:
+                pills.append((tag, _mix(c["accent2"], TEXT_DARK, 0.15), False))
+            probe_label = str(r.get("probe_label") or "")
+            if probe_label:
+                tone = str(r.get("probe_tone") or "")
+                if tone == "ok":
+                    pills.append((probe_label, STATE_COLORS["healthy"], False))
+                elif tone == "bad":
+                    # **实心红**：刚测出来挂了的那几个模型，是这张卡最要紧的信息
+                    pills.append((probe_label, STATE_COLORS["down"], True))
+                else:
+                    pills.append((probe_label, STATE_COLORS["unknown"], False))
+            pills_w = sum(int(_text_w(fonts.get(F_TAG), t)) + 24 + 10 for t, _c, _f in pills)
+            limit = max(60, right_limit - label_x - pills_w)
             label = _fit(fonts.get(F_NAME), r.get("label") or "", limit)
             note = str(r.get("note") or "")
-            if tag:
+            if pills:
                 # 胶囊必须画在**名字那一行**的高度上：画在行中央会和下面那行副标题叠在一起
-                _pill(draw, fonts, tag, label_x + int(_text_w(fonts.get(F_NAME), label)) + 12,
-                      cy - 15 if note else cy, _mix(c["accent2"], TEXT_DARK, 0.15))
+                px_ = label_x + int(_text_w(fonts.get(F_NAME), label)) + 12
+                for text, color, filled in pills:
+                    px_ = _pill(draw, fonts, text, px_, cy - 15 if note else cy,
+                                color, filled) + 10
             if note:
                 draw.text((label_x, cy - 15), label, font=fonts.get(F_NAME),
                           fill=TEXT_DARK + (255,), anchor="lm")
