@@ -149,6 +149,40 @@ v1.3.10 起四个指令共用同一张卡（`card_render.render_card`），骨�
 - 右上角那个角标写的是**这张卡的性质**（`只读` / `选单` / `详情` / `告警`），
   **不写「实时」**：卡上的数字来自已有记录（最近一次调用），不是此刻探测出来的
 
+### 给别的插件用：对外接口
+
+本插件对外暴露两个方法，供 [萌萌权限控制台](https://github.com/windExplorer/astrbot_plugin_user_gateway)
+的「切换模型检测」联动。**探测与统计口径只此一份** —— 别的插件不该自己再打一遍模型、
+也不该自己算成功率，否则同一个模型在两边的数字迟早对不上。
+
+```python
+md = context.get_registered_star("astrbot_plugin_model_panel")
+panel = md.star_cls                      # 插件实例；未安装 / 被禁用时为 None
+
+# ① 只读快照（不发请求、不花钱）
+snap = await panel.external_snapshot(provider_ids=["..."], days=1.0)
+# → {"ok": True, "items": {pid: {...}}, "missing": [...], "live_available": bool}
+
+# ② 真打一次（会消耗额度），结果写进本插件历史，返回最新快照
+res = await panel.external_detect(["..."])
+# → {"ok": True, "results": [...], "items": {...}} / {"ok": False, "busy": True}
+```
+
+单个模型的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `state` / `available` | `healthy` / `degraded` / `down` / `unknown`；`available` = 没被判成故障 |
+| `latency_ms` | 最近一次调用的延迟（首字优先，与卡片同口径） |
+| `avg_latency_ms` / `success_rate` / `samples` | 窗口内的均值、成功率与样本数（没样本给 `None`，不编 100%） |
+| `last_ts` | **最近一次有数据**的时间（真实对话或探测都会更新它） |
+| `last_probe_ts` | 最近一次**探测**的时间 —— 联动方做「同一模型几分钟内不重复测」按它算 |
+| `last_error_code` / `reason` | 最近一次失败的错误码、状态判定原因 |
+
+注意 `external_detect` 与手动/指令/定时探测**共用一把全局锁**：已有检测在跑时返回
+`busy=True`（不排队 —— 排队只会让两边一起超时），联动方据此提示用户稍后再试。
+外部发起的检测在历史里记为 `gateway`，面板上显示「插件联动」。
+
 ### 卡片配色（可换主题）
 
 在面板的「设置」页（或 AstrBot 插件配置页的 `card_theme`）里选，共五套：

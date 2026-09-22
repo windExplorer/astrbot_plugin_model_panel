@@ -622,7 +622,7 @@ export interface HealthScope {
   explicit: Record<"manual" | "scheduled" | "command", boolean>;
 }
 
-export type CallSource = "chat" | "manual" | "command" | "scheduled";
+export type CallSource = "chat" | "manual" | "command" | "scheduled" | "gateway";
 
 /** 一次调用的最新结果。来源可能是对话，也可能是三种探测入口。 */
 export interface LastCall {

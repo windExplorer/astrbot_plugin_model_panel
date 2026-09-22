@@ -553,6 +553,31 @@ def _name_sort_key(value) -> tuple:
     return (text.lower(), text)
 
 
+def _fmt_ago(ts: Any, now: Optional[float] = None) -> str:
+    """时间戳 → 「刚刚 / 3 分钟前 / 2 小时前 / 3 天前」；拿不到时间返回 ``-``。
+
+    卡片上写**相对时间**而不是 ``09-22 14:05``：看这张卡的人要判断的是「这条数据还新鲜吗」，
+    而「14:05」得先跟当前时刻做一次减法 —— 那个心智负担该由程序承担。
+    超过一个月才退回绝对日期，否则会变成「47 天前」这种没意义的数字。
+    """
+    try:
+        t = int(float(ts or 0))
+    except (TypeError, ValueError):
+        return "-"
+    if t <= 0:
+        return "-"
+    delta = max(0.0, float(now if now is not None else time.time()) - t)
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)} 分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)} 小时前"
+    if delta < 86400 * 30:
+        return f"{int(delta // 86400)} 天前"
+    return time.strftime("%m-%d", time.localtime(t))
+
+
 def _scope_label(days: float) -> str:
     """窗口天数 → 给人看的范围说法（今天 / 近 N 天）。"""
     try:
@@ -711,6 +736,10 @@ def _probe_source(trigger: Any) -> str:
         return "command"
     if t == "scheduled":
         return "scheduled"
+    if t == "gateway":
+        # 同伴插件（权限控制台）的「切换模型检测」发起的检测。单独标一类而不是并进
+        # command：面板上要能分清「谁花的这笔钱」，也便于排查那边的冷却是否生效。
+        return "gateway"
     return "manual"  # single / all / stream 都是人在面板上点的
 
 
@@ -3329,18 +3358,21 @@ class ModelPanelPlugin(Star):
         last = item.get("last") or {}
         c = item.get("calls") or {}
         c_counted = int(c.get("counted") or 0)
+        lat_ts = 0
         if c_counted:
             rate = c.get("fail_rate")
             cl = c.get("last") or {}
             lat = cl.get("ttft_ms") or cl.get("latency_ms") or c.get("avg_latency_ms")
             ok_flag = bool(cl.get("ok"))
             fail_n, total_n = int(c.get("fail") or 0), c_counted
+            lat_ts = int(cl.get("ts") or 0)
         else:
             rate = w.get("fail_rate")
             lat = last.get("ttft_ms") or last.get("latency_ms")
             ok_flag = bool(last.get("ok")) if last else True
             fail_n = int(w.get("fail") or 0)
             total_n = int(w.get("counted") or 0)
+            lat_ts = int(last.get("ts") or 0)
         row = {
             "index": index,
             "state": str(item.get("state") or "unknown"),
@@ -3350,6 +3382,12 @@ class ModelPanelPlugin(Star):
             "tag": "默认" if item.get("is_default") else ("静音" if item.get("muted") else ""),
             "highlight": bool(item.get("is_default")),
         }
+        # 「更新于」列：延迟/成功率都是**历史**数据的统计值，光给数字看不出新鲜度。
+        # 真实对话和主动探测都会刷新它，所以这一列回答的是「这行数字是什么时候的」。
+        # 取的时间戳必须**跟着延迟数字的来源**走（逐次埋点优先，其次合并台账），
+        # 否则会出现「延迟取自 A、时间取自 B」这种对不上的组合。
+        # 一条记录都没有时给 "-"，而不是「刚刚」那种「看着很新其实没数据」的假象。
+        fresh = _fmt_ago(lat_ts or int((last or {}).get("ts") or 0))
         if detailed:
             row["note"] = self._row_sub(item)
             row["cells"] = [
@@ -3358,6 +3396,7 @@ class ModelPanelPlugin(Star):
                 _fmt_ms(c.get("avg_latency_ms") if c_counted else w.get("avg_latency_ms")),
                 _fmt_success(rate) if total_n else "-",
                 f"{fail_n}/{total_n}",
+                fresh,
             ]
             return row
         note = self._row_note(item)
@@ -3370,6 +3409,7 @@ class ModelPanelPlugin(Star):
         row["cells"] = [
             _fmt_ms(lat) if (lat or c_counted or last) else "-",
             _fmt_success(rate) if total_n else "-",
+            fresh,
         ]
         return row
 
@@ -3964,42 +4004,59 @@ class ModelPanelPlugin(Star):
         lines.append(notes[0])
         return MessageChain([Plain("\n".join(lines))])
 
+    async def _probe_batch(self, targets: list, timeout: float) -> tuple[list[dict], dict[str, str]]:
+        """并发探测一批模型，返回 ``(results, names)``。
+
+        **只跑探测**：不写历史、不发消息、不占全局锁 —— 指令检测、定时巡检与
+        「同伴插件（user_gateway）的切换模型检测」三条路都复用这一份实现，
+        免得同一个「怎么算探测成功」的规则被抄成三份、慢慢长歪。
+        """
+        results: list[dict] = []
+        names: dict[str, str] = {}
+        tcfg = self._test_config()
+        modes = await self._probe_modes()
+        concurrency = max(1, min(3, MonitorConfig.from_config(self.config).probe_concurrency))
+        sem = asyncio.Semaphore(concurrency)
+
+        async def one(item):
+            pid, d, provider = item
+            names[pid] = d.get("display_model") or d.get("model") or pid
+            async with sem:
+                try:
+                    r = await self._test_one(provider, timeout, tcfg, modes.get(pid, "non_stream"))
+                except Exception as e:
+                    code, msg = _normalize_error(e)
+                    r = {"ok": False, "latency_ms": None, "error_code": code,
+                         "error": msg, "retry_count": 0}
+                r.update({"id": pid, "name": d.get("name") or "", "model": d.get("model") or "",
+                          "skipped": False, "checked_at": int(time.time())})
+                return r
+
+        results = list(await asyncio.gather(*[one(x) for x in targets]))
+        return results, names
+
+    async def _record_probe_history(self, trigger: str, results: list[dict]) -> None:
+        """把一次探测的结果写进历史（来源标记决定它在面板上算哪一种）。"""
+        if not self.storage or not results:
+            return
+        try:
+            ok_n = sum(1 for r in results if r.get("ok"))
+            session = await self.storage.create_session(trigger, len(results))
+            for r in results:
+                await self.storage.insert_result(session["id"], r)
+            await self.storage.finish_session(session["id"], ok_n, len(results) - ok_n, 0)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 探测写历史失败（{trigger}）: {e}")
+
     async def _run_command_probe(self, targets: list, umo: str, timeout: float) -> None:
         """后台跑指令探测并把结果推回原会话。
 
         不阻塞指令回执：3 个模型串起来最坏是 3 × 超时，直接在 handler 里等会让用户以为 bot 挂了。
         """
-        results: list[dict] = []
-        names = {}
         try:
+            results, names = await self._probe_batch(targets, timeout)
+            await self._record_probe_history("command", results)
             tcfg = self._test_config()
-            modes = await self._probe_modes()
-            sem = asyncio.Semaphore(max(1, min(3, MonitorConfig.from_config(self.config).probe_concurrency)))
-
-            async def one(item):
-                pid, d, provider = item
-                names[pid] = d.get("display_model") or d.get("model") or pid
-                async with sem:
-                    try:
-                        r = await self._test_one(provider, timeout, tcfg, modes.get(pid, "non_stream"))
-                    except Exception as e:
-                        code, msg = _normalize_error(e)
-                        r = {"ok": False, "latency_ms": None, "error_code": code,
-                             "error": msg, "retry_count": 0}
-                    r.update({"id": pid, "name": d.get("name") or "", "model": d.get("model") or "",
-                              "skipped": False, "checked_at": int(time.time())})
-                    return r
-
-            results = list(await asyncio.gather(*[one(x) for x in targets]))
-            if self.storage:
-                try:
-                    ok_n = sum(1 for r in results if r.get("ok"))
-                    session = await self.storage.create_session("command", len(results))
-                    for r in results:
-                        await self.storage.insert_result(session["id"], r)
-                    await self.storage.finish_session(session["id"], ok_n, len(results) - ok_n, 0)
-                except Exception as e:
-                    logger.warning(f"[ModelPanel] 指令探测写历史失败: {e}")
             # 每行已经带各自时刻，底部再放一个总时间戳会看着像两处不一致
             chain = await self._probe_result_chain(
                 results, names,
@@ -4010,6 +4067,165 @@ class ModelPanelPlugin(Star):
             logger.warning(f"[ModelPanel] 指令探测异常: {e}", exc_info=True)
         finally:
             self._test_all_lock.release()
+
+    # ================= 对外接口（供其它插件联动） =================
+    # 这两个方法被 astrbot_plugin_user_gateway 的「切换模型检测」调用。
+    # 它们**只此一份**实现对的探测与统计口径，别的插件不该自己再打一遍模型、
+    # 也不该自己算成功率 —— 否则同一个模型在两边的数字会对不上。
+    # 改动这两个方法的返回结构前，先看 user_gateway 的 detect.py 怎么读。
+    EXTERNAL_TRIGGER = "gateway"
+
+    def _external_item(self, item: dict) -> dict:
+        """把内部视图项裁成对外快照（只留别的插件真正会用的字段）。"""
+        calls = item.get("calls") or {}
+        last = item.get("last") or {}
+        window = item.get("window") or {}
+        counted = int(calls.get("counted") or 0)
+        if counted:
+            fail_rate = calls.get("fail_rate")
+            samples = counted
+        else:
+            fail_rate = window.get("fail_rate")
+            samples = int(window.get("counted") or 0)
+        return {
+            "provider_id": str(item.get("id") or ""),
+            "model": str(item.get("model") or ""),
+            "vendor": str(item.get("name") or ""),
+            "label": str(item.get("display_model") or item.get("model") or item.get("id") or ""),
+            "state": str(item.get("state") or "unknown"),
+            # 「可用」= 没被判成故障。unknown（没数据）也算可用：
+            # 没测过的模型不该在别人家里被标成不可用
+            "available": str(item.get("state") or "unknown") != "down",
+            "latency_ms": (last.get("ttft_ms") or last.get("latency_ms")
+                           if last else None),
+            "avg_latency_ms": (calls.get("avg_latency_ms") if counted
+                               else window.get("avg_latency_ms")),
+            "success_rate": (None if not samples
+                             else round(1.0 - float(fail_rate or 0.0), 4)),
+            "samples": samples,
+            "last_ts": int((last or {}).get("ts") or 0),
+            "last_ok": (bool(last.get("ok")) if last else None),
+            "last_error_code": str((last or {}).get("error_code") or ""),
+            "last_source": str((last or {}).get("source") or ""),
+            "is_default": bool(item.get("is_default")),
+            "reason": str(item.get("reason") or ""),
+        }
+
+    async def _external_lookup(self, provider_ids) -> dict[str, dict]:
+        """provider_id → 探测目标 ``(pid, display, provider)``，按传入顺序。"""
+        want = None if provider_ids is None else {str(p) for p in provider_ids}
+        out: dict[str, tuple] = {}
+        for p in self._chat_providers():
+            d = self._provider_display(p)
+            pid = str(d.get("id") or "")
+            if not pid or (want is not None and pid not in want):
+                continue
+            out[pid] = (pid, d, p)
+        return out
+
+    async def external_snapshot(self, provider_ids=None, days: float = 0.0) -> dict:
+        """给别的插件读的模型健康快照。**只读已有记录**：不请求模型、不产生费用。
+
+        Args:
+            provider_ids: 只关心这些 provider id；``None`` 表示当前加载的全部对话模型。
+            days: 统计窗口天数；``<= 0`` 表示「今天」（与本插件面板的默认口径一致）。
+
+        Returns:
+            ``{"ok": True, "days": float, "items": {pid: {...}}, "missing": [pid, ...]}``。
+            单个模型的字段见 :meth:`_external_item`；``last_ts`` 是**最近一次有数据的时间**
+            （真实对话或探测都会更新它），``last_probe_ts`` 才是最近一次**探测**的时间。
+        """
+        try:
+            view = await self._health_view(days=float(days) if days and days > 0 else _today_days())
+            wanted = None if provider_ids is None else [str(p) for p in provider_ids]
+            items = {str(it.get("id") or ""): self._external_item(it)
+                     for it in (view.get("items") or [])}
+            if wanted is not None:
+                items = {pid: items[pid] for pid in dict.fromkeys(wanted) if pid in items}
+            probes = await self._last_probe_times(list(items))
+            for pid, ts in probes.items():
+                if pid in items:
+                    items[pid]["last_probe_ts"] = ts
+            for pid in items:
+                items[pid].setdefault("last_probe_ts", 0)
+            missing = [str(p) for p in (provider_ids or []) if str(p) not in items]
+            return {"ok": True, "days": float(view.get("days") or 0),
+                    "items": items, "missing": missing,
+                    "live_available": bool(view.get("live_available"))}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] external_snapshot 失败: {e}")
+            return {"ok": False, "error": str(e), "items": {}, "missing": []}
+
+    async def _last_probe_times(self, provider_ids: list) -> dict[str, int]:
+        """每个 provider 最近一次**探测**的时间（模型级冷却就是按它算的）。"""
+        if not self.storage or not provider_ids:
+            return {}
+        try:
+            rows = await self.storage.probe_window(days=30.0, limit=5000)
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 读取探测历史失败: {e}")
+            return {}
+        out: dict[str, int] = {}
+        for r in rows:
+            pid = str(r.get("provider_id") or "")
+            ts = int(r.get("checked_at") or 0)
+            if pid and ts > out.get(pid, 0):
+                out[pid] = ts
+        return {pid: out.get(pid, 0) for pid in provider_ids}
+
+    async def external_detect(self, provider_ids, timeout: float = 0.0) -> dict:
+        """真打一次模型（**会消耗额度**），结果写进本插件历史，并返回最新快照。
+
+        与手动/指令/定时探测**共用一把全局锁**：撞车时返回 ``ok=False, busy=True``，
+        由调用方决定是提示用户稍后再试还是直接跳过 —— 排队等待只会让两边都超时。
+
+        Args:
+            provider_ids: 要检测的 provider id 列表（顺序即回执顺序）。
+            timeout: 单模型超时秒数；``<= 0`` 表示用插件配置里的值。
+
+        Returns:
+            ``{"ok": bool, "results": [...], "items": {pid: {...}}, "error": str, "busy": bool}``；
+            ``results`` 是本次探测的原始结果（含 ``ok`` / ``latency_ms`` / ``error``），
+            可能与 ``items``（读库后的最新快照）不完全一致 —— 后者才是「现在面板上显示的」。
+        """
+        pids = [str(p) for p in (provider_ids or []) if str(p)]
+        if not pids:
+            return {"ok": False, "error": "没有要检测的模型", "results": [], "items": {}}
+        try:
+            timeout = float(timeout) if timeout and timeout > 0 else float(self._test_config()["test_timeout"])
+        except Exception:
+            timeout = 45.0
+        if self._test_all_lock.locked():
+            return {"ok": False, "busy": True, "results": [], "items": {},
+                    "error": "已经有一轮检测在跑了"}
+        await self._test_all_lock.acquire()
+        try:
+            lookup = await self._external_lookup(pids)
+            targets = [lookup[pid] for pid in pids if pid in lookup]
+            missing = [pid for pid in pids if pid not in lookup]
+            if not targets:
+                return {"ok": False, "error": "模型都不在了（可能已被删除或改名）",
+                        "results": [], "items": {}, "missing": missing}
+            results, _names = await self._probe_batch(targets, timeout)
+            await self._record_probe_history(self.EXTERNAL_TRIGGER, results)
+            snap = await self.external_snapshot(pids)
+            logger.info(
+                f"[ModelPanel] 外部检测完成：{len(results)} 个模型，"
+                f"成功 {sum(1 for r in results if r.get('ok'))}"
+            )
+            return {"ok": True, "results": results, "items": snap.get("items") or {},
+                    "missing": missing, "days": snap.get("days")}
+        except Exception as e:
+            logger.warning(f"[ModelPanel] external_detect 异常: {e}", exc_info=True)
+            return {"ok": False, "error": str(e), "results": [], "items": {}}
+        finally:
+            self._test_all_lock.release()
+
+    @staticmethod
+    def external_available() -> dict:
+        """给联动方探活用的静态信息（不碰数据库、不碰网络）。"""
+        return {"plugin": "astrbot_plugin_model_panel", "api": 1,
+                "trigger": ModelPanelPlugin.EXTERNAL_TRIGGER}
 
     # ================= 序号选单与通用卡片 =================
     # 所有聊天指令共用一张「模型总览卡」：按供应商分组、统一编号。
@@ -4063,8 +4279,8 @@ class ModelPanelPlugin(Star):
         stats = self._counts_stats(view)
         headline = f"{len(items)} 个模型"
         png = await self._card_png(
-            title=title, badge=badge, stats=stats, columns=["延迟", "成功率"], rows=rows,
-            notes=list(footer or []), headline=headline,
+            title=title, badge=badge, stats=stats, columns=["延迟", "成功率", "更新"],
+            rows=rows, notes=list(footer or []), headline=headline,
             meta=self._card_meta(_scope_label(view.get("days"))), numbered=True,
         )
         if kind:
@@ -4085,9 +4301,10 @@ class ModelPanelPlugin(Star):
             notes[0] = "部分数据暂不可用（核心统计表读不到）"
         headline = f"{len(items)} 个模型"
         png = await self._card_png(
-            title=title, badge="详情", columns=["首字", "首字P95", "整轮", "成功率", "失败"],
+            title=title, badge="详情",
+            columns=["首字", "首字P95", "整轮", "成功率", "失败", "更新"],
             rows=rows, notes=notes, headline=headline, meta=self._card_meta("今天"),
-            width=1000,
+            width=1080,
         )
         if png is not None:
             return MessageChain([Image.fromBytes(png)])
@@ -4423,7 +4640,8 @@ class ModelPanelPlugin(Star):
             # 标成「实时」会让人以为数字是刚打出来的（用户就是这么指出的），
             # 于是「模型明明挂了，卡上却是绿的」会变成一场没必要的排查。
             footer=["数据来自真实调用的记录，不是此刻探测",
-                    "延迟为最近一次调用耗时；成功率为今天窗口内统计",
+                    "延迟为最近一次调用耗时；成功率按今天窗口统计；"
+                    "「更新」为这一行最近一次记录的时间",
                     "/模型统计 可看单个模型的明细"],
         )
         yield event.chain_result(chain.chain)

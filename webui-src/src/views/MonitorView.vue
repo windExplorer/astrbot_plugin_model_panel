@@ -118,7 +118,7 @@ const STATE_COLOR: Record<HealthState, string> = {
   healthy: "#4ade80", degraded: "#fbbf24", down: "#f87171", unknown: "#94a3b8",
 };
 const SOURCE_LABELS: Record<CallSource, string> = {
-  chat: "对话", manual: "手动", command: "指令", scheduled: "定时",
+  chat: "对话", manual: "手动", command: "指令", scheduled: "定时", gateway: "插件联动",
 };
 
 const data = ref<HealthResponse | null>(null);

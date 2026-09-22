@@ -65,7 +65,7 @@ except Exception:  # pragma: no cover - 仅在没有 Pillow 的环境
     ImageFont = None  # type: ignore
 
 # ---------------- 版面 ----------------
-CARD_W = 880          # 卡片本体默认宽度（不含四周的阴影留白）
+CARD_W = 940          # 卡片本体默认宽度（不含四周的阴影留白）
 CARD_W_MAX = 1160     # 自适应上限：再宽发出去就不像一张卡了
 SHADOW_PAD = 26       # 卡片四周的阴影留白（画布会比卡片大这么多）
 PAD = 40              # 卡片内左右边距
@@ -80,7 +80,7 @@ GROUP_H = 56
 COLHEAD_H = 34
 FOOTER_MIN_H = 64
 COL_GAP = 44          # 数值列间距（太窄时「-」和下一个数会读成一体的「-0.0%」）
-NAME_MIN = 230        # 名称列至少留这么宽，否则模型名会被数字列挤成「deepseek-v3 …」
+NAME_MIN = 300        # 名称列至少留这么宽，否则模型名会被数字列挤成「deepseek-v3 …」
 CELL_PAD = 18         # 数值列右侧的边距
 FIT_PAD = 28          # 名称与右邻元素的硬留白（太小会让名字贴着数字，像连成一句）
 

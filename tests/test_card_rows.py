@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import io
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -35,7 +36,8 @@ def check(cond: bool, label: str) -> None:
 
 
 # 需要的模块级函数 / 常量，以及 ModelPanelPlugin 上的方法（原样 exec，不抄一份）
-WANT_FUNCS = {"_fmt_ms", "_fmt_success", "_name_sort_key", "_error_label", "_scope_label"}
+WANT_FUNCS = {"_fmt_ms", "_fmt_success", "_fmt_ago", "_name_sort_key", "_error_label",
+              "_scope_label"}
 WANT_CONSTS = {"_ERROR_LABELS", "_STATE_LABELS"}
 WANT_METHODS = {
     "_billing_label", "_row_note", "_row_sub",
@@ -143,8 +145,8 @@ def main() -> None:
     print("[明细卡：不画序号]")
     rows_d, _opt_d = rows_of({"items": view["items"]}, numbered=False, detailed=True)
     check(all("index" not in r for r in rows_d), "明细卡的行不带序号（它不需要回号）")
-    check(all(len(r.get("cells") or []) == 5 for r in rows_d if r.get("kind") != "group"),
-          "明细卡是五列（首字/首字P95/整轮/成功率/失败）")
+    check(all(len(r.get("cells") or []) == 6 for r in rows_d if r.get("kind") != "group"),
+          "明细卡是六列（首字/首字P95/整轮/成功率/失败/更新）")
 
     print("[数值口径：有逐次埋点就以它为准]")
     it = item("p9", "OpenAI", "gpt-4o", state="degraded",
@@ -152,7 +154,32 @@ def main() -> None:
                      "last": {"ok": False, "latency_ms": 900.0}},
               window={"counted": 3, "fail": 0, "fail_rate": 0.0, "avg_latency_ms": 50.0})
     row = plug._card_row_for(it, 1)
-    check(row["cells"] == ["900ms", "80.0%"], f"延迟取最近一次、成功率取逐次埋点（实得 {row['cells']}）")
+    check(row["cells"][:2] == ["900ms", "80.0%"],
+          f"延迟取最近一次、成功率取逐次埋点（实得 {row['cells']}）")
+    check(len(row["cells"]) == 3 and row["cells"][2] == "-",
+          "第三列是「更新于」；这条没有 last.ts 时给 -（不是「刚刚」）")
+
+    print("[更新于：标注这行数字是什么时候的]")
+    # 必须拿真实时钟当基准：_card_row_for 内部用 time.time() 算相对时间，
+    # 用一个写死的「未来时间戳」会让一切都变成「刚刚」，测试就成了永远通过的摆设
+    now = time.time()
+    # ① 有逐次埋点：时间必须跟着「逐次埋点的最近一次」走
+    it2 = item("p10", "OpenAI", "gpt-4o", calls={"counted": 1, "fail": 0, "fail_rate": 0.0,
+                                                 "last": {"ok": True, "latency_ms": 800.0,
+                                                          "ts": int(now - 180)}})
+    r2 = plug._card_row_for(it2, 1)
+    check(r2["cells"][2] == "3 分钟前", f"180 秒前 → 「3 分钟前」（实得 {r2['cells'][2]}）")
+    # ② 没有逐次埋点（只读核心表）：退回合并台账的最近一次时间
+    it3 = item("p11", "OpenAI", "gpt-4o",
+               last={"ok": True, "latency_ms": 700.0, "ts": int(now - 7200)},
+               window={"counted": 2, "fail": 0, "fail_rate": 0.0})
+    r3 = plug._card_row_for(it3, 1)
+    check(r3["cells"][2] == "2 小时前", f"没有埋点时用窗口里最近一次的时间（实得 {r3['cells'][2]}）")
+    ago = ns["_fmt_ago"]
+    check(ago(int(now - 5), now) == "刚刚", "5 秒前 → 刚刚")
+    check(ago(int(now - 7200), now) == "2 小时前", "2 小时前")
+    check(ago(int(now - 86400 * 3), now) == "3 天前", "3 天前")
+    check(ago(0, now) == "-" and ago(None, now) == "-", "没有时间戳时给 -，不编「刚刚」")
     check("失败 2 次" in row["note"], "副标题里写明失败次数（旧版看不见的那个数）")
     check(row["state"] == "degraded", "状态透传给渲染器（决定色点颜色）")
 
