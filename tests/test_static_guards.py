@@ -34,6 +34,7 @@ EXPECTED_COMMANDS = {
     "cmd_model_status": ("模型状态", "ADMIN"),
     "cmd_model_stats": ("模型统计", "ADMIN"),
     "cmd_switch_model": ("切换系统模型", "ADMIN"),
+    "cmd_model_help": ("模型帮助", "ADMIN"),
 }
 
 # 指令别名：方法名 → 必须出现的别名（改名的指令要留住旧名）

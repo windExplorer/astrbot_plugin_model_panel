@@ -4778,10 +4778,62 @@ class ModelPanelPlugin(Star):
             if str(d.get("id") or "") == pid:
                 label = str(d.get("display_model") or d.get("model") or pid)
                 break
+        before_label = "未设置"
+        if before:
+            for p in self._chat_providers():
+                d = self._provider_display(p)
+                if str(d.get("id") or "") == str(before):
+                    before_label = str(d.get("display_model") or d.get("model") or before)
+                    break
         logger.info(f"[ModelPanel] 默认对话模型已由指令切换：{before or '未设置'} -> {pid}")
-        await self._reply(event,
-            f"已切换系统默认模型：{before or '未设置'} → {label}\n"
-            "下一条对话就会走新模型。")
+        # 结果也用卡片：文字回执在群里混在其它消息里不显眼，而且「换成了谁」
+        # 是这条指令唯一重要的信息，配得上大字
+        png = await self._card_png(
+            title="切换系统模型", badge="完成",
+            rows=[
+                {"label": before_label, "tag": "切换前"},
+                {"label": label, "tag": "默认", "highlight": True},
+            ],
+            notes=["下一条对话就会走新模型", "发 /切换系统模型 可再换"],
+            headline=label, meta=self._card_meta(),
+            # 结果卡只有两行，用不了 1080 那么宽
+            width=760,
+        )
+        if png is not None:
+            await self._reply_chain(event, MessageChain([Image.fromBytes(png)]))
+        else:
+            await self._reply(event,
+                f"已切换系统默认模型：{before_label} → {label}\n"
+                "下一条对话就会走新模型。")
+
+    @astr_filter.permission_type(astr_filter.PermissionType.ADMIN)
+    @astr_filter.command("模型帮助")
+    async def cmd_model_help(self, event: AstrMessageEvent):
+        """把本插件全部指令画成一张帮助卡（管理员限定；/陪伴分数 的全员可用性写在行注里）。"""
+        rows = [
+            {"label": "/模型状态", "note": "总览：分组 + 序号 + 延迟 / 成功率（只读，不花钱，不挂选单）"},
+            {"label": "/模型统计 [关键词]", "note": "单模型明细：首字 / P95 / 整轮 / 失败次数（回序号看明细）"},
+            {"label": "/模型检测 [关键词…]", "note": "真实探测所选模型并更新面板数据（会花额度；回序号可多选）"},
+            {"label": "/全部模型检测", "note": "不挑通道，加载中的对话模型全测一遍（会花额度）"},
+            {"label": "/切换系统模型 [关键词]", "note": "回序号改默认对话模型，切换成功回一张结果卡"},
+            {"label": "/模型静音 [开|关|状态]", "note": "全部模型告警推送的总开关"},
+            {"label": "/模型帮助", "note": "本卡片"},
+            {"label": "/陪伴分数", "note": "查自己在陪伴插件里的好感度（全员可用）"},
+        ]
+        png = await self._card_png(
+            title="模型帮助", badge="管理员", rows=rows,
+            notes=["除 /陪伴分数 外均为管理员限定（WebUI → 平台配置 → 管理员 ID）",
+                   "旧名 /检测模型 仍可用 · 指令回执不会 @ 发送者"],
+            headline=f"{len(rows)} 条指令", meta=self._card_meta(),
+            width=900,
+        )
+        if png is not None:
+            await self._reply_chain(event, MessageChain([Image.fromBytes(png)]))
+        else:
+            lines = [f"模型帮助｜{len(rows)} 条指令"]
+            lines += [f"{r['label']}  {r['note']}" for r in rows]
+            lines += ["除 /陪伴分数 外均为管理员限定"]
+            await self._reply(event, "\n".join(lines))
 
     @astr_filter.custom_filter(NumberPickerFilter)
     async def on_number_pick(self, event: AstrMessageEvent):
