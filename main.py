@@ -147,6 +147,24 @@ _ERROR_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("server", re.compile(r"internal\s*server|502|503|504|bad\s*gateway|service\s*unavailable", re.I)),
 ]
 
+# 错误码 → 卡片上给人看的说法。卡片会发到聊天里，直接印 `rate_limit` 这种内部码
+# 既看不懂也不体面。
+_ERROR_LABELS = {
+    "timeout": "超时",
+    "refused": "拒绝连接",
+    "connect": "连接失败",
+    "auth": "鉴权失败",
+    "rate_limit": "请求受限",
+    "not_found": "模型不存在",
+    "server": "服务异常",
+    "unknown": "未知异常",
+}
+
+
+def _error_label(code) -> str:
+    return _ERROR_LABELS.get(str(code or "").strip(), "异常")
+
+
 # 错误短消息最长字符数（防止 200 字符堆栈塞满前端）
 ERROR_MESSAGE_MAX = 80
 
@@ -2707,21 +2725,6 @@ class ModelPanelPlugin(Star):
             label = f"{label} {'已到期' if left < 0 else f'剩 {left} 天'}" if label else ""
         return label
 
-    def _card_name(self, item: dict, dup: set) -> str:
-        """卡片里的模型名。
-
-        总览卡不按供应商分组，所以同名模型（不同渠道各是一个 provider）必须带上
-        供应商标才能分辨；其余情况只写模型名 —— 「供应商/一长串路径」在两栏排版里
-        会被截断到看不出差别。
-        """
-        model = str(item.get("model") or "").strip()
-        if not model:
-            return str(item.get("display_model") or item.get("id") or "(未知)")
-        if model in dup:
-            vendor = str(item.get("name") or "").strip()
-            return f"{model} · {vendor}" if vendor else model
-        return model
-
     def _row_note(self, item: dict) -> str:
         """总览卡的行副标题只留给「需要解释的话」。
 
@@ -2761,7 +2764,7 @@ class ModelPanelPlugin(Star):
             if last.get("ok"):
                 verdict = f"最近 {_fmt_ms(last.get('latency_ms'))}"
             else:
-                verdict = f"最近失败 {last.get('error_code') or ''}"
+                verdict = f"最近失败 {_error_label(last.get('error_code'))}"
             parts.append(verdict.strip())
         if item.get("is_default"):
             parts.insert(0, "默认模型")
@@ -2793,40 +2796,45 @@ class ModelPanelPlugin(Star):
         超过约 15 行由渲染器自动折成两栏。
         """
         items = list(view.get("items") or [])
-        ordered = sorted(
-            items,
-            key=lambda it: (
-                self._STATE_ORDER.get(str(it.get("state")), 9),
-                -int((it.get("window") or {}).get("total") or 0),
-            ),
-        )
-        models = [str(it.get("model") or "").strip() for it in ordered]
-        dup = {m for m in models if m and models.count(m) > 1}
-        rows = []
-        for it in ordered:
-            w = it.get("window") or {}
-            last = it.get("last") or {}
-            counted = int(w.get("counted") or 0)
-            if detailed:
-                cells = [
-                    _fmt_ms(w.get("avg_ttft_ms")),
-                    _fmt_ms(w.get("p95_ttft_ms")),
-                    _fmt_ms(w.get("avg_latency_ms")),
-                    _fmt_success(w.get("fail_rate")) if counted else "-",
-                    f"{int(w.get('fail') or 0)}/{counted}",
-                ]
-            else:
-                # 总览只看最新一次：延迟 + 窗口成功率，样本数这类次要信息一律不进卡片
-                cells = [
-                    _fmt_ms(last.get("ttft_ms") or last.get("latency_ms")) if last else "-",
-                    _fmt_success(w.get("fail_rate")) if counted else "-",
-                ]
-            rows.append({
-                "state": it.get("state"),
-                "name": self._card_name(it, dup),
-                "sub": self._row_sub(it) if detailed else self._row_note(it),
-                "cells": cells,
-            })
+        # 先按供应商分组：同名模型挂在不同渠道时，只有分组才分得清是谁。
+        # 组间按「组内最坏状态」排，出问题的供应商整体浮到上面。
+        def worst(list_items):
+            return min((self._STATE_ORDER.get(str(it.get("state")), 9) for it in list_items), default=9)
+
+        by_vendor: dict[str, list] = {}
+        for it in items:
+            by_vendor.setdefault(str(it.get("name") or "未归组供应商"), []).append(it)
+        ordered = []
+        for vendor, group in sorted(by_vendor.items(), key=lambda kv: (worst(kv[1]), kv[0])):
+            for it in sorted(group, key=lambda it: (
+                    self._STATE_ORDER.get(str(it.get("state")), 9),
+                    -int((it.get("window") or {}).get("total") or 0))):
+                row = {
+                    "group": vendor,
+                    "state": it.get("state"),
+                    "name": str(it.get("model") or it.get("display_model") or it.get("id") or "(未知)"),
+                }
+                w = it.get("window") or {}
+                last = it.get("last") or {}
+                counted = int(w.get("counted") or 0)
+                if detailed:
+                    row["sub"] = self._row_sub(it)
+                    row["cells"] = [
+                        _fmt_ms(w.get("avg_ttft_ms")),
+                        _fmt_ms(w.get("p95_ttft_ms")),
+                        _fmt_ms(w.get("avg_latency_ms")),
+                        _fmt_success(w.get("fail_rate")) if counted else "-",
+                        f"{int(w.get('fail') or 0)}/{counted}",
+                    ]
+                else:
+                    # 总览只看最新一次：延迟 + 窗口成功率，样本数这类次要信息一律不进卡片
+                    row["sub"] = self._row_note(it)
+                    row["cells"] = [
+                        _fmt_ms(last.get("ttft_ms") or last.get("latency_ms")) if last else "-",
+                        _fmt_success(w.get("fail_rate")) if counted else "-",
+                    ]
+                ordered.append(row)
+        rows = ordered
         counts = view.get("counts") or {}
         stats = [
             {"label": "正常", "value": str(int(counts.get("healthy") or 0)), "state": "healthy"},
@@ -2839,17 +2847,10 @@ class ModelPanelPlugin(Star):
             stats = []
         columns = (["首字", "首字P95", "整轮", "成功率", "失败"] if detailed
                    else ["延迟", "成功率"])
-        # 脚注是口径纪律落到界面上的地方：探测值和真实对话值绝不能被读成同一个东西
-        if detailed:
-            notes = ["口径：成功率合并所有调用来源（对话 / 手动检测 / 指令检测 / 定时探测）；"
-                     "「首字」与「首字P95」只统计真实对话，不含探测"]
-        else:
-            notes = ["只列开放了「指令检测」通道的模型（与 /检测模型 可测的范围一致）；"
-                     "延迟取最近一次调用：对话为首字耗时，探测为整次往返，两者不可直接比较"]
+        # 卡片是发到聊天里的，脚注一句就够：口径细节留在面板和文档里，不往图上抄
+        notes = ["明细卡各列分别标注统计口径" if detailed else "延迟为最近一次调用耗时"]
         if not view.get("live_available"):
-            notes.append("实时监测不可用（核心表读不到），数值留空，副标题是最近一次探测结果")
-        elif view.get("truncated"):
-            notes.append(f"样本过多已截断，只统计了最近 {int(view.get('samples') or 0)} 条")
+            notes[0] = "部分数据暂不可用"
         notes.append(time.strftime("%m-%d %H:%M"))
         return stats, columns, rows, notes
 
@@ -2867,7 +2868,12 @@ class ModelPanelPlugin(Star):
         """没有可用中文字体时的纯文本降级。丑，但比发一张豆腐块图或报错好。"""
         stats, columns, rows, notes = self._card_payload(view, title, "", False)
         lines = [f"{title}  " + " ".join(f"{s['label']}{s['value']}" for s in stats)]
+        prev_group: object = object()
         for r in rows:
+            group = r.get("group")
+            if group and group != prev_group:
+                lines.append(f"— {group} —")
+            prev_group = group or None
             lines.append(f"[{r['state']}] {r['name']}  " + " / ".join(r["cells"]))
             if r.get("sub"):
                 lines.append(f"    {r['sub']}")
@@ -3033,12 +3039,9 @@ class ModelPanelPlugin(Star):
             })
         notes = []
         if kind == KIND_FAIL:
-            notes.append("故障判定基于真实对话连续失败，不含用户主动打断")
             notes.append(f"冷却 {cooldown_min} 分钟内不重复推送 · /模型静音 可临时关闭")
-        elif kind == KIND_RECOVER:
-            notes.append("需连续成功才算恢复，避免一次成功就宣布好了")
-        else:
-            notes.append("到期后是否转付费请人工确认，已过期不再重复提醒")
+        elif kind == KIND_FREE_EXPIRING:
+            notes.append("到期后是否转付费请人工确认")
         notes.append(time.strftime("%m-%d %H:%M"))
         badge = {KIND_FAIL: "告警", KIND_RECOVER: "恢复", KIND_FREE_EXPIRING: "提醒"}.get(kind, "通知")
         cfg_font = getattr(self, "config", None)
@@ -3264,12 +3267,11 @@ class ModelPanelPlugin(Star):
                 "state": "healthy" if ok else "down",
                 "name": names.get(pid) or pid,
                 "sub": (f"重试 {r.get('retry_count')} 次" if ok and r.get("retry_count")
-                        else (str(r.get("error_code") or "") if not ok else "")),
+                        else (_error_label(r.get("error_code")) if not ok else "")),
                 "cells": [_fmt_ms(r.get("latency_ms")),
                           time.strftime("%H:%M:%S", time.localtime(int(r.get("checked_at") or time.time())))],
             })
-        notes = ["口径：这里是空载探测值（一句 PONG 的往返），不是真实对话延迟，两者不可横向比较",
-                 context_line]
+        notes = ["探测延迟为单次往返耗时", context_line]
         cfg = getattr(self, "config", None)
         font = str(cfg.get("card_font_path") or "") if hasattr(cfg, "get") else ""
         png = await asyncio.to_thread(render_card, "模型探测结果", "指令", stats, ["探测延迟", "时间"],

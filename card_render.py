@@ -61,6 +61,7 @@ STATE_COLORS = {
 HEAD_H = 62        # 标题行，下方一条渐变细线收口
 STATS_H = 44       # 汇总点行
 COLHEAD_H = 32
+GROUP_H = 40       # 供应商分组标题行
 ROW_H = 48         # 单行行高
 ROW_H_SUB = 72     # 带副标题的行
 FOOT_H = 23
@@ -214,6 +215,17 @@ def _row_height(row: dict) -> int:
     return ROW_H_SUB if str(row.get("sub") or "") else ROW_H
 
 
+def _group_count(rows: list[dict]) -> int:
+    """需要画几条分组标题。行按 group 相邻排好即可，重复的 group 会各起一段。"""
+    n, prev = 0, object()
+    for r in rows:
+        g = r.get("group")
+        if g and g != prev:
+            n += 1
+        prev = g or None
+    return n
+
+
 def _column_widths(draw, rows: list[dict], columns: list[str]) -> list[int]:
     """每个数值列需要的像素宽：表头与各单元格文本宽的最大值。
 
@@ -275,7 +287,8 @@ def render_card(
     # 宽度跟着内容走：明细卡有五个数值列，固定 760 会把模型名挤到只剩省略号
     card_w = min(CARD_W_MAX, max(CARD_W, 2 * SHADOW_PAD + 2 * PAD_X + NAME_MIN + numbers_w + 24))
     inner_l, inner_r = SHADOW_PAD + PAD_X, card_w - SHADOW_PAD - PAD_X
-    body_h = sum(_row_height(r) for r in rows) + (COLHEAD_H if cols and rows else 0)
+    body_h = (sum(_row_height(r) for r in rows) + _group_count(rows) * GROUP_H
+              + (COLHEAD_H if cols and rows else 0))
     foot_lines = [ln for note in footnotes for ln in _wrap_lines(scratch, note, _font(14), inner_r - inner_l)]
     card_h = (HEAD_H + (STATS_H if stats else 0) + body_h
               + (FOOT_H * len(foot_lines) + 18 if foot_lines else 12))
@@ -335,11 +348,25 @@ def render_card(
         draw.line([(inner_l, cursor + COLHEAD_H - 1), (inner_r, cursor + COLHEAD_H - 1)], fill=LINE)
         cursor += COLHEAD_H
 
-    # ---------- 行 ----------
+    # ---------- 行（可按供应商分组） ----------
     name_font, sub_font, cell_font = _font(19), _font(14), _font(19)
+    group_font = _font(17)
     name_x = inner_l + 28
     name_max = max(120, ((anchors[0][0] - 24) if anchors else inner_r) - name_x)
+    prev_group: object = object()
     for idx, r in enumerate(rows):
+        group = r.get("group")
+        if group and group != prev_group:
+            cnt = sum(1 for x in rows if x.get("group") == group)
+            draw.rounded_rectangle([inner_l, cursor, inner_r, cursor + GROUP_H - 10],
+                                   radius=10, fill=_mix(ACCENT_A, CARD_BG, 0.93))
+            draw.text((inner_l + 14, cursor + 7),
+                      _fit(draw, str(group), group_font, (inner_r - inner_l) * 0.6),
+                      font=group_font, fill=_mix(ACCENT_A, ACCENT_B, 0.55))
+            gw = int(_text_w(draw, str(group), group_font))
+            draw.text((inner_l + 22 + gw, cursor + 10), f"{cnt} 个", font=_font(14), fill=FG_FAINT)
+            cursor += GROUP_H
+        prev_group = group or None
         state = str(r.get("state") or "unknown")
         color = STATE_COLORS.get(state, STATE_COLORS["unknown"])
         sub = str(r.get("sub") or "")
