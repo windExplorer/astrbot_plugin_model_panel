@@ -264,7 +264,9 @@ F_FOOT = 20     # 底部提示
 
 # 字号 → 已加载字体，按字号缓存避免每次重开字体文件
 _font_cache: dict[tuple[str, int], Any] = {}
-_font_path: Optional[str] = ""  # 空串=未探测；None=探测过且不可用
+_font_path: Optional[str] = ""  # 空串=还没探测到可用字体；命中后才写路径（失败不缓存）
+_font_probe_key = ""  # 上次探测时的 configured，配置变了要重探
+_font_warned = False  # 「没有中文字体」只告警一次
 
 # 断行优先在这些字符处断开（模型名基本是「供应商 · 模型-版本」结构）
 _BREAK_CHARS = " ·-/_,|:：，、"
@@ -356,9 +358,15 @@ def _font_candidates(configured: str = "") -> list[str]:
 
 
 def resolve_font(configured: str = "", force: bool = False) -> Optional[str]:
-    """探测一个可用的中文字体路径，结果缓存。找不到返回 None。"""
-    global _font_path, _font_cache
-    if _font_path != "" and not force:
+    """探测一个可用的中文字体路径。**只缓存成功，且缓存绑定 configured**。
+
+    失败不缓存：「先重启插件、之后再往 data/fonts 丢字体」是最常见的操作顺序，
+    把一次失败记死，用户放了字体也永远出不来图片，只能再重启一次 —— 那是最难查的
+    一种「插件坏了」。代价只是没字体时每张卡多跑一遍候选探测（一串 isfile，微秒级）。
+    缓存绑定 configured：改了配置项要立刻按新路径重探，不然换字体的效果出不来。
+    """
+    global _font_path, _font_probe_key, _font_cache, _font_warned
+    if _font_path and not force and _font_probe_key == configured:
         return _font_path
     _font_cache.clear()
     picked = None
@@ -373,9 +381,16 @@ def resolve_font(configured: str = "", force: bool = False) -> Optional[str]:
             continue
         picked = path
         break
-    _font_path = picked
-    if picked is None:
-        logger.warning("[ModelPanel] 未找到可用中文字体，卡片将降级为纯文本")
+    if picked:
+        _font_path = picked
+        _font_probe_key = configured
+    else:
+        _font_path = ""
+        if not _font_warned:
+            # 只说一次：找不到字体是环境事实，每张卡刷一条会把真正的日志淹掉
+            _font_warned = True
+            logger.warning("[ModelPanel] 未找到可用中文字体，卡片将降级为纯文本"
+                           "（往 data/fonts/ 放一个字体文件即可，不用重启）")
     return picked
 
 

@@ -121,7 +121,9 @@ def main() -> None:
     fonts_dir = os.path.join(data_root, "fonts")
     os.makedirs(fonts_dir, exist_ok=True)
 
-    # 目录里放一堆：字体 / 非字体 / 子目录，排序与过滤都要对
+    # 目录里放一堆：字体 / 非字体 / 子目录，排序与过滤都要对。
+    # 注意**别拿这些假字体去做加载校验**：文件名撞了真系统字体时，Windows 上
+    # 出现过「0 字节的 msyh.ttc 被 FreeType 当成真字体打开」的怪事（见下面 [探测缓存] 一段的说明）。
     names = [
         "zz-unknown.ttf", "msyh.ttc", "NotoSansCJK-Regular.ttc",
         "LXGWWenKai-Medium.ttf", "ResourceHanRoundedCN-Medium.woff2",
@@ -129,7 +131,11 @@ def main() -> None:
     ]
     for n in names:
         p = os.path.join(fonts_dir, n)
-        os.makedirs(p, exist_ok=True) if n == "sub" else io.open(p, "wb").write(b"x")
+        if n == "sub":
+            os.makedirs(p, exist_ok=True)
+        else:
+            with io.open(p, "wb") as fh:  # 必须关掉，否则缓冲区里的字节还没落盘
+                fh.write(b"x")
 
     log, StarTools = install_astrbot_stub(data_root)
     import card_render as CR
@@ -155,6 +161,52 @@ def main() -> None:
     c2 = CR._font_candidates("/somewhere/my.ttf")
     check(c2[0] == "/somewhere/my.ttf", "配置指定的路径优先级最高")
     check(len(c2) > 1, "指定的路径读不到时仍会继续往下找")
+
+    print("[探测缓存只记成功、且绑定 configured]")
+
+    def loadable(path):
+        try:
+            from PIL import ImageFont
+
+            ImageFont.truetype(path, 20)
+            return True
+        except Exception:
+            return False
+
+    # 假字体样本：内容明确不是字体，文件名也不撞任何真系统字体 ——
+    # 上面那批 b"x" 的样本不能拿来做加载校验，见创建处的注释。
+    broken = os.path.join(tmp, "sample-broken.ttf")
+    with io.open(broken, "wb") as fh:
+        fh.write(b"GARBAGE, NOT A FONT " * 64)
+    check(not loadable(broken), "样本本身确实读不动（不然下面几条断言是空的）")
+
+    orig_candidates = CR._font_candidates
+    # 真字体只从系统里挑（跳过临时目录里那些假样本）
+    real = next((p for p in orig_candidates("") if not p.startswith(str(tmp)) and loadable(p)), None)
+    CR._font_candidates = lambda configured="": [broken]
+    CR._font_path, CR._font_probe_key, CR._font_warned = "", "", False
+    check(CR.resolve_font("") is None, "候选全读不动时返回 None（调用方降级纯文本）")
+    check(CR._font_path == "", "失败**不**写缓存：否则以后放了字体也永远出不来，只能再重启")
+    check(CR.resolve_font("") is None, "再问一次仍然重新探测，而不是拿失败结果糊弄")
+    if real:
+        CR._font_candidates = lambda configured="": [real] if configured == "good" else [broken]
+        check(CR.resolve_font("good") == real, "配置指向真字体时命中并缓存")
+        check(CR._font_path == real and CR._font_probe_key == "good", "成功结果连着 configured 一起缓存")
+        check(CR.resolve_font("bad") is None, "改了配置就按新值重探，不沿用旧字体")
+        check(CR._font_path == "", "重探失败时清掉旧缓存，别继续用上一份字体骗人")
+    else:
+        print("  SKIP 本机找不到可加载的中文字体，成功路径那 4 条断言没法验")
+
+    print("[找不到字体只告警一次]")
+    CR._font_path, CR._font_probe_key, CR._font_warned = "", "", False
+    CR._font_candidates = lambda configured="": [broken]
+    log.lines.clear()
+    CR.resolve_font("")
+    CR.resolve_font("")
+    CR.resolve_font("")
+    warns = [x for x in log.lines if "未找到可用中文字体" in x]
+    check(len(warns) == 1, f"没字体时每张卡都刷一条会淹掉日志：{len(warns)} 条")
+    CR._font_candidates = orig_candidates
 
     print("[目录名与 main 一致]")
     msrc = io.open(ROOT / "main.py", encoding="utf-8").read()
