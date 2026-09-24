@@ -1,5 +1,57 @@
 # 更新日志
 
+## v1.4.4
+
+卡片字体支持往 `data/fonts/` 丢文件；库改放插件专属数据目录，并把旧库自动搬过来。
+
+### 需求（原话）
+
+「参考一下我引用的项目，这里面生成的卡片用到了字体，咱们项目是不是也要加个字体，可以吗」
+→「我就是 Docker 用户啊，应该咋整，不能用 astrbot 的特定目录吗，例如 data/fonts 啥的」。
+
+### 先量了几件事（结论和直觉不一样）
+
+- anima 的卡片字体**确实随包**，但不是仓库里那两个 25MB 的霞鹜文楷 ——
+  `$includeList` 收了 `assets`（3.52MB 的 `ResourceHanRoundedCN-Medium.woff2`）而**没收 `fonts/`**，
+  文楷只是开发素材。所以 anima 用户看到的也是圆体。
+- **Pillow/FreeType 能直接加载 woff2**，不用先转 ttf（实测 `getname()` 正常返回）。
+- 同一张卡换字体，渲出来高度 678 / 698 / 714 都不一样 —— 版式跟着字体走，
+  这也是「不打包字体」时跨机器不一致的代价。
+- 打包字体的性价比：一份全量中文 3~25MB，本插件 zip 才 1.07MB。**不打**。
+  改成「投放目录自动扫」，Docker 用户丢个文件就完事，连重装都不用。
+
+### 字体（`card_render.py`）
+
+- 查找顺序改为 **`card_font_path` 指定 → `data/plugin_data/<插件名>/fonts/` →
+  `data/fonts/` → 系统字体**。目录不存在就是空候选，不抛错；
+- 认 `.ttc/.otf/.ttf/.woff2/.woff`，一个目录里躺着好几个时按
+  **霞鹜文楷 > 圆体 > Noto > 思源 > 苹方 > 雅黑** 排，不认识的名字垫底而不是挡路；
+- **点保存配置就重新探测**（`api_set_config` 里 `resolve_font(force=True)`）：
+  用户很可能就是刚丢了字体才来点保存，不重探就得再重启一次 AstrBot 才见得到效果。
+
+### 数据目录（`main.py`）——顺手修掉一个真 bug
+
+- 原来 `initialize()` 里那句 `getattr(self.context, "data_dir")` 是**死分支**：
+  4.28.1 的 `Context` / `Star` 根本没有 `data_dir` 属性（全仓搜 `self.data_dir` 只有无关类命中），
+  于是永远落到 `DEFAULT_DB_PATH = os.path.join("data", "model_panel.db")` ——
+  **相对 CWD**。容器里 `WorkingDirectory` 不是 AstrBot 根目录时，库会写到别处，甚至攒出两份。
+- 现在走 `StarTools.get_data_dir(PLUGIN_NAME)` → `data/plugin_data/astrbot_plugin_model_panel/`
+  （核心助手不可用时手工拼同一路径）。**不是插件安装目录**：`data/plugins/<名>/` 每次更新会被
+  整个 `remove_dir`（`core/star/updater.py`），库放那儿等于每次升级清零；`plugin_data` 只在卸载时删。
+- 启动时自动把旧库连 `-wal` / `-shm` 搬过去（WAL 里可能还有没 checkpoint 的事务），
+  **目标已存在则一律不动**。搬不动只 warning，不打断启动。
+
+### 自检
+
+新增 `tests/test_font_and_db_paths.py`（22 项）：目录排序与扩展名过滤、查找顺序、
+插件目录名与 `main.PLUGIN_NAME` 一致、`StarTools` 不可用时的回退、旧库搬运含 WAL 边车、
+目标已存在不覆盖、路径去重不含自身、搬不动时返回 None 且留日志。
+
+**它当场抓到一个会造成数据丢失的 bug**：`_migrate_legacy_db` 最初漏了「目标已存在就收手」的守卫，
+新库会被老路径上残留的文件直接盖掉。修完做反向对照（删掉那两行守卫）→ 立刻 2 项 MISS。
+
+另：本仓库自带的 `test_card_layout` / `test_card_rows` / `test_merge_ledger` 等一并复跑，全绿。
+
 ## v1.4.3
 
 新增 `/模型帮助`；`/切换系统模型` 的结果改用卡片；README 整体重写。

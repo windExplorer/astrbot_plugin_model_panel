@@ -76,12 +76,14 @@
           <n-form-item label="卡片中文字体路径">
             <n-input
               v-model:value="form.card_font_path"
-              placeholder="留空 = 自动探测系统字体"
+              placeholder="留空 = 自动探测（data/fonts → 系统字体）"
               style="width: 360px"
               clearable
             />
             <n-text depth="3" style="margin-left: 12px; font-size: 12px">
-              找不到字体时卡片会退化成纯文本，可在这里填一个 .ttc / .otf 的绝对路径。
+              把 .ttc / .otf / .ttf / .woff2 丢进 data/fonts/ 就会自动命中（Docker 推荐这么干），
+              目录里有多个时按 文楷 &gt; 圆体 &gt; Noto &gt; 雅黑 挑；这里填了则以它为准。
+              改完点保存立刻重新探测，不用重启。三处都找不到时卡片降级为纯文本。
             </n-text>
           </n-form-item>
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
 from typing import Any, Optional
 
@@ -14,7 +15,13 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.provider.entities import LLMResponse, ProviderType
 from quart import Response, request
 
-from .card_render import DEFAULT_THEME, THEME_CHOICES, TONE_THEMES, render_card
+from .card_render import (
+    DEFAULT_THEME,
+    THEME_CHOICES,
+    TONE_THEMES,
+    render_card,
+    resolve_font,
+)
 from .call_recorder import install as install_call_recorder, suppressed as suppress_call_recording, wrapped_classes as recorder_wrapped_classes
 from .monitor import (
     KIND_FAIL,
@@ -51,8 +58,10 @@ COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 PLUGIN_NAME = "astrbot_plugin_model_panel"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}"
 
-# 默认数据库路径：AstrBot 插件数据目录 / model_panel.db
-DEFAULT_DB_PATH = os.path.join("data", "model_panel.db")
+# 库文件名。写入位置由 _plugin_data_dir() 决定（data/plugin_data/<插件名>/），
+# 下面这个相对路径只是**历史位置**：v1.3.9 及以前一直拿它当默认值，迁移时要认得它。
+DB_FILE_NAME = "model_panel.db"
+DEFAULT_DB_PATH = os.path.join("data", DB_FILE_NAME)
 
 # 伴侣插件精准模型配置的 provider 字段（与伴侣插件 _allowed_provider_keys 一致）
 COMPANION_PROVIDER_KEYS = [
@@ -454,6 +463,90 @@ class NumberPickerFilter(astr_filter.CustomFilter):
         if not _NUM_LIST_RE.match(text):
             return False
         return _picker_peek(str(event.unified_msg_origin or ""), _actor_key(event))
+
+
+def _astrbot_data_root() -> Optional[str]:
+    """AstrBot 的 ``data/`` 绝对路径。拿不到返回 None，由调用方决定兜底。"""
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        p = str(get_astrbot_data_path() or "")
+        return p or None
+    except Exception:
+        return None
+
+
+def _plugin_data_dir() -> str:
+    """插件专属数据目录。
+
+    为什么不用插件自己的安装目录：``data/plugins/<插件名>/`` 在每次更新安装时会被整个
+    ``remove_dir`` 掉（``core/star/updater.py``），库放那儿等于每次升级清零。
+    ``plugin_data`` 只在卸载时才删（``star_manager`` 的清理分支），这才是持久位。
+
+    ``StarTools.get_data_dir`` 是 4.26+ 的正式入口（绝对路径、自动建目录）；
+    老版本或异常时退回手工拼路径，最后才用相对 CWD —— 那条不保证对，但保证不炸。
+    """
+    try:
+        from astrbot.core.star.star_tools import StarTools
+
+        p = str(StarTools.get_data_dir(PLUGIN_NAME) or "")
+        if p:
+            return p
+    except Exception:
+        pass
+    root = _astrbot_data_root() or "data"
+    p = os.path.join(root, "plugin_data", PLUGIN_NAME)
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def _legacy_db_paths(dst: str) -> list:
+    """历史上真正用过的几个库位置（按尝试顺序），排除目标自身。"""
+    out = [DEFAULT_DB_PATH]
+    root = _astrbot_data_root()
+    if root:
+        out.append(os.path.join(root, DB_FILE_NAME))
+    seen, uniq = set(), []
+    for p in out:
+        try:
+            key = os.path.normcase(os.path.realpath(p))
+        except Exception:
+            key = p
+        if key == os.path.normcase(os.path.realpath(dst)) or key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    return uniq
+
+
+def _migrate_legacy_db(dst: str) -> Optional[str]:
+    """把老位置的库搬进插件数据目录，返回搬过来的源路径；没东西可搬返回 None。
+
+    必须搬、且是搬不是拷：档案、检测历史、告警全在这一个文件里，换了路径不迁移，
+    用户看到的不是「路径变了」而是「数据突然全空」。留在原地则下次再改路径就会
+    撞上「两份同名库哪份是真的」这种更难查的问题。
+
+    目标已存在时**一律不动**：那是本次启动要用的库，任何旧文件都不能盖它。
+    """
+    if os.path.exists(dst):
+        return None
+    for src in _legacy_db_paths(dst):
+        try:
+            if not os.path.isfile(src):
+                continue
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            shutil.move(src, dst)
+            # WAL 边车必须跟着走：-wal 里可能还有没 checkpoint 进主库的事务
+            for suffix in ("-wal", "-shm"):
+                if os.path.isfile(src + suffix):
+                    shutil.move(src + suffix, dst + suffix)
+            return src
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 迁移旧库失败（{src} -> {dst}）: {e}")
+    return None
 
 
 def _derive_state(live: dict, probe: dict) -> tuple[str, str]:
@@ -912,14 +1005,14 @@ class ModelPanelPlugin(Star):
         self._monitor_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
-        # 数据库路径：优先用 AstrBot 提供的数据目录，回退到相对路径
-        db_path = DEFAULT_DB_PATH
-        try:
-            base = getattr(self.context, "data_dir", None) or getattr(self.context, "_data_dir", None)
-            if base:
-                db_path = os.path.join(str(base), "model_panel.db")
-        except Exception:
-            pass
+        # 库放插件专属数据目录（data/plugin_data/<插件名>/），并把老位置的库搬过来。
+        # 老代码那句 getattr(context, "data_dir") 在 4.28.1 上是死分支 —— Context 没有这个
+        # 属性，于是永远落到相对 CWD 的 DEFAULT_DB_PATH，容器里换个 WorkingDirectory 就散到别处。
+        data_dir = _plugin_data_dir()
+        db_path = os.path.join(data_dir, DB_FILE_NAME)
+        moved = _migrate_legacy_db(db_path)
+        if moved:
+            logger.info(f"[ModelPanel] 数据库已迁移到插件数据目录：{moved} -> {db_path}")
         self.storage = Storage(db_path)
         await self.storage.init()
         # 历史清理一次
@@ -2062,6 +2155,12 @@ class ModelPanelPlugin(Star):
             save = getattr(cfg, "save_config", None)
             if callable(save):
                 save()
+            if "card_font_path" in raw:
+                # 落盘后重新探测字体：用户很可能就是刚往 data/fonts 丢了文件才来点保存的，
+                # 不重探就得再让他重启一次 AstrBot 才看得到效果。
+                probe = resolve_font(str(cfg.get("card_font_path") or ""), force=True)
+                logger.info(
+                    f"[ModelPanel] 字体重新探测：{probe or '没有可用中文字体，卡片降级为纯文本'}")
             logger.info(f"[ModelPanel] 写入插件配置: {raw}")
             return {"ok": True}
         except Exception as e:

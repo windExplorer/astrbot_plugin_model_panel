@@ -45,7 +45,10 @@
 - **往 RGBA 图上画带 alpha 的颜色是替换像素、不是叠加**：在白卡上画 ``(*color, 46)``
   会得到一个近乎透明的窟窿。要淡色就先用 ``_mix`` 和白底混成不透明色
   （见 ``_row_left`` / ``_state_dot``）；行底渐变则整个用 ``alpha_composite`` 贴。
-- 中文字体只从系统里找（候选见 ``_font_candidates``），**不往插件包里塞几十 MB 字体**；
+- 中文字体查找顺序：**配置指定 → ``data/plugin_data/<插件名>/fonts`` 与 ``data/fonts``
+  两个投放目录 → 系统字体**（见 ``_font_candidates``）。**不往插件包里塞字体文件**：
+  一份全量中文字体 3~25MB，而这个包连前端才 1MB，Docker 用户往挂载卷的 ``data/fonts/``
+  丢一个文件就能换字体，不用重装插件；
   找不到可用字体时返回 ``None``，由调用方降级发纯文本 —— 宁可丑，不可空白图。
 - 渲染是 CPU 密集的，**必须用 ``asyncio.to_thread`` 包起来调用**，别在事件循环里直接跑。
 - 画不出来**绝不能影响功能**：本模块对外只暴露「返回 PNG bytes 或 None」，
@@ -266,12 +269,66 @@ _font_path: Optional[str] = ""  # 空串=未探测；None=探测过且不可用
 # 断行优先在这些字符处断开（模型名基本是「供应商 · 模型-版本」结构）
 _BREAK_CHARS = " ·-/_,|:：，、"
 
+# Pillow/FreeType 认这几类字体容器（woff2 实测能加载，不必先转格式）
+_FONT_EXTS = (".ttc", ".otf", ".ttf", ".woff2", ".woff")
+# 一个目录里躺着好几个字体时按这个顺序挑：这套浅色卡片配手写体 / 圆体比配黑体协调，
+# 且列表末尾正好是「兜底也认得」的常见名字。不认识的名字排在最后，不会挡路。
+_FONT_NAME_HINTS = ("lxgw", "wenkai", "霞鹜", "hanrounded", "rounded", "圆",
+                    "noto", "sourcehan", "source-han", "pingfang", "msyh")
+# 只用来拼插件自己的持久数据目录。和 main.PLUGIN_NAME 是同一个值，
+# 由 tests/test_static_guards.py 钉住不让它俩漂开。
+_PLUGIN_DIR_NAME = "astrbot_plugin_model_panel"
+
+
+def _data_font_dirs() -> list[str]:
+    """允许用户自己投放字体的目录：插件专属持久位 → AstrBot 共享 ``data/fonts``。
+
+    为什么不把中文字体打进插件包：一份全量中文字体 3~25MB，而这个插件的 zip 才 1MB，
+    为了「开箱有中文」让所有人多下几十 MB 不划算。放目录里则 Docker 用户只要往挂载卷的
+    ``data/fonts/`` 丢一个文件就能换字体，不用重装插件。``data/t2i_templates`` 是核心
+    自己的同类先例。
+    """
+    dirs: list[str] = []
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+        root = str(get_astrbot_data_path() or "")
+    except Exception:  # 老版本没有这个助手，或核心结构变了：只少了两个候选目录，不影响功能
+        root = ""
+    if root:
+        dirs.append(os.path.join(root, "plugin_data", _PLUGIN_DIR_NAME, "fonts"))
+        dirs.append(os.path.join(root, "fonts"))
+    return dirs
+
+
+def _fonts_in(dir_path: str) -> list[str]:
+    """列一个字体目录里的候选，按文件名优先级排。目录不存在就是空列表。"""
+    try:
+        names = [n for n in os.listdir(dir_path) if n.lower().endswith(_FONT_EXTS)]
+    except Exception:
+        return []
+
+    def rank(name: str) -> tuple:
+        low = name.lower()
+        for i, hint in enumerate(_FONT_NAME_HINTS):
+            if hint in low:
+                return (0, i, low)
+        return (1, 0, low)
+
+    return [os.path.join(dir_path, n) for n in sorted(names, key=rank)]
+
 
 def _font_candidates(configured: str = "") -> list[str]:
-    """中文字体候选。configured 允许用户在插件配置里指定路径，优先级最高。"""
+    """中文字体候选。
+
+    顺序：**配置指定 → 用户投放的 data 字体目录 → 系统字体**。
+    configured 允许用户在插件配置里指定路径，优先级最高（想精确指定某一份时用）。
+    """
     out: list[str] = []
     if configured:
         out.append(configured)
+    for d in _data_font_dirs():
+        out += _fonts_in(d)
     if sys.platform.startswith("win"):
         root = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
         out += [

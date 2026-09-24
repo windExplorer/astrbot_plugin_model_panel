@@ -26,7 +26,7 @@
   "card_font_path": {
     "description": "卡片中文字体路径（留空=自动探测系统字体）",
     "type": "string",
-    "hint": "模型状态/告警以图片卡片发送时需要中文字体。留空则自动查找系统字体（Windows 微软雅黑 / Linux Noto Sans CJK / macOS 苹方）。若卡片退化成纯文本，说明没找到中文字体，可在此填一个 .ttc 或 .otf 的绝对路径。插件不内置字体文件，避免包体膨胀数十 MB。",
+    "hint": "卡片中文字体查找顺序：本项指定路径 → data/fonts/ 与 data/plugin_data/astrbot_plugin_model_panel/fonts/ 两个投放目录 → 系统字体（Windows 微软雅黑 / Linux Noto Sans CJK / macOS 苹方）。Docker 推荐做法：把 .ttc/.otf/.ttf/.woff2 丢进挂载卷的 data/fonts/ 即可，留空本项就会自动命中，换字体不用重装插件；该目录里有多个字体时按 霞鹜文楷 > 圆体 > Noto > 思源 > 苹方 > 雅黑 挑。要精确指定某一份就填绝对路径。改完点保存会立刻重新探测，不必重启。若三处都找不到，卡片会降级成纯文本。",
     "default": ""
   },
   "card_theme": {
