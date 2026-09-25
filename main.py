@@ -3881,6 +3881,11 @@ class ModelPanelPlugin(Star):
             now)
         if closed:
             logger.info(f"[ModelPanel] 结掉出窗的临期提醒 ×{closed}")
+        # 同一模型的历史提醒也只留最新一条：临期提醒是按天推进的，旧几条早就不是现状，
+        # 而且升级前攒下的上百条会一直占着 open_alerts 的名额（这一句同时充当历史自愈）
+        superseded = await self.storage.resolve_superseded(KIND_FREE_EXPIRING, now)
+        if superseded:
+            logger.info(f"[ModelPanel] 收敛重复的临期提醒 ×{superseded}")
         pruned = await self.storage.cleanup_alerts(cfg.alert_retention_days)
         if pruned:
             logger.info(f"[ModelPanel] 清理已结告警事件 {pruned} 条")

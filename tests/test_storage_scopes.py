@@ -191,6 +191,22 @@ async def main() -> None:
     check(any(str(a.get("provider_id")) == "p_z" for a in await st.open_alerts()),
           "全程没碰故障告警那一条")
 
+    print("[历史提醒收敛]")
+    for i, txt in enumerate(["限时免费 3 天后到期", "限时免费 2 天后到期", "限时免费 1 天后到期"]):
+        a = await st.open_alert("p_old", KIND_FREE_EXPIRING, txt, 2000 + i, 0)
+        await st.mark_alert_notified(a, 2000 + i)
+    await st.open_alert("p_old", "fail_burst", "连续失败 3 次", 2100, 0)
+    gone = await st.resolve_superseded(KIND_FREE_EXPIRING, 2200)
+    check(gone == 2, f"同一家只留最新一条，旧的 2 条闭合（实得 {gone}）")
+    frees = [a for a in await st.open_alerts() if str(a.get("kind")) == KIND_FREE_EXPIRING]
+    check(sum(1 for a in frees if str(a.get("provider_id")) == "p_old") == 1,
+          "p_old 只剩「剩 1 天」那条还挂着")
+    check((await st.last_notified_text_map(KIND_FREE_EXPIRING)).get("p_old") == "限时免费 1 天后到期",
+          "收敛后去重依据仍是最新那条")
+    check(await st.resolve_superseded(KIND_FREE_EXPIRING, 2300) == 0, "再跑一次是 0，不重复收敛")
+    check(sum(1 for a in await st.open_alerts()
+              if str(a.get("kind")) == "fail_burst") >= 2, "故障告警不参与收敛")
+
     await st.close()
     print()
     if _failures:

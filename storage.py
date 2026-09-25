@@ -1347,6 +1347,28 @@ class Storage:
                 await db.commit()
                 return cur.rowcount or 0
 
+    async def resolve_superseded(self, kind: str, now: int) -> int:
+        """同类型同 provider 只留最新一条未结，其余全部闭合。返回闭合条数。
+
+        临期提醒是按天推进的（剩 3 天 → 剩 2 天 → …），旧的那几条早就不是现状了；
+        不收敛的话，升级前攒下的上百条会一直占着 `open_alerts` 那 50 个名额，
+        把真正的故障告警挤出面板。这一条顺带充当历史数据的自愈。
+        """
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    """UPDATE alert_events SET state='resolved', resolved_at=?
+                       WHERE kind=? AND state IN ('open','notified')
+                         AND id NOT IN (
+                             SELECT MAX(id) FROM alert_events
+                             WHERE kind=? AND state IN ('open','notified')
+                             GROUP BY provider_id)""",
+                    (now, kind, kind),
+                )
+                await db.commit()
+                return cur.rowcount or 0
+
     async def close_alerts_except(self, kind: str, keep: set, now: int) -> int:
         """关掉某类型下所有**不在 keep 里**的未结事件，返回关掉几条。
 
