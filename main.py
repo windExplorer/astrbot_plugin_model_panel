@@ -3872,6 +3872,15 @@ class ModelPanelPlugin(Star):
         await self.storage.set_state_value(
             "calls_cursor" if use_calls else "stats_cursor", str(new_cursor))
         await self._dispatch_alerts(decisions, names, now, cfg)
+        # 临期提醒不像故障告警有「恢复」这个闭合点：到期了、改回付费了、日期挪出窗口了，
+        # 事件都会永远挂在未结列表里。而 open_alerts 带 limit —— 攒够几十条就会把真正的
+        # 故障告警挤出面板。所以本轮不再提醒的 provider 要主动结掉。
+        closed = await self.storage.close_alerts_except(
+            KIND_FREE_EXPIRING,
+            {d.provider_id for d in decisions if d.kind == KIND_FREE_EXPIRING},
+            now)
+        if closed:
+            logger.info(f"[ModelPanel] 结掉出窗的临期提醒 ×{closed}")
         pruned = await self.storage.cleanup_alerts(cfg.alert_retention_days)
         if pruned:
             logger.info(f"[ModelPanel] 清理已结告警事件 {pruned} 条")

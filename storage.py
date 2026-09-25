@@ -1347,7 +1347,33 @@ class Storage:
                 await db.commit()
                 return cur.rowcount or 0
 
-    async def last_notified_at(self, provider_id: str, kind: str) -> int:
+    async def close_alerts_except(self, kind: str, keep: set, now: int) -> int:
+        """关掉某类型下所有**不在 keep 里**的未结事件，返回关掉几条。
+
+        临期提醒没有「恢复」这种天然闭合点：到期了、改回付费了、日期改到窗口外了，
+        事件都会永远挂在未结列表里。而 `open_alerts` 带 limit —— 攒够几十条就把
+        真正的故障告警挤出面板了。闭合不影响去重（`last_notified_text_map` 不看 state）。
+        """
+        keep = {str(x) for x in (keep or set())}
+        await self.init()
+        async with self._lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    """SELECT DISTINCT provider_id FROM alert_events
+                       WHERE kind=? AND state IN ('open','notified')""",
+                    (kind,),
+                )
+                stale = [str(r[0] or "") for r in await cur.fetchall() if str(r[0] or "") not in keep]
+                closed = 0
+                for pid in stale:
+                    r = await db.execute(
+                        """UPDATE alert_events SET state='resolved', resolved_at=?
+                           WHERE provider_id=? AND kind=? AND state IN ('open','notified')""",
+                        (now, pid, kind),
+                    )
+                    closed += r.rowcount or 0
+                await db.commit()
+                return closed
         """该模型该类型最近一次真正发出去告警的时间，冷却判定用。"""
         await self.init()
         async with aiosqlite.connect(self.db_path) as db:

@@ -174,6 +174,22 @@ async def main() -> None:
     check(m.get("p_y") == "限时免费 2 天后到期" and m.get("p_x") == "限时免费 1 天后到期",
           "按 provider 分开记，别家的文案不干扰这家")
     check(await st.last_notified_text_map("fail_burst") == {}, "别的告警类型不串味")
+    # 出窗后要能闭合：未结列表带 limit，攒一堆会把真正的故障告警挤出面板
+    closed = await st.close_alerts_except(KIND_FREE_EXPIRING, {"p_x"}, 1000)
+    check(closed == 1, f"只结掉不在窗口里的那家（实得 {closed}）")
+    left = {str(a.get("provider_id")) for a in await st.open_alerts()}
+    check("p_x" in left and "p_y" not in left, "留下的正是本轮还在提醒的那家")
+    check((await st.last_notified_text_map(KIND_FREE_EXPIRING)).get("p_y") == "限时免费 2 天后到期",
+          "闭合不影响去重依据（不然第二天又催一遍）")
+    await st.open_alert("p_z", "fail_burst", "连续失败 3 次", 1010, 0)
+    left_free = [a for a in await st.open_alerts() if str(a.get("kind")) == KIND_FREE_EXPIRING]
+    closed_all = await st.close_alerts_except(KIND_FREE_EXPIRING, set(), 1020)
+    check(closed_all == len(left_free) and closed_all >= 1,
+          f"keep 为空时关掉该类型全部未结事件（{closed_all} 条，与未结数一致）")
+    check(await st.close_alerts_except(KIND_FREE_EXPIRING, set(), 1030) == 0,
+          "再关一次是 0：不会把已闭合的重复计数")
+    check(any(str(a.get("provider_id")) == "p_z" for a in await st.open_alerts()),
+          "全程没碰故障告警那一条")
 
     await st.close()
     print()
