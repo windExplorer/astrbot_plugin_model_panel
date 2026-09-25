@@ -157,6 +157,51 @@ def main() -> int:
     check("api_key=sk" not in d3.detail.get("last_error_message", ""),
           "连 key=value 这种形态也一起抹掉")
 
+    print("[限时免费到期提醒]")
+    DAY = 86400
+    c2 = cfg(free_alert_days=3)
+    now2 = 2_000_000
+    names2 = {"pf1": "Vendor/free-model"}
+    # 多给 3 小时余量：只前进 30 分钟时 days_left 必须还是 2，否则测的就不是去重了
+    prof = {"pf1": {"billing_type": "temp_free", "free_until": now2 + 2 * DAY + 3 * 3600}}
+
+    first = M.free_expiry_decisions(prof, c2, now2, None, names2)
+    eq([d.reason for d in first], ["限时免费 2 天后到期"], "进入窗口时提醒一次")
+    check(first[0].should_notify, "首轮没被任何条件压住")
+
+    # 这是本次要修的正题：故障告警冷却只有 30 分钟，临期提醒不能跟着每半小时催一遍
+    last = {"pf1": first[0].reason}
+    again = M.free_expiry_decisions(prof, c2, now2 + 1800, lambda pid, kind: False, names2, last)
+    eq([d.suppressed for d in again], ["unchanged"], "半小时后再巡检：同一个剩余天数不再重发")
+    check(not any(d.should_notify for d in again), "去重后这一轮一条都不发")
+    check(len(again) == 1, "仍然产出判定（面板要显示临期状态），只是不投递")
+
+    eq([d.reason for d in M.free_expiry_decisions(prof, c2, now2 + DAY, None, names2, last)],
+       ["限时免费 1 天后到期"], "天数变了要重新提醒")
+    check(M.free_expiry_decisions(prof, c2, now2 + DAY, None, names2, last)[0].should_notify,
+          "新天数照常投递")
+
+    today = {"pf1": {"billing_type": "temp_free", "free_until": now2 + 3600}}
+    eq([d.reason for d in M.free_expiry_decisions(today, c2, now2, None, names2)],
+       ["限时免费今天到期"], "最后一天说人话，不是「0 天后到期」")
+    check(M.free_expiry_decisions(today, c2, now2, None, names2)[0].suppressed == "",
+          "今天到期这条不会被去重误伤（文案和昨天不同）")
+
+    expired = {"pf1": {"billing_type": "temp_free", "free_until": now2 - 60}}
+    check(M.free_expiry_decisions(expired, c2, now2, None, names2) == [], "已过期不再催")
+    far = {"pf1": {"billing_type": "temp_free", "free_until": now2 + 9 * DAY}}
+    check(M.free_expiry_decisions(far, c2, now2, None, names2) == [], "窗口外不提醒")
+    paid = {"pf1": {"billing_type": "paid", "free_until": now2 + 2 * DAY}}
+    check(M.free_expiry_decisions(paid, c2, now2, None, names2) == [], "非限时免费类型不参与")
+    check(M.free_expiry_decisions(prof, cfg(free_alert_days=0), now2, None, names2) == [],
+          "配置设 0 = 彻底关掉提醒")
+
+    off = M.free_expiry_decisions(prof, cfg(free_alert_days=3, notify_enabled=False), now2, None, names2)
+    eq([d.suppressed for d in off], ["notify_off"], "全局静音优先于去重判定")
+    cool = M.free_expiry_decisions(prof, c2, now2, lambda pid, kind: True, names2,
+                                   {"pf1": "限时免费 3 天后到期"})
+    eq([d.suppressed for d in cool], ["cooldown"], "文案不同但仍在冷却里时，冷却兜住")
+
     print()
     if _failures:
         print(f"失败 {len(_failures)} 项：")

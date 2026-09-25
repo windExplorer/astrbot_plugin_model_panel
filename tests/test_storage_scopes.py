@@ -156,6 +156,25 @@ async def main() -> None:
     yest = await st.calls_day_by_provider(day="2000-01-01")
     check("p_x" not in yest, "指定别的日子 → 查不到今天的行（day 过滤生效）")
 
+    print("[到期提醒的去重依据]")
+    from monitor import KIND_FREE_EXPIRING
+    aid = await st.open_alert("p_x", KIND_FREE_EXPIRING, "限时免费 2 天后到期", 500, 0)
+    check(await st.last_notified_text_map(KIND_FREE_EXPIRING) == {},
+          "没送达的事件不算「已提醒过」——否则投递失败就永远不再提醒")
+    await st.mark_alert_notified(aid, 500)
+    got = await st.last_notified_text_map(KIND_FREE_EXPIRING)
+    check(got == {"p_x": "限时免费 2 天后到期"}, f"送达后查得到上次发的文案：{got}")
+    aid2 = await st.open_alert("p_x", KIND_FREE_EXPIRING, "限时免费 1 天后到期", 900, 0)
+    await st.mark_alert_notified(aid2, 900)
+    check((await st.last_notified_text_map(KIND_FREE_EXPIRING)).get("p_x") == "限时免费 1 天后到期",
+          "只认最近一次发出的文案，旧的不会挡住新提醒")
+    aid3 = await st.open_alert("p_y", KIND_FREE_EXPIRING, "限时免费 2 天后到期", 910, 0)
+    await st.mark_alert_notified(aid3, 910)
+    m = await st.last_notified_text_map(KIND_FREE_EXPIRING)
+    check(m.get("p_y") == "限时免费 2 天后到期" and m.get("p_x") == "限时免费 1 天后到期",
+          "按 provider 分开记，别家的文案不干扰这家")
+    check(await st.last_notified_text_map("fail_burst") == {}, "别的告警类型不串味")
+
     await st.close()
     print()
     if _failures:

@@ -1374,6 +1374,28 @@ class Storage:
             rows = await cur.fetchall()
         return {(str(r[0]), str(r[1])): int(r[2] or 0) for r in rows}
 
+    async def last_notified_text_map(self, kind: str) -> dict[str, str]:
+        """``{provider_id: 该类型最近一次**发出去**的告警文案}``。
+
+        临期提醒靠它做「同一个剩余天数只发一次」的判定 —— 文案本身就带着天数，
+        所以比文案等于比事实，比再加一列状态省。
+        只认 ``notified_at`` 有值的行：投递失败的事件没送达，不该压住下一次重试。
+        """
+        await self.init()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """SELECT provider_id, detail FROM alert_events
+                   WHERE kind = ? AND notified_at IS NOT NULL
+                   ORDER BY notified_at DESC, id DESC""",
+                (kind,),
+            )
+            rows = await cur.fetchall()
+        out: dict[str, str] = {}
+        for r in rows:
+            pid = str(r[0] or "")
+            out.setdefault(pid, str(r[1] or ""))  # 每个 provider 只留最新那条
+        return out
+
     async def open_alerts(self, limit: int = 50) -> list[dict[str, Any]]:
         await self.init()
         async with aiosqlite.connect(self.db_path) as db:

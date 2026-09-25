@@ -265,11 +265,18 @@ def free_expiry_decisions(
     now: int,
     cooldown_active: Optional[Callable[[str, str], bool]] = None,
     names: Optional[dict[str, str]] = None,
+    last_sent: Optional[dict[str, str]] = None,
 ) -> list[Decision]:
     """限时免费临期提醒。
 
-    只在「还没到期但已进入提醒窗口」时触发，且走冷却，避免每天重复提醒同一件事。
     已过期不再提醒——到期后到底转付费还是继续免费得人判断，天天催只会变成噪音。
+
+    ``last_sent`` 是「上次**发出去**的那条提醒的文案」（按 provider_id 索引，来自 alert_events）。
+    文案里带着剩余天数，所以拿它一比就等于「同一个剩余天数只发一次」：
+    剩 3 天、2 天、1 天、今天各一条，之后整天待在窗口里也不再重复刷屏。
+    为什么不复用 ``cooldown_active``：那是故障告警的冷却（默认 30 分钟），
+    故障要按周期催、临期提醒不用 —— 混用会变成「三天里每半小时一条、共 144 条」，
+    而配置项的说明写的恰恰是「提醒一次」。改了 ``free_until`` 会让天数变化，自然重新提醒。
     """
     if cfg.free_alert_days <= 0:
         return []
@@ -286,16 +293,19 @@ def free_expiry_decisions(
         days_left = int((until - now) // 86400)
         if not (0 <= days_left <= cfg.free_alert_days):
             continue
+        reason = "限时免费今天到期" if days_left <= 0 else f"限时免费 {days_left} 天后到期"
         d = Decision(
             provider_id=pid,
             state=STATE_HEALTHY,
             action="alert",
             kind=KIND_FREE_EXPIRING,
-            reason=f"限时免费 {days_left} 天后到期",
+            reason=reason,
             detail={"days_left": days_left, "name": str((names or {}).get(pid) or pid)},
         )
         if not cfg.notify_enabled:
             d.suppressed = "notify_off"
+        elif last_sent and str(last_sent.get(pid) or "") == reason:
+            d.suppressed = "unchanged"
         elif cooldown_active and cooldown_active(pid, KIND_FREE_EXPIRING):
             d.suppressed = "cooldown"
         out.append(d)

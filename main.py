@@ -3850,7 +3850,10 @@ class ModelPanelPlugin(Star):
                 names[d["id"]] = d.get("display_model") or d.get("model") or d["id"]
         profiles = await self.storage.get_all_profiles()
         decisions = evaluate_monitor(rows, states, cfg, now, cooling)
-        decisions += free_expiry_decisions(profiles, cfg, now, cooling, names)
+        # 临期提醒按「同一个剩余天数只发一次」去重：它复用的是故障告警的冷却（默认 30 分钟），
+        # 不额外去重的话，一个剩 3 天的模型三天里会被催约 144 次。
+        last_free_sent = await self.storage.last_notified_text_map(KIND_FREE_EXPIRING)
+        decisions += free_expiry_decisions(profiles, cfg, now, cooling, names, last_free_sent)
 
         # 状态照常落库（面板要显示真实状态），投递失败靠 alert_events 里
         # notified_at 为空的 open 事件在下一轮重试，见 _dispatch_alerts。
