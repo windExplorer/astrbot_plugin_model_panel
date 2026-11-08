@@ -149,6 +149,78 @@ COMPANION_KEY_LABELS: dict[str, str] = {
     "EMOTION_JUDGEMENT_PROVIDER_ID": "情绪判定模型",
 }
 
+# ---------------------------------------------------------------------------
+# 陪伴插件 V7（7.x）的配置结构
+# ---------------------------------------------------------------------------
+# V7 取消了 V1 的 37 个 *_PROVIDER_ID 与 model_assignment_config 分组，改成三层：
+#   A 插件级全局默认：仍是 AstrBot 插件配置（star.config），本插件可读写。
+#       config["model"].provider_id / fallback_provider_id / replacement_rules
+#       config["voice_reply"].<10 个 *_provider_id>
+#   B 逐任务路由（主体）：companion_v2 自己的 SQLite，model.<kind>.provider /
+#       .fallback / .replacement_rules，按 installation/role/window 分层继承，
+#       由「陪伴小屋 → 模型与连接」管理。
+#   C 旁挂配置：生图端点 / TTS Provider / 搜索 / Laya / semantic 的独立 JSON。
+# 陪伴插件 docs/extension-development.md 明确：HTTP 路由与数据库结构不构成兼容
+# 承诺，公开 extension_api 只有只读的 task_model_route(user_id, kind)。
+# 所以 V7 下本插件只读写 A 层（写 star.config + save_config + 提示重载），
+# B/C 层只做静态引导，绝不碰它的 SQLite 或未承诺兼容的内部路由。
+COMPANION_V7_MODEL_GROUP = "model"
+COMPANION_V7_VOICE_GROUP = "voice_reply"
+COMPANION_V7_REPLACEMENT_RULES = "replacement_rules"
+COMPANION_V7_ADDITIONAL_PROVIDERS = "additional_providers"
+
+# A 层可设置 / 一键替换的 provider 位置：(slot key, 分组, 字段, 中文用途, 主/备)
+COMPANION_V7_PROVIDER_SLOTS: list[tuple[str, str, str, str, str]] = [
+    ("model.provider_id", "model", "provider_id", "插件任务主模型", "main"),
+    ("model.fallback_provider_id", "model", "fallback_provider_id", "回复任务备用模型", "fallback"),
+    ("voice_reply.provider_id", "voice_reply", "provider_id", "语音回复 · 通用 TTS", "main"),
+    ("voice_reply.zh_provider_id", "voice_reply", "zh_provider_id", "语音回复 · 中文", "main"),
+    ("voice_reply.ja_provider_id", "voice_reply", "ja_provider_id", "语音回复 · 日语", "main"),
+    ("voice_reply.en_provider_id", "voice_reply", "en_provider_id", "语音回复 · 英语", "main"),
+    ("voice_reply.private_zh_provider_id", "voice_reply", "private_zh_provider_id", "语音回复 · 私聊中文", "main"),
+    ("voice_reply.private_ja_provider_id", "voice_reply", "private_ja_provider_id", "语音回复 · 私聊日语", "main"),
+    ("voice_reply.private_en_provider_id", "voice_reply", "private_en_provider_id", "语音回复 · 私聊英语", "main"),
+    ("voice_reply.group_zh_provider_id", "voice_reply", "group_zh_provider_id", "语音回复 · 群聊中文", "main"),
+    ("voice_reply.group_ja_provider_id", "voice_reply", "group_ja_provider_id", "语音回复 · 群聊日语", "main"),
+    ("voice_reply.group_en_provider_id", "voice_reply", "group_en_provider_id", "语音回复 · 群聊英语", "main"),
+]
+COMPANION_V7_SLOT_MAP = {slot[0]: slot for slot in COMPANION_V7_PROVIDER_SLOTS}
+
+# V7 里由「陪伴小屋」管理、本插件只读引导的位置。刻意不写任何读取内部
+# SQLite / HTTP 路由的代码：那些接口在陪伴插件里不构成兼容承诺。
+COMPANION_V7_MANAGED_AREAS: list[dict[str, str]] = [
+    {
+        "group": "逐任务模型路由",
+        "where": "陪伴小屋 → 模型与连接 → 任务模型",
+        "fields": "model.<任务>.provider / .fallback / .replacement_rules",
+        "note": "按 安装 / 角色 / 会话窗口 分层继承，是 V7 模型配置的主体；窗口层的显式设置会覆盖角色层。",
+    },
+    {
+        "group": "替换规则",
+        "where": "陪伴小屋 → 模型与连接",
+        "fields": "model.replacement_rules[].provider_id / [].model",
+        "note": "关键词 / 时段命中时切到指定 Provider。本插件只替换插件级默认里的 provider_id，规则细节请到小屋核对。",
+    },
+    {
+        "group": "生图与视觉",
+        "where": "陪伴小屋 → 模型与连接 → 生图",
+        "fields": "model_image_routes.json 的 endpoints[].model / operation_routes",
+        "note": "生图端点与模型名独立于 AstrBot Provider 目录，模型控制台不读写。",
+    },
+    {
+        "group": "语音 TTS",
+        "where": "陪伴小屋 → 模型与连接 → 语音",
+        "fields": "AstrBot Provider 目录里的 TTS 配置、按语种的绑定",
+        "note": "本插件可改插件级 voice_reply 的语种绑定，TTS Provider 本体仍由 AstrBot 管理。",
+    },
+    {
+        "group": "搜索 / 决策 / 语义",
+        "where": "陪伴小屋 → 设置",
+        "fields": "deepseek_provider_id、Laya 决策模型、embedding_provider / analysis_provider",
+        "note": "这些是陪伴插件自己的 JSON / 设置组，模型控制台不读写。",
+    },
+]
+
 # 错误归一化规则：按关键字匹配出 error_code，避免把接口返回的整段堆栈塞到前端
 _ERROR_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("timeout", re.compile(r"timeout|timed?\s*out|超时", re.I)),
@@ -1401,7 +1473,16 @@ class ModelPanelPlugin(Star):
             return
         record = await self._companion_affinity_record(sender_id)
         if record is None:
-            await self._reply(event, "还没有你的好感度记录，和 bot 聊聊天就会有啦～")
+            # V7 把好感度从插件实例 data["users"] 搬进了自己的 SQLite，
+            # 读不到不是"没记录"，别用旧文案误导用户去反复聊天。
+            if self._companion_generation() == "v7":
+                await self._reply(
+                    event,
+                    "陪伴插件 V7 把好感度搬进了自己的数据库，模型控制台读不到啦～"
+                    "请到「陪伴小屋 → 关系与记忆」查看。",
+                )
+            else:
+                await self._reply(event, "还没有你的好感度记录，和 bot 聊聊天就会有啦～")
             return
         try:
             score = int(record.get("relationship_score") or 0)
@@ -1663,6 +1744,247 @@ class ModelPanelPlugin(Star):
             return None
         return getattr(star, "config", None)
 
+    def _companion_version(self) -> str:
+        """陪伴插件版本号（StarMetadata.version，来自 @register / metadata.yaml）。"""
+        star = self._companion_star()
+        return str(getattr(star, "version", "") or "").strip() if star is not None else ""
+
+    def _companion_generation(self) -> str:
+        """判断陪伴插件配置结构代际：'v7' / 'v1' / 'unknown' / 'missing'。
+
+        V7（7.x）取消了 V1 的 37 个 *_PROVIDER_ID 与 model_assignment_config，
+        改成「插件级默认 + 逐任务分层路由」。两套结构的读写完全不同，必须分开处理。
+        探测按「版本号 → 公开 API 标识 → 配置结构特征」三级兜底：陪伴插件重载后
+        StarMetadata 字段可能暂时缺失，任一级命中即定论，避免误判成 V1 写坏配置。
+        """
+        star = self._companion_star()
+        if star is None:
+            return "missing"
+        version = str(getattr(star, "version", "") or "").strip()
+        matched = re.match(r"v?(\d+)", version)
+        if matched:
+            major = int(matched.group(1))
+            if major >= 7:
+                return "v7"
+            if major > 0:
+                return "v1"
+        plugin_obj = getattr(star, "star_cls", None)
+        api = getattr(plugin_obj, "extension_api", None)
+        if str(getattr(api, "api_version", "") or "") == "companion.product.v1":
+            return "v7"
+        if getattr(plugin_obj, "staging", None) is not None:
+            return "v7"
+        cfg = getattr(star, "config", None)
+        if isinstance(cfg, dict):
+            if COMPANION_PROVIDER_GROUP in cfg or any(k in cfg for k in COMPANION_PROVIDER_KEYS):
+                return "v1"
+            section = cfg.get(COMPANION_V7_MODEL_GROUP)
+            if isinstance(section, dict) and "provider_id" in section:
+                return "v7"
+        return "unknown"
+
+    def _companion_v7_section(self, cfg: Any, group: str) -> Optional[dict]:
+        """取 V7 插件配置里的一个 object 分组；不存在 / 不是 dict 返回 None。"""
+        if not isinstance(cfg, dict):
+            return None
+        section = cfg.get(group)
+        return section if isinstance(section, dict) else None
+
+    @staticmethod
+    def _v7_set_field(section: dict, field: str, value: str) -> None:
+        section[field] = value
+
+    def _companion_v7_positions(self, cfg: Any) -> list[dict]:
+        """列出 A 层里所有引用 provider id 的位置，每项带一个 apply(new_id)。
+
+        除 12 个插件级字段外，还包括 replacement_rules / additional_providers
+        这类 JSON 文本里内嵌的 provider_id —— 只替换顶层字段会漏掉它们，
+        所以统一在这里枚举，替换与展示共用同一份清单。
+        """
+        positions: list[dict] = []
+        for slot_key, group, field, label, kind in COMPANION_V7_PROVIDER_SLOTS:
+            section = self._companion_v7_section(cfg, group)
+            if section is None or field not in section:
+                continue
+            positions.append({
+                "key": slot_key,
+                "group": group,
+                "label": label,
+                "kind": kind,
+                "provider_id": str(section.get(field) or "").strip(),
+                "apply": lambda value, s=section, f=field: self._v7_set_field(s, f, value),
+            })
+
+        model_section = self._companion_v7_section(cfg, COMPANION_V7_MODEL_GROUP)
+        if model_section is None:
+            return positions
+
+        def enum_json_list(container_key: str, label_prefix: str) -> None:
+            raw = model_section.get(container_key)
+            data: Any = raw
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw.strip() or "[]")
+                except Exception:
+                    return
+            if not isinstance(data, list):
+                return
+            is_text = isinstance(raw, str)
+            for index, item in enumerate(data):
+                if not isinstance(item, dict) or "provider_id" not in item:
+                    continue
+
+                def set_rule(
+                    value: str, d=data, i=index, ck=container_key, text=is_text
+                ) -> None:
+                    d[i]["provider_id"] = value
+                    if text:
+                        model_section[ck] = json.dumps(
+                            d, ensure_ascii=False, separators=(",", ":")
+                        )
+
+                positions.append({
+                    "key": f"model.{container_key}[{index}].provider_id",
+                    "group": "model",
+                    "label": f"{label_prefix} #{index + 1}",
+                    "kind": "main",
+                    "provider_id": str(item.get("provider_id") or "").strip(),
+                    "apply": set_rule,
+                })
+
+        enum_json_list(COMPANION_V7_REPLACEMENT_RULES, "回复替换规则")
+        enum_json_list(COMPANION_V7_ADDITIONAL_PROVIDERS, "额外 Provider 运行元数据")
+        return positions
+
+    def _companion_provider_count(self) -> int:
+        """总览用：陪伴插件已配置的模型位置数（V1 / V7 各按自己的结构数）。"""
+        if self._companion_generation() == "v7":
+            cfg = self._companion_config()
+            if not isinstance(cfg, dict):
+                return 0
+            return sum(1 for p in self._companion_v7_positions(cfg) if p["provider_id"])
+        return sum(1 for v in self._companion_provider_values().values() if v)
+
+    def _companion_v7_payload(self, cfg: Any) -> dict:
+        """/panel/companion/providers 在 V7 下的返回：A 层可编辑清单 + B/C 层引导。"""
+        model_map = self._provider_model_map()
+        slots = []
+        for pos in self._companion_v7_positions(cfg):
+            pid = pos["provider_id"]
+            slots.append({
+                "key": pos["key"],
+                "group": pos["group"],
+                "label": pos["label"],
+                "kind": pos["kind"],
+                "provider_id": pid,
+                "model": model_map.get(pid, pid) if pid else "",
+                "configured": bool(pid),
+                # JSON 文本内层（替换规则 / 额外 Provider）只能参与一键替换，
+                # 不能走 /companion/set 的单键白名单，前端据此禁用下拉。
+                "editable": pos["key"] in COMPANION_V7_SLOT_MAP,
+            })
+        return {
+            "loaded": True,
+            "generation": "v7",
+            "companion_version": self._companion_version(),
+            "items": [],
+            "summary": [],
+            "config_mode": "",
+            "configured_count": sum(1 for s in slots if s["configured"]),
+            "total_keys": len(COMPANION_V7_PROVIDER_SLOTS),
+            "runtime_in_sync": True,
+            "v7": {
+                "version": self._companion_version(),
+                "slots": slots,
+                "managed_areas": COMPANION_V7_MANAGED_AREAS,
+                "house_hint": "陪伴小屋 → 模型与连接",
+                "edit_requires_reload": True,
+            },
+        }
+
+    def _companion_v7_replace(self, cfg: Any, replacements: list) -> dict:
+        """V7 一键替换：按模型名 / provider id 匹配 A 层所有引用位置。"""
+        model_map = self._provider_model_map()
+        positions = self._companion_v7_positions(cfg)
+        changed: list[dict] = []
+        for item in replacements:
+            if not isinstance(item, dict):
+                continue
+            old = str(item.get("old") or "").strip()
+            new = str(item.get("replacement") or "").strip()
+            kind = str(item.get("kind") or "any").strip().lower()
+            if not old or not new:
+                continue
+            for pos in positions:
+                cur = pos["provider_id"]
+                if not cur or cur == new:
+                    continue
+                if kind == "fallback" and pos["kind"] != "fallback":
+                    continue
+                if kind == "main" and pos["kind"] == "fallback":
+                    continue
+                if model_map.get(cur, cur) != old and cur != old:
+                    continue
+                try:
+                    pos["apply"](new)
+                except Exception as e:
+                    logger.warning(f"[ModelPanel] V7 替换 {pos['key']} 失败: {e}")
+                    continue
+                pos["provider_id"] = new
+                changed.append({
+                    "key": pos["key"], "kind": pos["kind"], "old": old, "new": new,
+                })
+        return {**self._companion_v7_save(cfg, changed), "generation": "v7"}
+
+    def _companion_v7_set(self, cfg: Any, items: list) -> dict:
+        """V7 单键直设：key 必须是 A 层 slot key，写对应分组里的字段。"""
+        changed: list[dict] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            slot = COMPANION_V7_SLOT_MAP.get(str(it.get("key") or "").strip())
+            if slot is None:
+                continue
+            pid = str(it.get("provider_id") or "").strip()
+            _, group, field, _, kind = slot
+            section = self._companion_v7_section(cfg, group)
+            if section is None or field not in section:
+                continue
+            section[field] = pid
+            changed.append({"key": slot[0], "kind": kind, "provider_id": pid})
+        return {**self._companion_v7_save(cfg, changed), "generation": "v7"}
+
+    @staticmethod
+    def _companion_v7_save(cfg: Any, changed: list[dict]) -> dict:
+        """V7 写回统一落盘。陪伴插件把 A 层配置解析成运行时策略对象缓存了，
+        改 config 不会立刻刷新它，所以返回 reload_required 让前端明确提示重载。"""
+        if not changed:
+            return {
+                "ok": True, "changed_count": 0, "changed": [],
+                "main_count": 0, "fallback_count": 0, "reload_required": False,
+            }
+        try:
+            save = getattr(cfg, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as e:
+            logger.warning(f"[ModelPanel] 保存陪伴插件 V7 配置失败: {e}")
+            return {"ok": False, "error": f"保存失败: {e}", "changed": changed}
+        main_count = sum(1 for c in changed if c.get("kind") != "fallback")
+        fb_count = sum(1 for c in changed if c.get("kind") == "fallback")
+        logger.info(
+            f"[ModelPanel] 陪伴插件 V7 配置写入 {len(changed)} 处"
+            f"（主 {main_count} / 备 {fb_count}），需重载陪伴插件生效"
+        )
+        return {
+            "ok": True,
+            "changed_count": len(changed),
+            "changed": changed,
+            "main_count": main_count,
+            "fallback_count": fb_count,
+            "reload_required": True,
+        }
+
     def _companion_provider_values(self) -> dict[str, str]:
         cfg = self._companion_config()
         if cfg is None:
@@ -1780,6 +2102,11 @@ class ModelPanelPlugin(Star):
         所以这里必须显式同步：备用模型 setattr 归一化后的 dict，主模型调其
         _apply_quick_provider_defaults()。
         """
+        # V7 没有 model_fallback_overrides，也没有这两个私有方法；它把 A 层配置
+        # 解析成运行时策略对象缓存，只能靠重载插件刷新（前端会提示 reload_required）。
+        # 明确识别为 V1 才做反射同步，避免 V7 下每次替换都打一堆无效 warning。
+        if self._companion_generation() != "v1":
+            return
         star = self._companion_star()
         if star is None:
             return
@@ -2042,7 +2369,7 @@ class ModelPanelPlugin(Star):
             "default_label": default_label,
             "default_set": bool(default_id and default_id in ids),
             "companion_loaded": self._companion_star() is not None,
-            "companion_provider_count": sum(1 for v in self._companion_provider_values().values() if v),
+            "companion_provider_count": self._companion_provider_count(),
             "history": stats,
             "latest_results": latest_results,
             "usage": usage,
@@ -2978,6 +3305,23 @@ class ModelPanelPlugin(Star):
         return {"ok": True, "changed": changed, **state}
 
     async def api_companion_providers(self) -> dict:
+        """按陪伴插件代际分发：V7 走 A 层总览，V1 沿用 37 key 老逻辑。
+
+        V1 分支的函数体刻意保持原样，只在结果上补 generation / companion_version，
+        这样旧版陪伴插件用户升级本插件后行为完全不变。
+        """
+        generation = self._companion_generation()
+        if generation == "v7":
+            cfg = self._companion_config()
+            if isinstance(cfg, dict):
+                return self._companion_v7_payload(cfg)
+        result = await self._companion_v1_providers()
+        result["generation"] = generation
+        result["companion_version"] = self._companion_version()
+        result["v7"] = None
+        return result
+
+    async def _companion_v1_providers(self) -> dict:
         cfg = self._companion_config()
         if cfg is None:
             logger.warning("[ModelPanel] /panel/companion/providers: 未找到陪伴插件配置")
@@ -3075,6 +3419,19 @@ class ModelPanelPlugin(Star):
         }
 
     async def api_companion_replace(self) -> dict:
+        """V7 只替换 A 层引用位置；V1 沿用 37 key + 主/备语义的老逻辑。"""
+        if self._companion_generation() != "v7":
+            return await self._companion_v1_replace()
+        payload = await self._json_payload()
+        replacements = payload.get("replacements") or []
+        if not isinstance(replacements, list) or not replacements:
+            return {"ok": False, "error": "replacements 不能为空"}
+        cfg = self._companion_config()
+        if cfg is None:
+            return {"ok": False, "error": f"未找到插件 {COMPANION_PLUGIN_NAME}"}
+        return self._companion_v7_replace(cfg, replacements)
+
+    async def _companion_v1_replace(self) -> dict:
         payload = await self._json_payload()
         replacements = payload.get("replacements") or []
         if not isinstance(replacements, list) or not replacements:
@@ -3171,6 +3528,19 @@ class ModelPanelPlugin(Star):
         }
 
     async def api_companion_set(self) -> dict:
+        """V7 的 key 是 A 层 slot key（如 voice_reply.zh_provider_id）；V1 走老白名单。"""
+        if self._companion_generation() != "v7":
+            return await self._companion_v1_set()
+        payload = await self._json_payload()
+        items = payload.get("items") or []
+        if not isinstance(items, list):
+            return {"ok": False, "error": "items 必须为数组"}
+        cfg = self._companion_config()
+        if cfg is None:
+            return {"ok": False, "error": f"未找到插件 {COMPANION_PLUGIN_NAME}"}
+        return self._companion_v7_set(cfg, items)
+
+    async def _companion_v1_set(self) -> dict:
         """直接设置某个 provider key 的模型（主模型 / 备用模型），无需按模型名匹配。
 
         用于"总览"页：未配置项也能直接在下拉里选模型并保存。

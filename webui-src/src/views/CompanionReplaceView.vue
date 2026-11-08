@@ -1,5 +1,13 @@
 <template>
   <div class="companion-view">
+    <!-- 陪伴插件 V7 换了配置结构，整套 37 key 逻辑不适用，交给独立总览组件 -->
+    <CompanionV7View
+      v-if="generation === 'v7'"
+      :data="companionData"
+      :providers="providers"
+      @refresh="reload"
+    />
+    <template v-else>
     <n-card :title="t('companion.title')" size="small">
       <n-text v-if="loaded === false" depth="3">{{ t("companion.notLoaded") }}</n-text>
       <template v-else>
@@ -159,6 +167,7 @@
         />
       </template>
     </n-modal>
+    </template>
   </div>
 </template>
 
@@ -197,11 +206,15 @@ import {
   type CompanionReplaceResponse,
   type CompanionSummaryItem,
 } from "../api";
+import CompanionV7View from "./CompanionV7View.vue";
 
 const { t } = useI18n();
 const message = useMessage();
 
 const loaded = ref<boolean | null>(null);
+// 陪伴插件代际：v7 走独立总览组件，v1 / 未加载沿用下面的三 Tab 老页面
+const generation = ref("");
+const companionData = ref<CompanionProvidersResponse | null>(null);
 const items = ref<CompanionProviderItem[]>([]);
 const providers = ref<{ id: string; model: string; vendor: string }[]>([]);
 // Tab1 精简配置：key = 纯 model 名
@@ -398,6 +411,8 @@ async function reload() {
   try {
     const data = await apiGet<CompanionProvidersResponse>("/panel/companion/providers");
     loaded.value = data.loaded;
+    generation.value = data.generation || "v1";
+    companionData.value = data;
     items.value = data.items || [];
     configMode.value = data.config_mode || "";
     configuredCount.value = data.configured_count || 0;

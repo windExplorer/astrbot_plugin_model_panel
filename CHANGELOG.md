@@ -1,5 +1,75 @@
 # 更新日志
 
+## v1.5.0
+
+适配陪伴插件 V7（7.1.6）：模型配置从「37 个全局 key」改成「插件级默认 + 逐任务分层路由」。
+
+### 问题
+
+陪伴插件升级到 V7 后，模型控制台的「陪伴插件配置」页其实已经全瞎了：
+
+- 页面按 V1 的 37 个 `*_PROVIDER_ID` 去读，V7 里这些 key 一个都不存在，
+  于是全部显示「未配置」，一键替换也永远命中不了；
+- 即便手动写进去陪伴插件也不认 —— V7 的
+  `docs/V1_V2_CONFIG_VERIFIED_20260927.csv:122` 明确
+  `FAST_RESPONSE_PROVIDER_ID` **不自动迁移**；
+- 全插件扫描器还把陪伴插件当 V1 特例处理（`_flat_set` 全量同步 + 镜像去重），
+  而 V7 的 `model` / `voice_reply` 两个分组里都有 `provider_id`，继续用
+  `_flat_set` 会把「改一个字段」变成「把所有同名字段一起覆盖」；
+- `/陪伴分数` 读不到 `star_cls.data["users"]`，却回「还没有好感度记录」，误导用户。
+
+### 根因
+
+陪伴插件 V7 把模型配置整体重构为三层：
+
+| 层 | 位置 | 说明 |
+| --- | --- | --- |
+| A 插件级全局默认 | `config["model"]`（`provider_id` / `fallback_provider_id` / `replacement_rules`）、`config["voice_reply"]`（10 个语种与场景绑定） | 仍是普通 AstrBot 插件配置，可读写 |
+| B 逐任务路由（主体） | companion_v2 自己的 SQLite，`model.<任务>.provider / .fallback`，按 installation / role / window 分层继承 | 由「陪伴小屋 → 模型与连接」管理 |
+| C 旁挂配置 | 生图端点 / TTS / 搜索 / Laya / semantic 的独立 JSON | 同上 |
+
+`docs/extension-development.md:9` 明确「未在本文或专门接口文档中列出的内部模块、
+注册表、HTTP 路由和数据库结构均不构成兼容承诺」；唯一公开的 `extension_api`
+（`companion.product.v1`）只有只读的 `task_model_route(user_id, kind)`，既不能枚举
+任务也没有写方法；`/model/*` 要求 Dashboard 登录身份；
+`docs/AGENT_MIGRATION_AND_SETUP.md:16` 禁止直写 SQLite。所以「像 V1 那样一键替换
+全部模型」在 V7 **没有稳定的官方写入路径**。用户确认按「稳档」处理：V7 感知 +
+A 层可改 + B/C 层只读引导，并保留 V1 兼容分支。
+
+### 修复（后端）
+
+- 新增 `_companion_generation()`：按「`StarMetadata.version` 主版本号 → 公开
+  `extension_api.api_version` / `staging` → 配置结构特征」三级兜底判定
+  `v7` / `v1` / `unknown` / `missing`，结果不缓存（陪伴插件可重载）。
+- 三个陪伴 API 改成分发：V1 原逻辑整体挪进 `_companion_v1_*` 且**一个字未改**，
+  V7 走 `_companion_v7_*`；V1 响应补 `generation` / `companion_version` / `v7`。
+- V7 新增 A 层模型：`COMPANION_V7_PROVIDER_SLOTS` 12 个可读写字段 +
+  `_companion_v7_positions()` 统一枚举 `replacement_rules` /
+  `additional_providers` JSON 文本内层的 `provider_id`（只替换顶层字段会漏）。
+- V7 写回只改 `star.config` 并 `save_config()`。陪伴插件会把 A 层解析成运行时策略
+  缓存，所以返回 `reload_required`，不再调 V1 的 `_sync_companion_runtime()` 反射
+  （V7 里 `_apply_quick_provider_defaults` 等方法已不存在）。
+- `_companion_provider_count()` 按代际计数，`/panel/overview` 不再恒为 0。
+- `plugin_models.py` 在 V7 一律走通用按 path 写回：跳过 `_flat_set` 镜像特例、
+  镜像去重、V1 运行时同步与 JSON 容器特例。
+- `/陪伴分数` 在 V7 改为引导「陪伴小屋 → 关系与记忆」，不再误报「没记录」。
+
+### 修复（前端）
+
+- 新增 `CompanionV7View.vue`：V7 模型路由总览（配置清单 / 一键替换两个 Tab）+
+  「由陪伴小屋管理的位置」说明卡；文案全部简体中文，不新增任何 i18n 设施。
+- `CompanionReplaceView.vue` 按 `generation` 分流，`v7` 走新组件，V1 三 Tab 原样保留。
+- `api.ts` 增加 `CompanionV7Slot` / `CompanionV7Payload` 等类型与
+  `reload_required` 字段。
+
+### 自检
+
+新增 `tests/test_companion_v7.py`：用 AST 从 `main.py` 抠真实代码跑，覆盖版本探测
+三级兜底、A 层位置枚举（含 JSON 内层）、一键替换（含 kind=fallback 与无命中）、
+单键白名单、落盘与重载提示、总览计数，以及 `plugin_models.py` 的 V7 分支静态守卫。
+原有 11 个自检脚本 + 新增脚本全绿，Vite 构建通过。方案与边界见
+`docs/设计文档.md` 第十二节。
+
 ## v1.4.8
 
 补 v1.4.7 的尾巴：升级前已经攒下的历史提醒也要收敛掉。

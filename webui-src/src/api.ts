@@ -286,6 +286,37 @@ export interface CompanionSummaryItem {
   configured: boolean;
 }
 
+/** 陪伴插件 V7 插件级全局默认里的一个模型引用位置。 */
+export interface CompanionV7Slot {
+  /** 形如 model.provider_id / voice_reply.zh_provider_id */
+  key: string;
+  group: string;
+  label: string;
+  kind: string;
+  provider_id: string;
+  /** provider id 翻译出的模型名，供展示与按模型名聚合替换 */
+  model: string;
+  configured: boolean;
+  /** JSON 文本内层（替换规则等）只能参与一键替换，不能单键设置 */
+  editable: boolean;
+}
+
+/** V7 里由「陪伴小屋」管理、模型控制台不读写的位置（静态说明）。 */
+export interface CompanionV7ManagedArea {
+  group: string;
+  where: string;
+  fields: string;
+  note: string;
+}
+
+export interface CompanionV7Payload {
+  version: string;
+  slots: CompanionV7Slot[];
+  managed_areas: CompanionV7ManagedArea[];
+  house_hint: string;
+  edit_requires_reload: boolean;
+}
+
 export interface CompanionProvidersResponse {
   loaded: boolean;
   items: CompanionProviderItem[];
@@ -296,16 +327,27 @@ export interface CompanionProvidersResponse {
   total_keys?: number;
   /** 陪伴插件运行时（实例属性）的备用模型是否与配置一致 */
   runtime_in_sync?: boolean;
+  /** 陪伴插件代际：v1 = 旧 37 key 结构；v7 = 插件级默认 + 逐任务分层路由 */
+  generation?: string;
+  companion_version?: string;
+  /** 仅 generation === "v7" 时有值 */
+  v7?: CompanionV7Payload | null;
+}
+
+export interface CompanionSetResponse {
+  ok: boolean;
+  changed_count?: number;
+  changed?: { key: string; kind: string; provider_id?: string }[];
+  error?: string;
+  /** V7 写回后需要重载陪伴插件才会生效 */
+  reload_required?: boolean;
 }
 
 /** 直接设置陪伴插件某个 provider key 的模型（主/备），支持清除（provider_id 为空）。 */
 export async function apiCompanionSet(
   items: { key: string; provider_id: string; kind?: string }[],
 ) {
-  return apiPost<{ ok: boolean; changed_count: number; changed: any[] }>(
-    "/panel/companion/set",
-    { items },
-  );
+  return apiPost<CompanionSetResponse>("/panel/companion/set", { items });
 }
 
 // ---------- 全插件模型配置（扫描 / 改写） ----------
@@ -491,6 +533,9 @@ export interface CompanionReplaceResponse {
   fallback_count?: number;
   changed?: { key: string; kind: string; old: string; new: string }[];
   error?: string;
+  /** V7 写回后需要重载陪伴插件才会生效 */
+  reload_required?: boolean;
+  generation?: string;
 }
 
 export interface TestAllStreamItemEvent {

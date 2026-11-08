@@ -36,10 +36,14 @@ TTS/向量模型，却被标成未匹配、下拉里也选不到"。
 ## 写回
 
 - 通用：按 path 精确写回插件 config（dict / list），最后 `save_config()`。
-- 陪伴插件特例：它把 provider key 同时存在**顶层扁平副本**与
+- 陪伴插件 **V1** 特例：它把 provider key 同时存在**顶层扁平副本**与
   `model_assignment_config` 分组里，必须用 main.py 的 `_flat_set` 语义全量同步，
   否则「我们改了一处、插件读另一处」，出现改了不生效的假象。
-- JSON 字符串映射（`model_fallback_overrides`）：读出 → 改内层 key → 重新序列化写回。
+- 陪伴插件 **V7**：取消了上面的镜像结构，插件级默认改成 `config["model"]` /
+  `config["voice_reply"]` 分组，逐任务路由搬到它自己的 SQLite。V7 一律走通用
+  按 path 写回（`_flat_set` 会把值灌进所有同名 key，反而写坏配置），也不做镜像
+  去重（多个分组都有 `provider_id`，去重会在值不同时误标 conflict）。
+- JSON 字符串映射（`model_fallback_overrides`，V1）：读出 → 改内层 key → 重新序列化写回。
 
 ## 需要注意的坑
 
@@ -63,7 +67,8 @@ from astrbot.api import logger
 # 本插件自身：没有任何"模型配置"，扫描时跳过，避免页面出现噪音
 OWN_PLUGIN_NAME = "astrbot_plugin_model_panel"
 
-# 陪伴插件：provider key 同时存在顶层扁平副本与 model_assignment_config 分组
+# 陪伴插件 V1：provider key 同时存在顶层扁平副本与 model_assignment_config 分组。
+# V7 已取消这套结构，COMPANION_PROVIDER_GROUP 只在 V1 分支里有效。
 COMPANION_PLUGIN_NAME = "astrbot_plugin_private_companion"
 COMPANION_PROVIDER_GROUP = "model_assignment_config"
 
@@ -267,6 +272,16 @@ class PluginModelScanner:
             "is_default": is_default,
         }
 
+    # ---------------- 陪伴插件代际 ----------------
+    def _companion_is_v1(self) -> bool:
+        """陪伴插件是否为 V1 配置结构（37 key + model_assignment_config 镜像）。
+
+        host 没提供探测方法时保守当作 V1，保持旧行为；V7 返回 False，
+        写回 / 去重 / 运行时同步都改走通用路径。
+        """
+        getter = getattr(self.host, "_companion_generation", None)
+        return not callable(getter) or getter() == "v1"
+
     # ================= 扫描 =================
     def _stars(self) -> list[Any]:
         if self.context is None:
@@ -437,7 +452,10 @@ class PluginModelScanner:
             by_model=by_model,
         )
 
-        entries = self._dedupe(entries)
+        # V7 陪伴插件没有镜像结构，但 model / voice_reply 两个分组里都有名为
+        # provider_id 的字段；_dedupe 按 key 分组会在值不同时误标 conflict。
+        if not (name == COMPANION_PLUGIN_NAME and not self._companion_is_v1()):
+            entries = self._dedupe(entries)
         # 已配置的排前面（stable 排序保持各自相对顺序），未配置的沉到分组末尾
         entries.sort(key=lambda e: 0 if e.get("configured", True) else 1)
         return {
@@ -970,7 +988,7 @@ class PluginModelScanner:
         # 运行时同步
         runtime_synced = 0
         for plugin_name, info in touched.items():
-            if plugin_name == COMPANION_PLUGIN_NAME:
+            if plugin_name == COMPANION_PLUGIN_NAME and self._companion_is_v1():
                 sync = getattr(self.host, "_sync_companion_runtime", None)
                 if callable(sync):
                     try:
@@ -999,8 +1017,13 @@ class PluginModelScanner:
 
     # ---------- 写回细节 ----------
     def _is_companion_slot(self, plugin_name: str, path: list) -> bool:
-        """陪伴插件的 provider 位置：顶层 key 或 model_assignment_config.<key>。"""
-        if plugin_name != COMPANION_PLUGIN_NAME or not path:
+        """V1 陪伴插件的镜像位置：顶层 key 或 model_assignment_config.<key>。
+
+        V7 的 model / voice_reply 分组必须走通用按 path 精确写回：若还用
+        _flat_set，改 model.provider_id 会顺带把 voice_reply.provider_id 等
+        所有同名字段一起覆盖掉。
+        """
+        if plugin_name != COMPANION_PLUGIN_NAME or not self._companion_is_v1() or not path:
             return False
         if not isinstance(path[-1], str):
             return False
@@ -1073,8 +1096,10 @@ class PluginModelScanner:
         else:
             data.pop(key, None)
         encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        # 陪伴插件：容器是顶层 legacy 键，用 _flat_set_existing 避免被塞进分组
-        if plugin_name == COMPANION_PLUGIN_NAME and len(container) == 1:
+        # V1 陪伴插件：容器是顶层 legacy 键，用 _flat_set_existing 避免被塞进分组。
+        # V7 的 model 分组是 schema object，按 path 精确写即可。
+        if (plugin_name == COMPANION_PLUGIN_NAME and self._companion_is_v1()
+                and len(container) == 1):
             self._flat_set_existing(cfg, str(container[0]), encoded)
             return True
         return self._set_value(cfg, tuple(container), encoded)
